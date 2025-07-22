@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.android.securelogging">
+
+  <uses-sdk
+      android:minSdkVersion="34"
+      android:targetSdkVersion="35"/>
+
+  <uses-permission android:name="android.permission.REQUEST_PASSWORD_COMPLEXITY" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.CAMERA" />
+
+  <application
+      android:label="Crumbles"
+      android:theme="@style/Theme.Crumbles"
+      android:icon="@mipmap/ic_launcher"
+      android:roundIcon="@mipmap/ic_launcher_round">
+    <activity android:name=".CrumblesMain" android:exported="true" android:testOnly="true">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+    <activity
+            android:name="CrumblesDecryptedLogsActivity"
+            android:label="@string/decrypted_logs_viewer_title"
+            android:parentActivityName=".CrumblesMain"
+            android:exported="false">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".CrumblesMain" />
+    </activity>
+     <activity
+            android:name="CrumblesManageExternalKeysActivity"
+            android:label="@string/title_manage_external_keys"
+            android:parentActivityName=".CrumblesMain"
+            android:exported="false">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".CrumblesMain" />
+    </activity>
+    <activity android:name=".audit.CrumblesAuditLogViewerActivity"
+            android:label="@string/title_audit_log_viewer"
+            android:parentActivityName=".CrumblesMain">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".CrumblesMain" />
+    </activity>
+    <activity android:name=".CrumblesReEncryptKeysActivity" />
+    <activity android:name=".CrumblesQrScannerActivity"
+            android:label="Scan QR Code"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+    </activity>
+    <provider
+          android:name="androidx.core.content.FileProvider"
+          android:authorities="com.android.securelogging.fileprovider"
+          android:exported="false"
+          android:grantUriPermissions="true">
+        <meta-data
+            android:name="android.support.FILE_PROVIDER_PATHS"
+            android:resource="@xml/file_paths" />
+    </provider>
+    <receiver
+            android:name=".CrumblesDeviceAdminReceiver"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:exported="false">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                <action android:name="android.app.action.NETWORK_LOGS_AVAILABLE" />
+            </intent-filter>
+        </receiver>
+  </application>
+   <queries>
+            <intent>
+                <action android:name="android.intent.action.VIEW"/>
+                <data android:scheme="mailto"/>
+            </intent>
+            <intent>
+                <action android:name="android.intent.action.SEND"/>
+                <data android:scheme="mailto"/>
+            </intent>
+    </queries>
+</manifest>

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:fitsSystemWindows="true"
+    tools:context=".CrumblesManageExternalKeysActivity">
+
+    <TextView
+        android:id="@+id/tv_current_external_key_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="24dp"
+        android:gravity="center_horizontal"
+        android:text="@string/status_no_external_key"
+        android:textSize="16sp" />
+
+    <Button
+        android:id="@+id/btn_generate_keystore_key"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/generate_keystore_key_pair_button" />
+
+    <Button
+        android:id="@+id/btn_generate_exportable_key"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/generate_external_key_pair_button" />
+
+    <Button
+        android:id="@+id/btn_import_external_public_key_qr"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/import_external_public_key_qr_button" />
+
+    <Button
+        android:id="@+id/btn_clear_active_external_key"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="@string/clear_active_external_key_button"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+</LinearLayout>

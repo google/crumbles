@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp"
+    tools:context=".DecryptedLogsActivity">
+
+    <TextView
+        android:id="@+id/warning_text_view"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/decryption_warning"
+        android:textColor="@android:color/holo_red_dark"
+        android:background="#33FF0000"
+        android:padding="8dp"
+        android:gravity="center"
+        android:layout_alignParentTop="true"
+        android:layout_marginBottom="8dp"
+        android:textStyle="bold"/>
+
+    <androidx.core.widget.NestedScrollView
+        android:id="@+id/scroll_view_logs"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_above="@id/buttons_layout"
+        android:layout_below="@id/warning_text_view"
+        android:layout_marginBottom="8dp">
+
+        <TextView
+            android:id="@+id/decrypted_logs_text_view"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textAppearance="?android:attr/textAppearanceSmall"
+            android:textIsSelectable="true"/>
+    </androidx.core.widget.NestedScrollView>
+
+    <LinearLayout
+        android:id="@+id/buttons_layout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_alignParentBottom="true"
+        android:gravity="center">
+
+        <Button
+            android:id="@+id/close_button"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="8dp"
+            android:text="@string/close_button_label" />
+
+        <Button
+            android:id="@+id/reencrypt_and_share_button"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="@string/re_encrypt_and_share_button_label" />
+    </LinearLayout>
+
+</RelativeLayout>

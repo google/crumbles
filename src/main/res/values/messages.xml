@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="material_switch_msg" description="Label for a switch that enables or disables logging. [CHAR LIMIT=NONE] ">Logging Disabled</string>
+    <string name="enable_logging_switch_msg" description="Label for a switch that enables or disables logging. [CHAR LIMIT=NONE] ">Logging Enabled</string>
+    <string name="rotate_key_button_label" description="Label for a button that rotates the encryption key. [CHAR LIMIT=NONE] ">Rotate Encryption Key</string>
+    <string name="decrypt_logs_button_label" description="Label for a button that decrypts and views logs. [CHAR LIMIT=NONE] ">Decrypt and View Logs</string>
+    <string name="decrypted_logs_viewer_title" description="Title for the decrypted logs viewer. [CHAR LIMIT=NONE] ">Decrypted Logs Viewer</string>
+    <string name="close_button_label" description="Label for a button that closes the decrypted logs viewer. [CHAR LIMIT=NONE] ">Close</string>
+    <string name="decryption_warning" description="Warning message displayed when the user is viewing decrypted logs. [CHAR LIMIT=NONE] ">Decrypted content is only viewable here from memory. It is never stored decrypted anywhere on this device.</string>
+    <string name="re_encrypt_and_share_button_label" description="Label for a button that re-encrypts decrypted logs and shares them. [CHAR LIMIT=NONE] ">Re-encrypt &amp; Share</string>
+    <string name="no_decrypted_log_content_to_display" description="Message displayed when there is no decrypted log content to display. [CHAR LIMIT=NONE] ">No decrypted log content to display.</string>
+    <string name="error_could_not_load_decrypted_logs" description="Message displayed when there was an error loading decrypted logs. [CHAR LIMIT=NONE] ">Error: Could not load decrypted logs.</string>
+    <string name="encryption_key_status_keystore" description="Status message indicating the app is using the default Keystore encryption key. [CHAR LIMIT=NONE] ">Encryption Key: Keystore Default</string>
+    <string name="encryption_key_status_external" description="Status message indicating the app is using an external encryption key. %1$s is a short identifier/hash of the key. [CHAR LIMIT=NONE] ">Encryption Key: External (%1$s)</string>
+    <string name="manage_external_keys_button_label" description="Label for a button that opens the screen to manage external encryption keys. [CHAR LIMIT=NONE]">Manage External Keys</string>
+
+    <string name="title_manage_external_keys" description="Title for the activity where users manage external encryption keys. [CHAR LIMIT=40] ">Manage External Keys</string>
+    <string name="external_key_management_info" description="Informational text about user responsibility for private keys generated externally. [CHAR LIMIT=NONE] ">Logs encrypted with an external key require its corresponding private key for decryption. This app will not store the generated private key.</string>
+
+    <string name="status_no_external_key" description="Status display in manage keys screen when no external key is active (default text in layout). [CHAR LIMIT=NONE] ">Status: No External Key Active (Using Keystore)</string>
+    <string name="status_external_key_active_formatted" description="Status display in manage keys screen when an external key is active. %1$s is a short identifier/hash of the key. [CHAR LIMIT=NONE] ">Status: External Key Active (%1$s)</string>
+    <string name="status_keystore_key_active_priority" description="Status display when the internal Keystore key is active and has priority over any external key. [CHAR LIMIT=NONE]">Status: Keystore key is active (Priority)</string>
+
+    <string name="generate_external_key_pair_button" description="Label for a button to generate a new external (user-managed) key pair. [CHAR LIMIT=NONE] ">Generate New External Key Pair</string>
+    <string name="import_external_public_key_qr_button" description="Label for a button to import an external public key by scanning a QR code. [CHAR LIMIT=NONE] ">Import External Public Key (QR)</string>
+    <string name="clear_active_external_key_button" description="Label for a button to clear the currently active external key and revert to using the Keystore key. [CHAR LIMIT=NONE] ">Clear Active External Key (Use Keystore)</string>
+
+    <string name="toast_qr_scan_cancelled" description="Toast message shown when QR code scanning is cancelled by the user. [CHAR LIMIT=NONE] ">QR Scan Cancelled</string>
+    <string name="toast_external_key_imported_successfully" description="Toast message shown when an external public key is imported successfully. [CHAR LIMIT=NONE] ">External public key imported successfully!</string>
+    <string name="toast_qr_decode_public_key_failed" description="Toast message shown if decoding a public key from a QR code fails. [CHAR LIMIT=NONE] ">Failed to decode public key from QR code.</string>
+    <string name="toast_import_public_key_error" description="Generic toast message shown if there's an error during public key import. Specific error might be logged. [CHAR LIMIT=NONE] ">Error importing public key. Please check format.</string>
+    <string name="toast_import_public_key_error_with_message" description="Toast message shown if there's an error during public key import, with a specific message. %1$s is the error message. [CHAR LIMIT=NONE] ">Error importing public key: %1$s</string>
+    <string name="qr_scan_prompt_public_key" description="Prompt displayed to the user when the QR code scanner is active for a public key. [CHAR LIMIT=NONE] ">Scan External Public Key QR Code</string>
+    <string name="toast_camera_permission_denied_qr" description="Toast message notifying that it is impossible to scan a QR code  due to the permission to access the device's photo and video camera (camera is a generic term) being denied. [CHAR LIMIT=NONE] ">Camera permission denied. Cannot scan QR code.</string>
+
+    <string name="toast_new_external_key_generated_successfully" description="Toast message shown when a new external key pair is generated successfully. [CHAR LIMIT=NONE] ">New external key pair generated. Public key set for encryption.</string>
+    <string name="toast_generate_external_key_error" description="Generic toast message if an error occurs during external key pair generation. Specific error might be logged. [CHAR LIMIT=NONE] ">Error generating external key pair.</string>
+    <string name="toast_generate_external_key_error_with_message" description="Toast message if an error occurs during external key pair generation, with a specific message. %1$s is the error message. [CHAR LIMIT=NONE] ">Error generating external key pair: %1$s</string>
+    <string name="toast_error_generated_private_key_is_null" description="Toast message shown if the generated private key is unexpectedly null. [CHAR LIMIT=NONE] ">Error: Generated private key is null.</string>
+    <string name="toast_qr_generation_failed_for_private_key" description="Toast message if generating a QR code for the private key fails. [CHAR LIMIT=NONE] ">Could not generate QR code for private key.</string>
+    <string name="toast_qr_scan_failed_no_data" description="Toast message if QR scan was technically successful but no content data was found in the result. [CHAR LIMIT=NONE]">Scan completed, but no data found.</string>
+
+    <string name="toast_external_key_cleared_successfully" description="Toast message shown when the active external key is cleared. [CHAR LIMIT=NONE] ">External public key cleared.</string>
+
+    <string name="dialog_title_private_key_security_warning" description="Title for the dialog that displays the newly generated private key and warns the user. [CHAR LIMIT=NONE] ">Your New Private Key (SAVE SECURELY!)</string>
+    <string name="dialog_message_private_key_user_responsibility" description="Warning message in the private key display dialog about user responsibility. [CHAR LIMIT=NONE] ">This private key will NOT be stored by the app. You MUST save it securely now. Without it, logs encrypted with its public key cannot be decrypted by you.</string>
+    <string name="label_base64_private_key" description="Label for the text field showing the Base64 encoded private key. [CHAR LIMIT=NONE] ">Base64 Private Key:</string>
+    <string name="label_private_key_qr_code" description="Label for the ImageView showing the QR code of the private key. [CHAR LIMIT=NONE] ">Private Key QR Code:</string>
+    <string name="dialog_button_acknowledge_private_key_saved" description="Button text for the user to acknowledge they have saved the private key. [CHAR LIMIT=NONE] ">OK, I Understand &amp; Saved It</string>
+    <string name="toast_barcode_scanner_not_found" description="Toast message shown if the required Barcode Scanner app is not installed. [CHAR LIMIT=NONE]">Barcode Scanner app not found. Please install it to scan QR codes.</string>
+    <string name="private_key_display_format" description="Format string for displaying the private key. %1$s is the label, %2$s is the Base64 key. Includes newlines for spacing. [CHAR LIMIT=NONE]">\n%1$s\n%2$s</string>
+    <string name="qr_code_label_display_format" description="Format string for displaying the QR code label. %1$s is the label text. Includes a newline for spacing. [CHAR LIMIT=NONE]">\n%1$s</string>
+    <string name="scanner_status_searching" description="Label for the text view that displays the scanner status. [CHAR LIMIT=NONE]">Point camera at QR code…</string>
+
+    <string name="dpm_logging_enabled_toast_msg" description="Toast message shown when logging is enabled. [CHAR LIMIT=NONE]">Logging enabled</string>
+    <string name="dpm_logging_disabled_toast_msg" description="Toast message shown when logging is disabled. [CHAR LIMIT=NONE]">Logging disabled</string>
+    <string name="dpm_not_device_owner_enable_log_failed_toast_msg" description="Toast message shown when logging cannot be enabled because the user is not the device owner. [CHAR LIMIT=NONE]">Not device owner, cannot enable logging.</string>
+    <string name="decryption_aborted_no_private_key" description="Toast message shown when decryption is aborted because the private key is not available. [CHAR LIMIT=NONE]">Decryption aborted: Private key is not available.</string>
+    <string name="dpm_not_device_owner_disable_log_failed_toast_msg" description="Toast message shown when logging cannot be disabled because the user is not the device owner. [CHAR LIMIT=NONE]">Not device owner, cannot disable logging.</string>
+    <string name="encryption_key_status_textview_label" description="Label for a text view that displays the encryption key status. [CHAR LIMIT=NONE]">Encryption Key Status: Active</string>
+    <string name="decryption_error_not_valid_logbatch_format_suffix" description="Error message shown when the file is not a valid LogBatch format. [CHAR LIMIT=NONE]">is not a valid LogBatch format.</string>
+    <string name="decryption_unexpected_error_with_file" description="Error message shown when an unexpected error occurs with the file. %1$s is the file name, %2$s is the error message. [CHAR LIMIT=NONE]">Unexpected error with %1$s: %2$s</string>
+
+    <string name="title_audit_log_viewer" description="Title for the activity that displays app activity logs. [CHAR LIMIT=40]">App Activity Log</string>
+    <string name="btn_view_audit_log_label" description="Button label to open the app activity log viewer. [CHAR LIMIT=NONE]">View Activity Log</string>
+    <string name="no_audit_logs_to_display" description="Message displayed when there are no audit logs. [CHAR LIMIT=NONE]">No activity logs to display.</string>
+    <string name="btn_clear_audit_logs_label" description="Button label to clear all audit logs. [CHAR LIMIT=NONE]">Clear All Logs</string>
+    <string name="dialog_title_clear_audit_logs" description="Dialog title for clearing audit logs confirmation. [CHAR LIMIT=NONE]">Clear Audit Logs?</string>
+    <string name="dialog_message_clear_audit_logs_confirmation" description="Confirmation message before clearing all audit logs. [CHAR LIMIT=NONE]">Are you sure you want to delete all app activity logs? This action cannot be undone.</string>
+    <string name="dialog_button_clear" description="Dialog button text for 'Clear'. [CHAR LIMIT=20]">Clear</string>
+
+    <string name="dialog_title_choose_key_format" description="Dialog title for choosing the key format. [CHAR LIMIT=NONE]">Choose Display Format</string>
+    <string name="dialog_message_choose_key_format" description="Dialog message for choosing the key format. [CHAR LIMIT=NONE]">The private key is critical for decrypting logs. How would you like to view and back it up?</string>
+    <string name="dialog_button_view_as_text" description="Dialog button text for 'View as Text'. [CHAR LIMIT=20]">View as Text</string>
+    <string name="dialog_button_view_as_qr" description="Dialog button text for 'View as QR'. [CHAR LIMIT=50]">View as QR Code</string>
+
+    <string name="no_key_ready_generate_button" description="Button label for generating a new key. [CHAR LIMIT=NONE]">No Encryption Key Ready - Generate</string>
+    <string name="change_encryption_key_button" description="Button label for changing the encryption key. [CHAR LIMIT=NONE]">Change Encryption Key</string>
+    <string name="generate_keystore_key_pair_button" description="Button label for generating a new Keystore key pair. [CHAR LIMIT=NONE]">Generate Keystore Key Pair (Recommended)</string>
+    <string name="encryption_key_status_none" description="Status message indicating that no encryption key is currently configured. [CHAR LIMIT=NONE]">No encryption key configured</string>
+
+    <string name="re_encrypt_keys_options" description="Message displayed to choose a re-encryption key either new or existing. [CHAR LIMIT=NONE]">Select a key to re-encrypt the logs with, or create a new one.</string>
+    <string name="re_encrypt_keys_new_internal_key_button" description="Button label for creating a new internal key for re-encryption. [CHAR LIMIT=NONE]">Create New Internal Key</string>
+    <string name="re_encrypt_keys_import_external_public_key_qr_button" description="Button label for importing an external public key for re-encryption. [CHAR LIMIT=NONE]">Import External Public Key (QR)</string>
+</resources>

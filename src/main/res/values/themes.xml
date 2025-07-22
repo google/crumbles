@@ -1,0 +1,6 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+  <style name="Base.Theme.Crumbles" parent="Theme.Material3.DayNight">
+      </style>
+
+  <style name="Theme.Crumbles" parent="Base.Theme.Crumbles" />
+</resources>
