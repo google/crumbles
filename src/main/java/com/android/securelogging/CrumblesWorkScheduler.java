@@ -96,8 +96,7 @@ final class CrumblesWorkScheduler {
         TAG,
         "Periodic mark as sent work scheduled every "
             + CrumblesConstants.MARK_SENT_REPEAT_INTERVAL_HOURS
-            // + " hours with "
-            + " minutes with "
+            + " hours with "
             + CrumblesConstants.MARK_SENT_INITIAL_DELAY_MINUTES_OFFSET
             + " min offset.");
   }

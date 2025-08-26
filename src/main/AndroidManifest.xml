@@ -33,7 +33,7 @@
       android:theme="@style/Theme.Crumbles"
       android:icon="@mipmap/ic_launcher"
       android:roundIcon="@mipmap/ic_launcher_round">
-    <activity android:name=".CrumblesMain" android:exported="true" android:testOnly="true">
+    <activity android:name=".CrumblesMain" android:exported="true">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
         <category android:name="android.intent.category.LAUNCHER"/>
