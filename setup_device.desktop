@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=Crumbles Device Setup
+Comment=Sets the Crumbles app as a device owner
+Exec=./setup_device.sh
+Path=
+Icon=utilities-terminal
+Terminal=true
+Type=Application
+Categories=Utility;
