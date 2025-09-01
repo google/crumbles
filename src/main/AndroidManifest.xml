@@ -6,7 +6,7 @@
  you may not use this file except in compliance with the License.
  You may obtain a copy of the License at
 
-     http://www.apache.org/licenses/LICENSE-2.0
+      http://www.apache.org/licenses/LICENSE-2.0
 
  Unless required by applicable law or agreed to in writing, software
  distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,12 +17,7 @@
 
 
 <manifest
-    xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.android.securelogging">
-
-  <uses-sdk
-      android:minSdkVersion="34"
-      android:targetSdkVersion="35"/>
+    xmlns:android="http://schemas.android.com/apk/res/android">
 
   <uses-permission android:name="android.permission.REQUEST_PASSWORD_COMPLEXITY" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -40,7 +35,7 @@
       </intent-filter>
     </activity>
     <activity
-            android:name="CrumblesDecryptedLogsActivity"
+            android:name=".CrumblesDecryptedLogsActivity"
             android:label="@string/decrypted_logs_viewer_title"
             android:parentActivityName=".CrumblesMain"
             android:exported="false">
@@ -49,7 +44,7 @@
                 android:value=".CrumblesMain" />
     </activity>
      <activity
-            android:name="CrumblesManageExternalKeysActivity"
+            android:name=".CrumblesManageExternalKeysActivity"
             android:label="@string/title_manage_external_keys"
             android:parentActivityName=".CrumblesMain"
             android:exported="false">
@@ -93,7 +88,7 @@
             </intent-filter>
         </receiver>
   </application>
-   <queries>
+    <queries>
             <intent>
                 <action android:name="android.intent.action.VIEW"/>
                 <data android:scheme="mailto"/>
@@ -104,3 +99,5 @@
             </intent>
     </queries>
 </manifest>
+
+

@@ -30,7 +30,7 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.VisibleForTesting;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.android.securelogging.LogBatch;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
@@ -201,8 +201,6 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
           case SecurityLog.TAG_ADB_SHELL_INTERACTIVE ->
               "ADB interactive shell was opened via \"adb shell\":";
           case SecurityLog.TAG_APP_PROCESS_START -> "App process started: ";
-          case SecurityLog.TAG_BACKUP_SERVICE_TOGGLED ->
-              "Admin has enabled or disabled backup service: ";
           case SecurityLog.TAG_BLUETOOTH_CONNECTION -> "Attempted to connect to Bluetooth device: ";
           case SecurityLog.TAG_BLUETOOTH_DISCONNECTION ->
               "Attempted to disconnect from Bluetooth device: ";

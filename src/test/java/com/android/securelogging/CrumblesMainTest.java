@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -55,8 +55,8 @@ import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.ByteString;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogData;
+import com.android.securelogging.LogBatch;
+import com.android.securelogging.LogData;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -115,18 +115,17 @@ public class CrumblesMainTest {
     Configuration config = new Configuration.Builder().setMinimumLoggingLevel(Log.DEBUG).build();
     WorkManagerTestInitHelper.initializeTestWorkManager(context, config);
 
-    // Base path that ShadowEnvironment.setExternalStoragePublicDirectory() will use.
-    File mockPublicStorageBase = new File(context.getCacheDir(), "TestPublicStorageBase");
-    mockPublicStorageBase.mkdirs();
-    ShadowEnvironment.setExternalStoragePublicDirectory(mockPublicStorageBase.toPath());
-
+    // Get the directory that Robolectric provides for DIRECTORY_DOCUMENTS.
+    // This is a sandboxed directory within the test environment.
     File shadowedDocumentsDir =
         Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
-    shadowedDocumentsDir.mkdirs();
+    // This directory is the root we will clean up after tests.
+    this.rootOfTestCleanup = shadowedDocumentsDir;
+    shadowedDocumentsDir.mkdirs(); // Ensure it exists for the test.
 
+    // Continue with the rest of the setup as before.
     this.mockAdHocDir = new File(shadowedDocumentsDir, CrumblesConstants.TEMP_RE_ENCRYPTED_DIR);
     this.mockAdHocDir.mkdirs();
-    this.rootOfTestCleanup = mockPublicStorageBase;
   }
 
   @After
@@ -707,8 +706,8 @@ public class CrumblesMainTest {
       }
     }
     assertWithMessage(
-            "Error log for missing encryptionKeyStatusTextView should not appear if layout is"
-                + " correct.")
+        "Error log for missing encryptionKeyStatusTextView should not appear if layout is"
+            + " correct.")
         .that(textViewMissingErrorLogged)
         .isFalse();
 

@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,7 +27,7 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Looper;
-import android.support.v7.app.ActionBar;
+import androidx.appcompat.app.ActionBar;
 import android.view.View;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -89,7 +89,7 @@ public class CrumblesReEncryptKeysActivityTest {
   @Before
   public void setUp() {
     MockitoAnnotations.openMocks(this);
-    ApplicationProvider.getApplicationContext().setTheme(R.style.Theme_AppCompat);
+    ApplicationProvider.getApplicationContext().setTheme(R.style.Theme_Crumbles);
     CrumblesMain.setLogsEncryptorInstanceForTest(mockLogsEncryptor);
     // This is a simple way to inject the mock. A real app might use a DI framework.
     CrumblesReEncryptKeysActivity.publicKeyManagerForTest = mockPublicKeyManager;
@@ -191,11 +191,11 @@ public class CrumblesReEncryptKeysActivityTest {
           Intent resultData = shadowOf(activity).getResultIntent();
           assertThat(resultData).isNotNull();
           assertThat(
-                  resultData.getStringExtra(CrumblesReEncryptKeysActivity.EXTRA_SELECTED_KEY_ALIAS))
+              resultData.getStringExtra(CrumblesReEncryptKeysActivity.EXTRA_SELECTED_KEY_ALIAS))
               .isEqualTo(internalKeyAlias);
           assertThat(
-                  resultData.getBooleanExtra(
-                      CrumblesReEncryptKeysActivity.EXTRA_SELECTED_KEY_IS_INTERNAL, false))
+              resultData.getBooleanExtra(
+                  CrumblesReEncryptKeysActivity.EXTRA_SELECTED_KEY_IS_INTERNAL, false))
               .isTrue();
         });
   }

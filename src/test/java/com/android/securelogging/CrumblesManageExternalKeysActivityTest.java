@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,8 +25,8 @@ import static org.mockito.Mockito.when;
 
 import android.app.Dialog;
 import android.content.Context;
-import android.support.v4.app.DialogFragment;
-import android.support.v7.app.AlertDialog;
+import androidx.fragment.app.DialogFragment;
+import androidx.appcompat.app.AlertDialog;
 import android.view.View;
 import android.widget.Button;
 import android.widget.ImageView;
@@ -95,9 +95,8 @@ public class CrumblesManageExternalKeysActivityTest {
     // Given: Mocks are initialized.
     MockitoAnnotations.openMocks(this);
     appContext = ApplicationProvider.getApplicationContext();
-    // Using a simpler base theme for testing to avoid Material Components interfering
-    // with Robolectric's dialog shadowing.
-    appContext.setTheme(R.style.Theme_AppCompat);
+    // Using the application's actual theme for the test.
+    appContext.setTheme(R.style.Theme_Crumbles);
 
     testExternalKeyPair = generateTestRsaKeyPair();
     // And: The static accessor for CrumblesLogsEncryptor in CrumblesMain is made to return our
@@ -131,10 +130,10 @@ public class CrumblesManageExternalKeysActivityTest {
 
   private void mockSuccessfulKeyGeneration(byte[] keyBytes) throws CrumblesKeysException {
     doAnswer(
-            invocation -> {
-              invocation.getArgument(0, PrivateKeyBytesConsumer.class).accept(keyBytes);
-              return null;
-            })
+        invocation -> {
+          invocation.getArgument(0, PrivateKeyBytesConsumer.class).accept(keyBytes);
+          return null;
+        })
         .when(mockLogsEncryptor)
         .generateAndSetExternalKeyPair(any(PrivateKeyBytesConsumer.class));
     when(mockLogsEncryptor.getExternalEncryptionPublicKey())

@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -35,8 +35,9 @@ import androidx.work.testing.TestListenableWorkerBuilder;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
-import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.time.InstantSource;
@@ -97,7 +98,9 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
       throws IOException {
     String fileName = namePrefix + timestamp + suffix;
     File file = new File(testDirectory, fileName);
-    Files.writeString(file.toPath(), content);
+    try (FileOutputStream fos = new FileOutputStream(file)) {
+      fos.write(content.getBytes(StandardCharsets.UTF_8));
+    }
     assertTrue("File should exist after creation: " + file.getAbsolutePath(), file.exists());
     return file;
   }

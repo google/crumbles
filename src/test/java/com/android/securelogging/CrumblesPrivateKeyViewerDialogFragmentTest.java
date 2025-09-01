@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -66,7 +66,7 @@ public class CrumblesPrivateKeyViewerDialogFragmentTest {
     // When: The fragment is launched.
     FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
         FragmentScenario.launch(
-            CrumblesPrivateKeyViewerDialogFragment.class, args, R.style.Theme_AppCompat);
+            CrumblesPrivateKeyViewerDialogFragment.class, args, R.style.Theme_Crumbles);
     scenario.moveToState(Lifecycle.State.RESUMED);
 
     // Then: The text view is visible, and the QR code view is hidden.
@@ -94,7 +94,7 @@ public class CrumblesPrivateKeyViewerDialogFragmentTest {
     // When: The fragment is launched.
     FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
         FragmentScenario.launch(
-            CrumblesPrivateKeyViewerDialogFragment.class, args, R.style.Theme_AppCompat);
+            CrumblesPrivateKeyViewerDialogFragment.class, args, R.style.Theme_Crumbles);
     scenario.moveToState(Lifecycle.State.RESUMED);
 
     // Then: The QR code view is visible, and the text view is hidden.

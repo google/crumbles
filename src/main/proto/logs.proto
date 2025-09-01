@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+option java_package = "com.android.securelogging";
+option java_outer_classname = "CrumblesProto";
+option java_multiple_files = true;
+
+enum LogEncryptionType {
+  LOG_ENCRYPTION_TYPE_UNSPECIFIED = 0;
+  LOG_ENCRYPTION_TYPE_AES_GCM = 1;
+}
+
+enum KeyEncryptionType {
+  KEY_ENCRYPTION_TYPE_UNSPECIFIED = 0;
+  KEY_ENCRYPTION_TYPE_ASYMMETRIC = 1;
+  KEY_ENCRYPTION_TYPE_CERT_SHA256_WITH_RSA = 2;
+  KEY_ENCRYPTION_TYPE_CIPHER_MODE_RSA_ECB_PKCS1 = 3;
+}
+
+enum UploadLogResult {
+  UPLOAD_LOG_RESULT_UNSPECIFIED = 0;
+  UPLOAD_LOG_RESULT_SUCCESS = 1;
+  UPLOAD_LOG_RESULT_FAILURE = 2;
+}
+
+message DeviceId {
+  // A hardware ID - precisely which TBD
+  string device_id = 1;
+}
+
+message LogData {
+  bytes log_blob = 1;
+}
+
+message LogMetadata {
+  uint32 blob_size = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  DeviceId device = 3;
+  LogEncryptionType encryption_type = 4;
+}
+
+message LogKey {
+  KeyEncryptionType key_encryption_type = 1;
+  bytes encrypted_symmetric_key = 2;
+  bytes iv = 3;
+}
+
+message LogBatch {
+  LogData data = 1;
+  // Even when used in a DownloadLogsResponse, there should only be one log
+  // batch for each response, each including only one key+iv.
+  LogKey key = 2;
+  LogMetadata metadata = 3;
+}
+
+message UploadLogRequest {
+  LogBatch log_batch = 1;
+  // Gaia ID will be provided by the request authentication
+}
+
+message UploadLogResponse {
+  UploadLogResult result = 1;
+}
+
+message QueryLogsRequest {
+  google.protobuf.Timestamp query_from = 1;
+  google.protobuf.Timestamp query_to = 2;
+  LogMetadata log_metadata = 3;
+}
+
+message QueryLogsResponse {
+  repeated LogBatch log_batch = 1;
+}
+
+message DownloadLogsRequest {
+  repeated LogMetadata logs = 1;
+}
+
+message DownloadLogsResponse {
+  repeated LogBatch log_batch = 1;
+}
+
+/**
+ * Service for uploading and downloading logs.
+ */
+service CrumblesService {
+  /**
+   * Upload a log to the server.
+   */
+  rpc UploadLog(UploadLogRequest) returns (UploadLogResponse) {
+    // The server will ignore blob_size, blob_sha256, and timestamp in LogData,
+    // filling these values in itself.
+  }
+
+  /**
+   * Query logs from the server.
+   */
+  rpc QueryLogs(QueryLogsRequest) returns (QueryLogsResponse) {}
+
+  /**
+   * Download logs from the server.
+   */
+  rpc DownloadLogs(DownloadLogsRequest) returns (DownloadLogsResponse) {
+    // Use the QueryLogs request to get information about a set of logs, and
+    // then provide information about the logs to this RPC to actually get the
+    // data and encrypted keys.
+  }
+}
+
+

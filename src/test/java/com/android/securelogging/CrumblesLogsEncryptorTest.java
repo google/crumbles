@@ -26,7 +26,7 @@ import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.android.securelogging.LogBatch;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;

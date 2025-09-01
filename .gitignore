@@ -1,0 +1,11 @@
+crumbles-release-key.keystore
+local.properties
+build.output
+gradlew
+gradlew.bat
+
+build/*
+.gradle/*
+.idea/*
+gradle/*
+release/*

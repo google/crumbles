@@ -32,7 +32,7 @@ import android.widget.Toast;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 import androidx.core.content.FileProvider;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.android.securelogging.LogBatch;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;

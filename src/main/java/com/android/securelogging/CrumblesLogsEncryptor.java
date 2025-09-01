@@ -28,21 +28,21 @@ import androidx.annotation.VisibleForTesting;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
-import com.google.common.time.TimeSource;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.util.Timestamps;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.KeyEncryptionType;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogData;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogEncryptionType;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogKey;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
+import com.android.securelogging.DeviceId;
+import com.android.securelogging.KeyEncryptionType;
+import com.android.securelogging.LogBatch;
+import com.android.securelogging.LogData;
+import com.android.securelogging.LogEncryptionType;
+import com.android.securelogging.LogKey;
+import com.android.securelogging.LogMetadata;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+
 import java.nio.file.Path;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -400,7 +400,7 @@ public class CrumblesLogsEncryptor {
   public LogBatch deserializeFile(Path filePath) {
     try {
       byte[] serializedBytes = Files.readAllBytes(filePath);
-      return LogBatch.parseFrom(serializedBytes, ExtensionRegistryLite.getGeneratedRegistry());
+      return LogBatch.parseFrom(serializedBytes, ExtensionRegistryLite.getEmptyRegistry());
     } catch (IOException e) {
       throw new CrumblesLogsEncryptionException("Failed to deserialize bytes from file.", e);
     }
@@ -423,7 +423,7 @@ public class CrumblesLogsEncryptor {
     LogMetadata logMetadata =
         LogMetadata.newBuilder()
             .setBlobSize(encryptedLogsBytes.length)
-            .setTimestamp(Timestamps.fromMillis(TimeSource.system().instant().toEpochMilli()))
+            .setTimestamp(Timestamps.fromMillis(System.currentTimeMillis()))
             .setDevice(deviceId)
             .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
             .build();
