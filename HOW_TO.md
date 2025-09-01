@@ -26,14 +26,15 @@ your skills.
 ### Using a terminal
 
 1. Install adb if you do not have it yet, as follows. Download the [SDK Platform-Tools for your computer's OS](https://developer.android.com/tools/releases/platform-tools). Double-click on the downloaded file and follow the prompts.
-2. Download [Crumbles_app.apk](https://github.com/google/crumbles/releases/v1.0/CrumblesApp.apk) version 1.0 or any other version of choice.
+2. Download [CrumblesApp.apk](
+3. https://github.com/google/crumbles/releases/tag/v1.0) version 1.0 or any other version of choice.
 3. Plug your Android device into your computer (desktop/laptop/tablet) using a
 USB cable. On your phone, check the **Always allow** box and tap **Allow** on the pop-up
 dialog that appears when you plug in your phone.
 4. Open a terminal and run the following commands:
     ```
     $ cd <path of the folder where you saved your downloaded apk>
-    $ adb install -r Crumbles_app.apk
+    $ adb install -r CrumblesApp.apk
     $ adb shell dpm set-device-owner com.android.securelogging/.CrumblesDeviceAdminReceiver
     ```
 
@@ -165,8 +166,8 @@ account on your device**.
 6. Run the following.
 
     ```
-    $ cd <path of the folder where you cloned this repo>/crumbles
-    $ <your build tool, for example `./gradlew`> build crumbles:all
+    $ cd <path of the folder where you cloned this repo>
+    $ <your build tool, for example `./gradlew`> build crumbles
     ```
 
 7. Plug your Android device into your computer (desktop/laptop/tablet) using a
