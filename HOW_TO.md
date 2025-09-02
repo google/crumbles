@@ -16,7 +16,7 @@ state-sponsored attacks than others (At-Risk-Users).
 
 On your Android phone:
 
-1. [Back up your data](https://support.google.com/android/answer/2819582?hl=en).
+1. [Back up your data](https://support.google.com/android/answer/2819582?hl=en). Please note that the Android backup mechanism does not include apps that opt-out of backups, like Signal or banking apps.
 2. [Factory reset your phone](https://support.google.com/android/answer/6088915?hl=en) without adding any Google Account. Warning: This process will completely erase your device. That's why it's important to backup your data first, in step (1).
 3. [Enable USB Debugging](https://developer.android.com/studio/debug/dev-options).
 

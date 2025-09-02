@@ -1,10 +1,13 @@
 # Crumbles
 
+See how to install and use Crumbles in the [HOW_TO]()HOW_TO.md).
+
 ## tl;dr
 
 Crumbles is an Android Device-Owner app that allows you to collect more logs to
 help forensic analysis and suspicious activity detection, while still preserving
-your privacy.
+your privacy. Here we describe Crumbles features, If you want to know how to
+install Crumbles and use it then please go to the [HOW_TO](HOW_TO.md)
 
 ## How Crumbles works
 
