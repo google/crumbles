@@ -112,7 +112,7 @@ and ready to use.
     This option also gives you the chance to easily re-encrypt them to share
     them with a trusted 3rd party.
 
-    ![decryption and re-encryption video](documentation_images/crumbles_decrypt_re_encrypt_2fanotrecordable.mp4)
+    ![decryption and re-encryption steps](documentation_images/decrypt_re_encrypt.png)
 
     b. Or whether you prefer to keep the private encryption key safely stored by
        yourself elsewhere.
@@ -125,7 +125,7 @@ and ready to use.
     public key you would like to use to encrypt your logs, you can ask Crumbles
     to import it.
 
-    ![import public encryption key](documentation_images/import_public_key.png)
+    ![import public encryption key](documentation_images/import_pub_key.png)
 
       **Decryption**. Whenever you wish to decrypt your logs, you can download
       them from your remote storage location of choice and use your private key
@@ -135,7 +135,7 @@ Once a day you will receive a notification about encrypted logs ready to be
 uploaded to a remote storage location. Tap on the notification and select the
 remote storage location that you prefer among all those installed on your phone.
 
-![uploading screencast video](documentation_images/uploading_screencast.webm)
+![uploading steps](documentation_images/uploading.png)
 
 ## How to build
 
