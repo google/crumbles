@@ -26,8 +26,7 @@ your skills.
 ### Using a terminal
 
 1. Install adb if you do not have it yet, as follows. Download the [SDK Platform-Tools for your computer's OS](https://developer.android.com/tools/releases/platform-tools). Double-click on the downloaded file and follow the prompts.
-2. Download [CrumblesApp.apk](
-3. https://github.com/google/crumbles/releases/tag/v1.0) version 1.0 or any other version of choice.
+2. Download [CrumblesApp.apk](https://github.com/google/crumbles/releases/tag/v1.0) version 1.0 or any other version of choice.
 3. Plug your Android device into your computer (desktop/laptop/tablet) using a
 USB cable. On your phone, check the **Always allow** box and tap **Allow** on the pop-up
 dialog that appears when you plug in your phone.
