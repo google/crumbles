@@ -1,6 +1,6 @@
 # Crumbles
 
-See how to install and use Crumbles in the [HOW_TO]()HOW_TO.md).
+See how to install and use Crumbles in the [HOW_TO](HOW_TO.md).
 
 ## tl;dr
 
