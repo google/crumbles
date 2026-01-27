@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -33,7 +33,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.security.keystore.UserNotAuthenticatedException;
-import androidx.fragment.app.FragmentActivity;
+import android.support.v4.app.FragmentActivity;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.TextView;
@@ -45,11 +45,13 @@ import androidx.work.WorkManager;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.audit.CrumblesAuditLogViewerActivity;
 import com.android.securelogging.exceptions.CrumblesKeysException;
+import com.google.android.libraries.security.content.SafeContentResolver;
+import com.google.android.libraries.security.content.SafeContentResolver.SourcePolicy;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.google.common.io.ByteStreams;
 import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.InvalidProtocolBufferException;
-import com.android.securelogging.LogBatch;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -473,13 +475,12 @@ public class CrumblesMain extends FragmentActivity {
         inputStream = new FileInputStream(inputFile);
 
       } else if (Objects.equals(scheme, ContentResolver.SCHEME_CONTENT)) {
-        // For content:// URIs, use the standard ContentResolver, which is the public
-        // API for this purpose.
-        Log.d(TAG, "Opening content URI via ContentResolver: " + uri);
-        inputStream = getContentResolver().openInputStream(uri);
+        // For content:// URIs, use SafeContentResolver as intended for external content.
+        Log.d(TAG, "Opening content URI via SafeContentResolver: " + uri);
+        inputStream = SafeContentResolver.openInputStream(this, uri, SourcePolicy.EXTERNAL_ONLY);
         if (inputStream == null) {
           throw new FileNotFoundException(
-              "ContentResolver.openInputStream returned null for content URI: " + uri);
+              "SafeContentResolver.openInputStream returned null for content URI: " + uri);
         }
       } else {
         Log.w(TAG, "Unsupported URI scheme for reading: " + scheme + " for URI: " + uri);
@@ -525,7 +526,7 @@ public class CrumblesMain extends FragmentActivity {
 
       LogBatch logBatch;
       try {
-        logBatch = LogBatch.parseFrom(fileBytes, ExtensionRegistryLite.getEmptyRegistry());
+        logBatch = LogBatch.parseFrom(fileBytes, ExtensionRegistryLite.getGeneratedRegistry());
         Log.d(TAG, "Successfully deserialized LogBatch from " + fileName);
       } catch (InvalidProtocolBufferException e) {
         Log.e(TAG, "Failed to parse LogBatch from file: " + fileName, e);
@@ -583,6 +584,9 @@ public class CrumblesMain extends FragmentActivity {
     Log.d(TAG, "Getting file name for URI: " + uri + " with scheme: " + scheme);
 
     if (Objects.equals(scheme, ContentResolver.SCHEME_CONTENT)) {
+      // SafeContentResolver does not have a public query method.
+      // Use standard ContentResolver for querying display name.
+      // Security here relies on the ContentProvider's implementation and URI permissions.
       Cursor cursor = null;
       try {
         cursor =

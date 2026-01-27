@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,8 +23,6 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.LinearLayout;
-import androidx.recyclerview.widget.DiffUtil;
-import androidx.recyclerview.widget.RecyclerView;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.R;
@@ -50,7 +48,7 @@ public class CrumblesAuditLogAdapterTest {
   public void setUp() {
     // Given: A context and a list of sample audit events.
     context = ApplicationProvider.getApplicationContext();
-    context.setTheme(R.style.Theme_Crumbles); // Use the application's theme.
+    context.setTheme(R.style.Theme_MaterialComponents_DayNight_DarkActionBar);
 
     testEvents = new ArrayList<>();
     testEvents.add(
