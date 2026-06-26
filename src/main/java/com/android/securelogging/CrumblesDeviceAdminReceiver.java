@@ -30,7 +30,6 @@ import android.os.PersistableBundle;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.VisibleForTesting;
-import androidx.work.WorkManager;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.ByteArrayOutputStream;
@@ -73,8 +72,7 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
     }
 
     PersistableBundle adminExtras =
-        intent.getParcelableExtra(
-            DevicePolicyManager.EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE, PersistableBundle.class);
+        intent.getParcelableExtra(DevicePolicyManager.EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE);
     boolean enableLogging = false;
     if (adminExtras != null) {
       enableLogging = adminExtras.getBoolean("enable_logging", /* defaultValue= */ false);
@@ -100,15 +98,6 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
       Log.i(TAG, "Network logging automatically enabled post-provisioning.");
     } catch (SecurityException e) {
       Log.e(TAG, "Failed to enable network logging post-provisioning.", e);
-    }
-
-    try {
-      Context appContext = context.getApplicationContext();
-      CrumblesWorkScheduler.scheduleAllPeriodicWork(
-          appContext, WorkManager.getInstance(appContext));
-      Log.i(TAG, "Periodic work automatically scheduled post-provisioning.");
-    } catch (RuntimeException e) {
-      Log.e(TAG, "Failed to schedule periodic work post-provisioning.", e);
     }
   }
 
