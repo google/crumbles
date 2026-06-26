@@ -18,6 +18,12 @@ package com.android.securelogging;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import android.app.admin.ConnectEvent;
 import android.app.admin.DeviceAdminReceiver;
@@ -27,23 +33,23 @@ import android.app.admin.NetworkEvent;
 import android.app.admin.SecurityLog;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
 import android.os.PersistableBundle;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-
-import android.content.ContextWrapper;
+import android.util.Log;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.work.Configuration;
+import androidx.work.WorkInfo;
+import androidx.work.WorkManager;
+import androidx.work.testing.SynchronousExecutor;
+import androidx.work.testing.WorkManagerTestInitHelper;
 import com.google.common.collect.ImmutableList;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -62,6 +68,13 @@ public final class CrumblesDeviceAdminReceiverTest {
   @Before
   public void setup() {
     receiver = new CrumblesDeviceAdminReceiver();
+    Context context = ApplicationProvider.getApplicationContext();
+    Configuration config =
+        new Configuration.Builder()
+            .setMinimumLoggingLevel(Log.DEBUG)
+            .setExecutor(new SynchronousExecutor())
+            .build();
+    WorkManagerTestInitHelper.initializeTestWorkManager(context, config);
   }
 
   /**
@@ -221,16 +234,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
     when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);
 
-    Context contextWrapper =
-        new ContextWrapper(realContext) {
-          @Override
-          public Object getSystemService(String name) {
-            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
-              return mockDpm;
-            }
-            return super.getSystemService(name);
-          }
-        };
+    Context contextWrapper = createContextWrapper(realContext, mockDpm);
 
     Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
     PersistableBundle adminExtras = new PersistableBundle();
@@ -241,6 +245,19 @@ public final class CrumblesDeviceAdminReceiverTest {
 
     verify(mockDpm).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
     verify(mockDpm).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
+
+    try {
+      List<WorkInfo> sendWorkInfos =
+          WorkManager.getInstance(realContext)
+              .getWorkInfosForUniqueWork(CrumblesConstants.SEND_WORK_TAG)
+              .get();
+      assertThat(sendWorkInfos).hasSize(1);
+    } catch (ExecutionException e) {
+      fail("Failed to verify work manager scheduling: " + e.getMessage());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      fail("Interrupted while verifying work manager scheduling: " + e.getMessage());
+    }
   }
 
   @Test
@@ -249,16 +266,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
     when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);
 
-    Context contextWrapper =
-        new ContextWrapper(realContext) {
-          @Override
-          public Object getSystemService(String name) {
-            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
-              return mockDpm;
-            }
-            return super.getSystemService(name);
-          }
-        };
+    Context contextWrapper = createContextWrapper(realContext, mockDpm);
 
     Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
     PersistableBundle adminExtras = new PersistableBundle();
@@ -269,6 +277,19 @@ public final class CrumblesDeviceAdminReceiverTest {
 
     verify(mockDpm, never()).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
     verify(mockDpm, never()).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
+
+    try {
+      List<WorkInfo> sendWorkInfos =
+          WorkManager.getInstance(realContext)
+              .getWorkInfosForUniqueWork(CrumblesConstants.SEND_WORK_TAG)
+              .get();
+      assertThat(sendWorkInfos).isEmpty();
+    } catch (ExecutionException e) {
+      fail("Failed to verify work manager scheduling: " + e.getMessage());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      fail("Interrupted while verifying work manager scheduling: " + e.getMessage());
+    }
   }
 
   @Test
@@ -277,16 +298,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
     when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);
 
-    Context contextWrapper =
-        new ContextWrapper(realContext) {
-          @Override
-          public Object getSystemService(String name) {
-            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
-              return mockDpm;
-            }
-            return super.getSystemService(name);
-          }
-        };
+    Context contextWrapper = createContextWrapper(realContext, mockDpm);
 
     Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
     // Intent does not contain EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE
@@ -303,16 +315,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
     when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(false);
 
-    Context contextWrapper =
-        new ContextWrapper(realContext) {
-          @Override
-          public Object getSystemService(String name) {
-            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
-              return mockDpm;
-            }
-            return super.getSystemService(name);
-          }
-        };
+    Context contextWrapper = createContextWrapper(realContext, mockDpm);
 
     Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
     PersistableBundle adminExtras = new PersistableBundle();
@@ -323,5 +326,17 @@ public final class CrumblesDeviceAdminReceiverTest {
 
     verify(mockDpm, never()).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
     verify(mockDpm, never()).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
+  }
+
+  private static Context createContextWrapper(Context realContext, DevicePolicyManager mockDpm) {
+    return new ContextWrapper(realContext) {
+      @Override
+      public Object getSystemService(String name) {
+        if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
+          return mockDpm;
+        }
+        return super.getSystemService(name);
+      }
+    };
   }
 }
