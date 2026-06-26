@@ -20,9 +20,24 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.fail;
 
 import android.app.admin.ConnectEvent;
+import android.app.admin.DeviceAdminReceiver;
+import android.app.admin.DevicePolicyManager;
 import android.app.admin.DnsEvent;
 import android.app.admin.NetworkEvent;
 import android.app.admin.SecurityLog;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.os.PersistableBundle;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import android.content.ContextWrapper;
+import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.google.common.collect.ImmutableList;
 import java.lang.reflect.Constructor;
@@ -198,5 +213,115 @@ public final class CrumblesDeviceAdminReceiverTest {
     } catch (ReflectiveOperationException e) {
       fail("Test failed due to reflection error on getSecurityEventSeverity: " + e.getMessage());
     }
+  }
+
+  @Test
+  public void onProfileProvisioningComplete_whenDeviceOwnerAndFlagTrue_enablesSecurityAndNetworkLogging() {
+    Context realContext = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);
+
+    Context contextWrapper =
+        new ContextWrapper(realContext) {
+          @Override
+          public Object getSystemService(String name) {
+            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
+              return mockDpm;
+            }
+            return super.getSystemService(name);
+          }
+        };
+
+    Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
+    PersistableBundle adminExtras = new PersistableBundle();
+    adminExtras.putBoolean("enable_logging", true);
+    intent.putExtra(DevicePolicyManager.EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE, adminExtras);
+
+    receiver.onProfileProvisioningComplete(contextWrapper, intent);
+
+    verify(mockDpm).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
+    verify(mockDpm).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
+  }
+
+  @Test
+  public void onProfileProvisioningComplete_whenDeviceOwnerAndFlagFalse_doesNotEnableLogging() {
+    Context realContext = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);
+
+    Context contextWrapper =
+        new ContextWrapper(realContext) {
+          @Override
+          public Object getSystemService(String name) {
+            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
+              return mockDpm;
+            }
+            return super.getSystemService(name);
+          }
+        };
+
+    Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
+    PersistableBundle adminExtras = new PersistableBundle();
+    adminExtras.putBoolean("enable_logging", false);
+    intent.putExtra(DevicePolicyManager.EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE, adminExtras);
+
+    receiver.onProfileProvisioningComplete(contextWrapper, intent);
+
+    verify(mockDpm, never()).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
+    verify(mockDpm, never()).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
+  }
+
+  @Test
+  public void onProfileProvisioningComplete_whenDeviceOwnerAndNoFlag_doesNotEnableLogging() {
+    Context realContext = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);
+
+    Context contextWrapper =
+        new ContextWrapper(realContext) {
+          @Override
+          public Object getSystemService(String name) {
+            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
+              return mockDpm;
+            }
+            return super.getSystemService(name);
+          }
+        };
+
+    Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
+    // Intent does not contain EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE
+
+    receiver.onProfileProvisioningComplete(contextWrapper, intent);
+
+    verify(mockDpm, never()).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
+    verify(mockDpm, never()).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
+  }
+
+  @Test
+  public void onProfileProvisioningComplete_whenNotDeviceOwner_doesNotEnableLogging() {
+    Context realContext = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(false);
+
+    Context contextWrapper =
+        new ContextWrapper(realContext) {
+          @Override
+          public Object getSystemService(String name) {
+            if (name.equals(Context.DEVICE_POLICY_SERVICE)) {
+              return mockDpm;
+            }
+            return super.getSystemService(name);
+          }
+        };
+
+    Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
+    PersistableBundle adminExtras = new PersistableBundle();
+    adminExtras.putBoolean("enable_logging", true);
+    intent.putExtra(DevicePolicyManager.EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE, adminExtras);
+
+    receiver.onProfileProvisioningComplete(contextWrapper, intent);
+
+    verify(mockDpm, never()).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
+    verify(mockDpm, never()).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
   }
 }

@@ -26,6 +26,7 @@ import android.app.admin.SecurityLog.SecurityEvent;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.os.PersistableBundle;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.VisibleForTesting;
@@ -58,6 +59,46 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   @Override
   public void onEnabled(Context context, Intent intent) {
     Log.i(TAG, "onEnabled");
+  }
+
+  @Override
+  public void onProfileProvisioningComplete(@NonNull Context context, @NonNull Intent intent) {
+    Log.i(TAG, "Profile provisioning complete.");
+    initDpm(context);
+
+    if (!dpm.isDeviceOwnerApp(context.getPackageName())) {
+      Log.w(TAG, "Not device owner, skipping automatic logging enablement.");
+      return;
+    }
+
+    PersistableBundle adminExtras =
+        intent.getParcelableExtra(DevicePolicyManager.EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE);
+    boolean enableLogging = false;
+    if (adminExtras != null) {
+      enableLogging = adminExtras.getBoolean("enable_logging", /* defaultValue= */ false);
+    }
+    Log.i(TAG, "Provisioning admin extras enable_logging flag: " + enableLogging);
+
+    if (!enableLogging) {
+      Log.i(
+          TAG,
+          "Logging not enabled during provisioning (enable_logging was false or missing).");
+      return;
+    }
+
+    try {
+      dpm.setSecurityLoggingEnabled(adminComponentName, /* enabled= */ true);
+      Log.i(TAG, "Security logging automatically enabled post-provisioning.");
+    } catch (SecurityException e) {
+      Log.e(TAG, "Failed to enable security logging post-provisioning.", e);
+    }
+
+    try {
+      dpm.setNetworkLoggingEnabled(adminComponentName, /* enabled= */ true);
+      Log.i(TAG, "Network logging automatically enabled post-provisioning.");
+    } catch (SecurityException e) {
+      Log.e(TAG, "Failed to enable network logging post-provisioning.", e);
+    }
   }
 
   private void initDpm(Context context) {
