@@ -14,14 +14,53 @@ state-sponsored attacks than others (At-Risk-Users).
 
 ## Okay, how do I install it?
 
+There are two options available to set up Crumbles on your device as Device Owner:
+
+---
+
+### Option 1: Zero-Touch / QR Code Provisioning (Recommended, No Computer Needed)
+
+This automated method uses Android Enterprise QR Code provisioning during initial
+phone setup. It automatically downloads the trusted Crumbles APK directly from the
+official GitHub repository (`https://github.com/google/crumbles/releases`), sets it
+as Device Owner, pre-configures logging enablement, and schedules background log
+exfiltration tasks.
+
+**Built-in Cryptographic Integrity Verification**:
+When scanning the QR payload, the system embeds a trusted SHA-256 signature checksum
+(`android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM`). Android OS
+automatically verifies this checksum against the downloaded APK before installation,
+guaranteeing that the binary has not been tampered with.
+
+1. **Back up your data**:
+   [Back up your data](https://support.google.com/android/answer/2819582?hl=en).
+2. **Factory reset your phone**:
+   [Factory reset your phone](https://support.google.com/android/answer/6088915?hl=en).
+3. **Trigger built-in QR scanner**: On the initial "Welcome" / setup screen
+   (before connecting to Wi-Fi), tap the same blank area of the screen **6 times**
+   in a row.
+4. **Scan the QR Code**: The built-in Android QR code reader will launch. Scan the
+   official Crumbles provisioning QR code provided by your organization or
+   generated via `tools/generate_qr_payload.sh`.
+5. **Connect to Wi-Fi**: Follow the on-screen prompts to connect to Wi-Fi.
+   Android Enterprise will automatically verify the APK checksum, install Crumbles,
+   and complete provisioning securely. No further setup or USB connections are required!
+
+*(Note: Helpdesks can generate custom provisioning QR code payloads and verify local APK checksums using `./tools/generate_qr_payload.sh <path_to_apk>`.)*
+
+---
+
+### Option 2: Manual USB / ADB Setup
+
+If you prefer to manually install Crumbles via USB debugging, follow the steps below.
+
 On your Android phone:
 
 1. [Back up your data](https://support.google.com/android/answer/2819582?hl=en).
 2. [Factory reset your phone](https://support.google.com/android/answer/6088915?hl=en) without adding any Google Account. Warning: This process will completely erase your device. That's why it's important to backup your data first, in step (1).
 3. [Enable USB Debugging](https://developer.android.com/studio/debug/dev-options).
 
-The next steps depend on the Operating System that you use on your computer and
-your skills.
+The next steps depend on the Operating System that you use on your computer and your skills.
 
 ### Using a terminal
 
