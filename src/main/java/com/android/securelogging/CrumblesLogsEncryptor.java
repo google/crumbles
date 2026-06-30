@@ -82,13 +82,13 @@ public class CrumblesLogsEncryptor {
   private static final int GCM_IV_LEN_BYTES = 12;
 
   @VisibleForTesting static final String ASYM_ALGORITHM = KeyProperties.KEY_ALGORITHM_RSA;
-  private static final String CIPHER_MODE_ASYM = "RSA/ECB/PKCS1Padding";
+  private static final String CIPHER_MODE_ASYM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
   private static final int ASYM_BITS = 2048;
 
   private static final String ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore";
   public static final String KEY_ALIAS = "com.android.securelogging.CrumblesRsaKeyAlias";
-  public static final String PREFERENCE_MASTER_KEY_ALIAS =
-      "com.android.securelogging.CrumblesPreferenceMasterKey";
+  public static final String PREFERENCE_PRIMARY_KEY_ALIAS =
+      "com.android.securelogging.CrumblesPreferencePrimaryKey";
   public static final String RE_ENCRYPT_KEY_ALIAS_PREFIX = "re_encrypt_";
   private static final String SERIALIZED_ENCRYPTED_DATA_DELIMITER = ":";
 
@@ -171,7 +171,8 @@ public class CrumblesLogsEncryptor {
           new KeyGenParameterSpec.Builder(
                   keyAlias, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
               .setKeySize(ASYM_BITS)
-              .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1)
+              .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
+              .setDigests(KeyProperties.DIGEST_SHA256)
               .setUserAuthenticationRequired(requireUserAuthentication)
               .setUserAuthenticationValidityDurationSeconds(AUTH_VALIDITY_SECONDS);
 
@@ -432,9 +433,9 @@ public class CrumblesLogsEncryptor {
 
   @CanIgnoreReturnValue
   public String encryptDataStoreEntry(byte[] plaintext) throws CrumblesKeysException {
-    PublicKey publicKey = getPublicKey(PREFERENCE_MASTER_KEY_ALIAS);
+    PublicKey publicKey = getPublicKey(PREFERENCE_PRIMARY_KEY_ALIAS);
     if (publicKey == null) {
-      publicKey = generateKeyPair(PREFERENCE_MASTER_KEY_ALIAS, false).getPublic();
+      publicKey = generateKeyPair(PREFERENCE_PRIMARY_KEY_ALIAS, false).getPublic();
     }
     EncryptedData encData = encryptData(plaintext, publicKey);
 
@@ -461,12 +462,12 @@ public class CrumblesLogsEncryptor {
 
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
-      PrivateKey masterPrivateKey = (PrivateKey) keyStore.getKey(PREFERENCE_MASTER_KEY_ALIAS, null);
-      if (masterPrivateKey == null) {
-        throw new CrumblesKeysException("Failed to load master private key from Keystore.");
+      PrivateKey primaryPrivateKey = (PrivateKey) keyStore.getKey(PREFERENCE_PRIMARY_KEY_ALIAS, null);
+      if (primaryPrivateKey == null) {
+        throw new CrumblesKeysException("Failed to load primary private key from Keystore.");
       }
 
-      SecretKey aesKey = unwrapAesKey(masterPrivateKey, wrappedKeyBytes);
+      SecretKey aesKey = unwrapAesKey(primaryPrivateKey, wrappedKeyBytes);
       SecretKeySpec aesKeySpec = new SecretKeySpec(aesKey.getEncoded(), SYM_ALGORITHM);
 
       return decryptUsingAes256Gcm(aesKeySpec, new IvParameterSpec(ivBytes), ciphertext);
