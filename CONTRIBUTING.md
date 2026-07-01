@@ -1,1 +1,2 @@
-
+#REDIRECT [[Soul]]
+{{redr|history}}
