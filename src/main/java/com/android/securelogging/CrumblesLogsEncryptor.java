@@ -48,6 +48,8 @@ import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
+import java.time.Duration;
+import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
@@ -86,13 +88,16 @@ public class CrumblesLogsEncryptor {
   private static final int ASYM_BITS = 2048;
 
   private static final String ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore";
+  /** Default alias for the RSA key pair. */
   public static final String KEY_ALIAS = "com.android.securelogging.CrumblesRsaKeyAlias";
+  /** Alias for the primary key used to encrypt preferences. */
   public static final String PREFERENCE_PRIMARY_KEY_ALIAS =
       "com.android.securelogging.CrumblesPreferencePrimaryKey";
+  /** Prefix for key aliases used in re-encryption. */
   public static final String RE_ENCRYPT_KEY_ALIAS_PREFIX = "re_encrypt_";
   private static final String SERIALIZED_ENCRYPTED_DATA_DELIMITER = ":";
 
-  private static final int AUTH_VALIDITY_SECONDS = 30;
+  private static final Duration AUTH_VALIDITY_DURATION = Duration.ofSeconds(30);
 
   private PublicKey externalEncryptionPublicKey;
 
@@ -114,11 +119,14 @@ public class CrumblesLogsEncryptor {
     void accept(byte[] privateKeyBytes) throws CrumblesKeysException;
   }
 
+  /** getPublicKey method. */
   @Nullable
   public PublicKey getPublicKey() {
     return getPublicKey(KEY_ALIAS);
   }
 
+  /** getPublicKey method. */
+  /** getPublicKey method. */
   @Nullable
   public PublicKey getPublicKey(String keyAlias) {
     try {
@@ -137,6 +145,7 @@ public class CrumblesLogsEncryptor {
     return getPublicKey() != null;
   }
 
+  /** setExternalEncryptionPublicKey method. */
   public synchronized void setExternalEncryptionPublicKey(@Nullable PublicKey publicKey) {
     this.externalEncryptionPublicKey = publicKey;
     if (publicKey != null) {
@@ -152,13 +161,44 @@ public class CrumblesLogsEncryptor {
     return this.externalEncryptionPublicKey;
   }
 
-  @CanIgnoreReturnValue
+  /**
+   * Generates a new key pair using the default alias and authentication settings.
+   *
+   * @return the generated {@link KeyPair}
+   * @throws CrumblesKeysException if the key pair cannot be generated
+   */
+ @CanIgnoreReturnValue
   public synchronized KeyPair generateKeyPair() throws CrumblesKeysException {
     return generateKeyPair(KEY_ALIAS, true);
   }
 
-  @CanIgnoreReturnValue
+  /**
+   * Generates a new key pair and stores it in the Android Keystore.
+   *
+   * @param keyAlias the alias under which to store the key pair
+   * @param requireUserAuthentication whether the key requires user authentication to be used
+   * @return the generated {@link KeyPair}
+   * @throws CrumblesKeysException if the key pair cannot be generated
+   */
+ @CanIgnoreReturnValue
   public synchronized KeyPair generateKeyPair(String keyAlias, boolean requireUserAuthentication)
+      throws CrumblesKeysException {
+    return generateKeyPair(
+        keyAlias, requireUserAuthentication, AUTH_VALIDITY_DURATION);
+  }
+
+  /**
+   * Generates a new key pair and stores it in the Android Keystore.
+   *
+   * @param keyAlias the alias under which to store the key pair
+   * @param requireUserAuthentication whether the key requires user authentication to be used
+   * @param authValidityDuration the duration for which the authentication remains valid
+   * @return the generated {@link KeyPair}
+   * @throws CrumblesKeysException if the key pair cannot be generated
+   */
+ @CanIgnoreReturnValue
+  public synchronized KeyPair generateKeyPair(
+      String keyAlias, boolean requireUserAuthentication, Duration authValidityDuration)
       throws CrumblesKeysException {
     deleteExistingKeyPair(keyAlias);
     try {
@@ -174,7 +214,7 @@ public class CrumblesLogsEncryptor {
               .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
               .setDigests(KeyProperties.DIGEST_SHA256)
               .setUserAuthenticationRequired(requireUserAuthentication)
-              .setUserAuthenticationValidityDurationSeconds(AUTH_VALIDITY_SECONDS);
+              .setUserAuthenticationValidityDurationSeconds((int) authValidityDuration.toSeconds());
 
       keyPairGenerator.initialize(specBuilder.build());
       return keyPairGenerator.generateKeyPair();
@@ -202,7 +242,14 @@ public class CrumblesLogsEncryptor {
     }
   }
 
-  public synchronized void generateAndSetExternalKeyPair(PrivateKeyBytesConsumer consumer)
+  /**
+   * Generates a new external key pair, sets the public key for encryption, and passes the private
+   * key to the provided consumer. Also deletes any existing keystore key pair.
+   *
+   * @param consumer a consumer that will receive the encoded private key bytes
+   * @throws CrumblesKeysException if the key pair cannot be generated
+   */
+ public synchronized void generateAndSetExternalKeyPair(PrivateKeyBytesConsumer consumer)
       throws CrumblesKeysException {
     try {
       KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(ASYM_ALGORITHM);
@@ -228,7 +275,15 @@ public class CrumblesLogsEncryptor {
     }
   }
 
-  public EncryptedData encryptData(byte[] data, PublicKey encryptionKey)
+  /**
+   * Encrypts data using a hybrid encryption scheme: AES-GCM for the data, and RSA for the AES key.
+   *
+   * @param data the plaintext data to encrypt
+   * @param encryptionKey the RSA public key to use for encrypting the symmetric key
+   * @return an {@link EncryptedData} object containing the encrypted data, encrypted symmetric key, and IV
+   * @throws CrumblesKeysException if an error occurs during encryption
+   */
+ public EncryptedData encryptData(byte[] data, PublicKey encryptionKey)
       throws CrumblesKeysException {
     SecretKey symKey = generateSecretKey();
     IvParameterSpec generatedIv = generateAesGcmInitializationVector();
@@ -237,7 +292,13 @@ public class CrumblesLogsEncryptor {
     return new EncryptedData(encryptedBytes, encSymKey, generatedIv.getIV());
   }
 
-  @CanIgnoreReturnValue
+  /**
+   * Encrypts log data and packages it into a {@link LogBatch} protobuf message.
+   *
+   * @param plainLogsBytes the serialized log data to encrypt
+   * @return a {@link LogBatch} containing the encrypted logs and metadata, or null if encryption fails
+   */
+ @CanIgnoreReturnValue
   @Nullable
   public LogBatch encryptLogs(byte[] plainLogsBytes) {
     try {
@@ -269,6 +330,7 @@ public class CrumblesLogsEncryptor {
     }
   }
 
+  /** decryptLogs method. */
   @CanIgnoreReturnValue
   public byte[] decryptLogs(LogBatch logBatch)
       throws CrumblesKeysException, UserNotAuthenticatedException {
@@ -386,6 +448,7 @@ public class CrumblesLogsEncryptor {
     }
   }
 
+  /** serializeBytes method. */
   public Path serializeBytes(LogBatch toSerialize, File baseDir, String fileName) {
     try {
       byte[] serializedBytes = toSerialize.toByteArray();
@@ -538,15 +601,11 @@ public class CrumblesLogsEncryptor {
     }
     String keyHash = "Unknown";
     try {
-      String base64Key = CrumblesLogsEncryptor.publicKeyToBase64(key);
-      if (base64Key != null && !base64Key.isEmpty()) {
-        if (base64Key.length() > 20) {
-          keyHash = "..." + base64Key.substring(base64Key.length() - 10);
-        } else {
-          keyHash = base64Key.substring(0, min(base64Key.length(), 10)) + "...";
-        }
-      }
-    } catch (RuntimeException e) {
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      byte[] hashBytes = digest.digest(key.getEncoded());
+      String base64Hash = Base64.getEncoder().encodeToString(hashBytes);
+      keyHash = base64Hash.substring(0, min(base64Hash.length(), 16));
+    } catch (NoSuchAlgorithmException | RuntimeException e) {
       Log.w(TAG, "Could not generate preview for external key", e);
     }
     return keyHash;

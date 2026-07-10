@@ -39,6 +39,9 @@ import java.security.UnrecoverableKeyException;
 import java.security.spec.RSAKeyGenParameterSpec;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicReference;
+import java.time.Duration;
+import java.security.MessageDigest;
+import java.util.Base64;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -148,10 +151,10 @@ public final class CrumblesLogsEncryptorTest {
 
   @Test
   public void generateKeyPair_specRequiresUserAuthentication() throws Exception {
-    // When a key pair is generated
+    // When a key pair is generated.
     encryptor.generateKeyPair();
 
-    // Then the KeyGenParameterSpec used should require user authentication
+    // Then the KeyGenParameterSpec used should require user authentication.
     FakeAndroidKeyStoreSpi.PrivateKeyEntry entry =
         FakeAndroidKeyStoreSpi.getPrivateKeyEntry(CrumblesLogsEncryptor.KEY_ALIAS);
     assertThat(entry).isNotNull();
@@ -159,6 +162,21 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(spec).isNotNull();
     assertThat(spec.isUserAuthenticationRequired()).isTrue();
     assertThat(spec.getUserAuthenticationValidityDurationSeconds()).isEqualTo(30);
+  }
+
+  @Test
+  public void generateKeyPair_customAuthValidityDuration() throws Exception {
+    // When a key pair is generated with a custom auth validity duration (0 for per-use auth).
+    encryptor.generateKeyPair(CrumblesLogsEncryptor.KEY_ALIAS, true, Duration.ZERO);
+
+    // Then the KeyGenParameterSpec should specify the custom validity duration.
+    FakeAndroidKeyStoreSpi.PrivateKeyEntry entry =
+        FakeAndroidKeyStoreSpi.getPrivateKeyEntry(CrumblesLogsEncryptor.KEY_ALIAS);
+    assertThat(entry).isNotNull();
+    KeyGenParameterSpec spec = entry.getSpec();
+    assertThat(spec).isNotNull();
+    assertThat(spec.isUserAuthenticationRequired()).isTrue();
+    assertThat(spec.getUserAuthenticationValidityDurationSeconds()).isEqualTo(0);
   }
 
   @Test
@@ -354,7 +372,26 @@ public final class CrumblesLogsEncryptorTest {
         CrumblesLogsDecryptionException.class, () -> decryptorWithKeystore.decryptLogs(logBatch));
   }
 
-  // --- Hashing and Helper Method Tests are omitted for brevity as they were not failing ---
+  // --- Hashing and Helper Method Tests ---
+
+  @Test
+  public void getPublicKeyHash_whenKeyIsNotNull_returnsCorrectHash() throws Exception {
+    PublicKey publicKey = generateTestExternalRsaKeyPair().getPublic();
+
+    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+    byte[] hashBytes = digest.digest(publicKey.getEncoded());
+    String expectedHash = Base64.getEncoder().encodeToString(hashBytes);
+    expectedHash = expectedHash.substring(0, Math.min(expectedHash.length(), 16));
+
+    String actualHash = CrumblesLogsEncryptor.getPublicKeyHash(publicKey);
+    assertThat(actualHash).isEqualTo(expectedHash);
+  }
+
+  @Test
+  public void getPublicKeyHash_whenKeyIsNull_returnsUnknown() {
+    String actualHash = CrumblesLogsEncryptor.getPublicKeyHash(null);
+    assertThat(actualHash).isEqualTo("Unknown");
+  }
 
   // --- Serialization/Deserialization Test ---
 
