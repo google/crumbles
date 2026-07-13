@@ -51,8 +51,25 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import org.junit.Before;
+
+import java.security.Security;
+import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
+import org.junit.BeforeClass;
+import org.junit.AfterClass;
+
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import java.io.File;
+import java.nio.file.Files;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import javax.crypto.Cipher;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+
+import com.google.protobuf.ExtensionRegistryLite;
+
+import java.nio.charset.StandardCharsets;
+
 
 /**
  * Unit tests for {@link CrumblesDeviceAdminReceiver}.
@@ -63,6 +80,21 @@ import org.junit.runner.RunWith;
  */
 @RunWith(AndroidJUnit4.class)
 public final class CrumblesDeviceAdminReceiverTest {
+
+  private static FakeAndroidKeyStoreProvider fakeProviderInstance;
+
+  @BeforeClass
+  public static void setUpClass() {
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    fakeProviderInstance = new FakeAndroidKeyStoreProvider();
+    Security.insertProviderAt(fakeProviderInstance, 1);
+  }
+
+  @AfterClass
+  public static void tearDownClass() {
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+  }
+
   private CrumblesDeviceAdminReceiver receiver;
 
   @Before
@@ -169,6 +201,45 @@ public final class CrumblesDeviceAdminReceiverTest {
     assertThat(receiver.getSerializableSecurityLogs(null)).isEmpty();
     assertThat(receiver.getSerializableSecurityLogs(new ArrayList<>())).isEmpty();
   }
+  /**
+   * Tests that logs are encrypted using the persisted external key after a cold start where the singleton is uninitialized.
+   */
+  @Test
+  public void encryptLogs_usesPersistedExternalKey_notKeystore_afterColdStart() throws Exception {
+    // Arrange: persist an external key via the manager (simulating prior QR import).
+    KeyPair ngo = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager mgr =
+        CrumblesExternalPublicKeyManager.getInstance(ApplicationProvider.getApplicationContext());
+    mgr.saveActiveExternalPublicKey(ngo.getPublic());
+
+    // Simulate cold start: do NOT call CrumblesMain.onResume(); do NOT touch the singleton.
+    CrumblesDeviceAdminReceiver receiver = new CrumblesDeviceAdminReceiver();
+    // invoke encryptLogs via reflection
+    Method method =
+        CrumblesDeviceAdminReceiver.class.getDeclaredMethod(
+            "encryptLogs", Context.class, byte[].class);
+    method.setAccessible(true);
+    method.invoke(
+        receiver,
+        ApplicationProvider.getApplicationContext(),
+        "hello".getBytes(StandardCharsets.UTF_8));
+
+    // Assert: file exists AND its wrapped key decrypts with ngo.getPrivate().
+    File logsDir =
+        new File(
+            ApplicationProvider.getApplicationContext().getFilesDir(),
+            CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    File[] out = logsDir.listFiles((d, n) -> n.endsWith(".bin"));
+    assertThat(out).hasLength(1);
+    LogBatch batch =
+        LogBatch.parseFrom(
+            Files.readAllBytes(out[0].toPath()), ExtensionRegistryLite.getEmptyRegistry());
+    Cipher rsa = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+    rsa.init(Cipher.UNWRAP_MODE, ngo.getPrivate());
+    // Throws if wrapped with a different key -> test fails on current code.
+    rsa.unwrap(batch.getKey().getEncryptedSymmetricKey().toByteArray(), "AES", Cipher.SECRET_KEY);
+  }
+
 
   /** Tests the private getSecurityEventType helper method directly using reflection. */
   @Test

@@ -145,12 +145,15 @@ public class CrumblesLogsEncryptor {
     return getPublicKey() != null;
   }
 
-  /** setExternalEncryptionPublicKey method. */
+  /**
+   * Sets the external encryption public key.
+   *
+   * @param publicKey the public key to be set for external encryption
+   */
   public synchronized void setExternalEncryptionPublicKey(@Nullable PublicKey publicKey) {
     this.externalEncryptionPublicKey = publicKey;
     if (publicKey != null) {
       Log.d(TAG, "External public key has been set for encryption.");
-      deleteExistingKeyPair();
     } else {
       Log.d(TAG, "Setting the external public key did not work.");
     }
@@ -296,23 +299,24 @@ public class CrumblesLogsEncryptor {
    * Encrypts log data and packages it into a {@link LogBatch} protobuf message.
    *
    * @param plainLogsBytes the serialized log data to encrypt
+   * @param publicKey the specific public key to use for encryption
    * @return a {@link LogBatch} containing the encrypted logs and metadata, or null if encryption fails
    */
- @CanIgnoreReturnValue
+  @CanIgnoreReturnValue
   @Nullable
-  public LogBatch encryptLogs(byte[] plainLogsBytes) {
+  public LogBatch encryptLogs(byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
     try {
       String keySourceMessage;
       EncryptedData encryptedData;
 
-      if (this.externalEncryptionPublicKey == null && !doesPrivateKeyExist()) {
+      if (publicKey == null && !doesPrivateKeyExist()) {
         Log.e(TAG, "Encryption failed: No encryption key available.");
         return null;
       }
 
-      if (this.externalEncryptionPublicKey != null) {
-        encryptedData = encryptData(plainLogsBytes, this.externalEncryptionPublicKey);
-        keySourceMessage = "Using external public key for encryption.";
+      if (publicKey != null) {
+        encryptedData = encryptData(plainLogsBytes, publicKey);
+        keySourceMessage = "Using provided public key for encryption.";
       } else {
         encryptedData = encryptData(plainLogsBytes, getPublicKey());
         keySourceMessage = "Using Keystore public key for encryption.";

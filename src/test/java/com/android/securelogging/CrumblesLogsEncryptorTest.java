@@ -259,8 +259,8 @@ public final class CrumblesLogsEncryptorTest {
     byte[] logData = "some log data".getBytes(UTF_8);
 
     // When: encryptLogs is called twice.
-    LogBatch batch1 = encryptor.encryptLogs(logData);
-    LogBatch batch2 = encryptor.encryptLogs(logData);
+    LogBatch batch1 = encryptor.encryptLogs(logData, encryptor.getExternalEncryptionPublicKey());
+    LogBatch batch2 = encryptor.encryptLogs(logData, encryptor.getExternalEncryptionPublicKey());
 
     // Then: The Initialization Vectors (IVs) in each LogBatch must be different.
     byte[] iv1 = batch1.getKey().getIv().toByteArray();
@@ -281,7 +281,7 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(FakeAndroidKeyStoreSpi.keystoreEntries).isEmpty();
 
     // When: encryptLogs is called.
-    encryptor.encryptLogs("test encryption with external key.".getBytes(UTF_8));
+    encryptor.encryptLogs("test encryption with external key.".getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // Then: The encryption proceeds without accessing or generating a Keystore key.
     assertThat(FakeAndroidKeyStoreSpi.keystoreEntries).isEmpty();
@@ -295,7 +295,7 @@ public final class CrumblesLogsEncryptorTest {
 
     // When: encryptLogs is called.
     // Then: it returns null.
-    assertThat(encryptor.encryptLogs("test encryption with external key.".getBytes(UTF_8)))
+    assertThat(encryptor.encryptLogs("test encryption with external key.".getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey()))
         .isNull();
   }
 
@@ -309,7 +309,7 @@ public final class CrumblesLogsEncryptorTest {
 
     // And: The user provides successful authentication for the fake keystore to allow encryption.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
-    LogBatch logBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8));
+    LogBatch logBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // And: A new CrumblesLogsEncryptor instance, simulating an app restart.
     CrumblesLogsEncryptor decryptingEncryptor = new CrumblesLogsEncryptor();
@@ -331,7 +331,7 @@ public final class CrumblesLogsEncryptorTest {
 
     // And: Authenticate temporarily to allow the encryption step to succeed.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
-    LogBatch logBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8));
+    LogBatch logBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // And: Lock the keystore again by revoking authentication.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(false);
@@ -353,7 +353,7 @@ public final class CrumblesLogsEncryptorTest {
   public void decryptLogs_whenEncryptedWithExternalKey_thenFailsWithKeystoreKey() throws Exception {
     // Given: A LogBatch encrypted with an external key.
     encryptor.setExternalEncryptionPublicKey(generateTestExternalRsaKeyPair().getPublic());
-    LogBatch logBatch = encryptor.encryptLogs("encrypted with external key.".getBytes(UTF_8));
+    LogBatch logBatch = encryptor.encryptLogs("encrypted with external key.".getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // When: Decryption is attempted with an encryptor that can only access the Keystore.
     CrumblesLogsEncryptor decryptorWithKeystore = new CrumblesLogsEncryptor();
@@ -404,7 +404,7 @@ public final class CrumblesLogsEncryptorTest {
     encryptor.generateKeyPair();
     // And: The user authenticates before encryption.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
-    LogBatch originalLogBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8));
+    LogBatch originalLogBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // And: A temporary directory for file operations.
     Path tempDir = Files.createTempDirectory("crumbles_test_");

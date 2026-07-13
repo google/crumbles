@@ -25,6 +25,10 @@ import android.app.admin.SecurityLog;
 import android.app.admin.SecurityLog.SecurityEvent;
 import android.content.ComponentName;
 import android.content.Context;
+
+import java.security.PublicKey;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
+
 import android.content.Intent;
 import android.os.PersistableBundle;
 import android.util.Log;
@@ -331,11 +335,18 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   }
 
   private void encryptLogs(Context context, byte[] logsBytes) {
-    CrumblesLogsEncryptor logsEncryptor = new CrumblesLogsEncryptor();
+    CrumblesLogsEncryptor logsEncryptor = CrumblesMain.getLogsEncryptorInstance();
+    // The receiver can run in a cold-started process where the singleton has not yet
+    // been primed with the persisted external key. Reload it from durable storage.
+    PublicKey persistedExternal =
+        CrumblesExternalPublicKeyManager.getInstance(context).getActiveExternalPublicKey();
+    logsEncryptor.setExternalEncryptionPublicKey(persistedExternal);
     try {
-      LogBatch logBatch = logsEncryptor.encryptLogs(logsBytes);
+      LogBatch logBatch = logsEncryptor.encryptLogs(logsBytes, persistedExternal);
       if (logBatch == null) {
-        Log.e(TAG, "Failed to encrypt logs: logBatch is null.");
+        Log.e(TAG, "Failed to encrypt logs: no encryption key configured.");
+        CrumblesAppAuditLogger.getInstance(context)
+            .logEvent("ENCRYPT_NO_KEY", "Log batch dropped: no encryption key configured.");
         return;
       }
       File baseDir =
