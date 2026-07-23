@@ -92,15 +92,22 @@
                 <action android:name="android.app.action.NETWORK_LOGS_AVAILABLE" />
             </intent-filter>
         </receiver>
+    <receiver
+        android:name=".CrumblesShareResultReceiver"
+        android:exported="true" />
   </application>
-   <queries>
-            <intent>
-                <action android:name="android.intent.action.VIEW"/>
-                <data android:scheme="mailto"/>
-            </intent>
-            <intent>
-                <action android:name="android.intent.action.SEND"/>
-                <data android:scheme="mailto"/>
-            </intent>
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="mailto"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND"/>
+            <data android:mimeType="*/*"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND_MULTIPLE"/>
+            <data android:mimeType="*/*"/>
+        </intent>
     </queries>
 </manifest>
