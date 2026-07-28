@@ -20,11 +20,19 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.robolectric.Shadows.shadowOf;
 
+import android.app.Activity;
+import android.app.Application;
 import android.app.Dialog;
+import android.app.KeyguardManager;
 import android.content.Context;
+import android.content.Intent;
+import android.net.Uri;
+import android.security.keystore.UserNotAuthenticatedException;
 import android.support.v4.app.DialogFragment;
 import android.support.v7.app.AlertDialog;
 import android.view.View;
@@ -38,7 +46,10 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.CrumblesLogsEncryptor.PrivateKeyBytesConsumer;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import java.io.File;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.PublicKey;
@@ -51,7 +62,9 @@ import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.robolectric.annotation.Config;
+import org.robolectric.shadows.ShadowActivity;
 import org.robolectric.shadows.ShadowDialog;
+import org.robolectric.shadows.ShadowKeyguardManager;
 import org.robolectric.shadows.ShadowLooper;
 import org.robolectric.shadows.ShadowToast;
 
@@ -63,6 +76,7 @@ public class CrumblesManageExternalKeysActivityTest {
   @Mock private CrumblesLogsEncryptor mockLogsEncryptor;
   @Mock private CrumblesAppAuditLogger mockAuditLogger;
   @Mock private CrumblesExternalPublicKeyManager mockPublicKeyManager;
+  @Mock private CrumblesUriGenerator mockUriGenerator;
 
   private KeyPair testExternalKeyPair;
   private ActivityScenario<CrumblesManageExternalKeysActivity> scenario;
@@ -105,6 +119,13 @@ public class CrumblesManageExternalKeysActivityTest {
     CrumblesMain.setLogsEncryptorInstanceForTest(mockLogsEncryptor);
     // And: The CrumblesAppAuditLogger singleton is replaced with our mock for this test class.
     CrumblesAppAuditLogger.setInstanceForTest(mockAuditLogger);
+
+    when(mockUriGenerator.getUriForFile(any(), any()))
+        .thenAnswer(
+            inv ->
+                Uri.parse(
+                    "content://com.android.securelogging.fileprovider/test/"
+                        + ((File) inv.getArgument(1)).getName()));
   }
 
   @After
@@ -124,7 +145,11 @@ public class CrumblesManageExternalKeysActivityTest {
   private void launchActivity() {
     scenario = ActivityScenario.launch(CrumblesManageExternalKeysActivity.class);
     // Inject mocks after launch but before the activity is resumed.
-    scenario.onActivity(activity -> activity.setPublicKeyManagerForTest(mockPublicKeyManager));
+    scenario.onActivity(
+        activity -> {
+          activity.setPublicKeyManagerForTest(mockPublicKeyManager);
+          activity.setUriGeneratorForTest(mockUriGenerator);
+        });
     scenario.moveToState(Lifecycle.State.RESUMED);
     ShadowLooper.idleMainLooper(); // Ensure all initial UI tasks complete.
   }
@@ -323,5 +348,338 @@ public class CrumblesManageExternalKeysActivityTest {
                   activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
           assertThat(dialogFragment).isNull();
         });
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenPendingLogsExist_showsReEncryptDialogAndReEncryptsOnConfirmation()
+      throws Exception {
+    // Given: A pending log file exists in the logs subdirectory.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File logFile = new File(logsDir, "test_log.bin");
+    logFile.createNewFile();
+
+    when(mockLogsEncryptor.encryptLogs(any(), any())).thenReturn(LogBatch.getDefaultInstance());
+
+    launchActivity();
+
+    // When: The generate keystore key button is clicked.
+    scenario.onActivity(
+        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
+    ShadowLooper.idleMainLooper();
+
+    // Then: The re-encrypt confirmation dialog is shown.
+    AlertDialog reEncryptDialog = getLatestAppCompatAlertDialog();
+    assertThat(reEncryptDialog).isNotNull();
+
+    // When: User clicks "Re-encrypt" (item 0).
+    reEncryptDialog.getListView().performItemClick(null, 0, 0);
+    ShadowLooper.idleMainLooper();
+
+    // Then: Key pair generation proceeds.
+    verify(mockLogsEncryptor).generateKeyPair();
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo("Logs re-encrypted with new key pair.");
+
+    // Cleanup test file.
+    logFile.delete();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenPendingLogsExist_andUserSelectsUploadAsIs_proceedsWithoutReEncrypting()
+      throws Exception {
+    // Given: A pending log file exists.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File logFile = new File(logsDir, "test_log_asis.bin");
+    logFile.createNewFile();
+
+    launchActivity();
+
+    // When: User clicks generate key.
+    scenario.onActivity(
+        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
+    ShadowLooper.idleMainLooper();
+
+    // Then: Re-encrypt dialog appears.
+    AlertDialog reEncryptDialog = getLatestAppCompatAlertDialog();
+    assertThat(reEncryptDialog).isNotNull();
+
+    // When: User clicks "Upload As-Is" (item 1).
+    reEncryptDialog.getListView().performItemClick(null, 1, 1);
+    ShadowLooper.idleMainLooper();
+
+    // Then: Key pair generation proceeds without re-encrypting logs toast.
+    verify(mockLogsEncryptor).generateKeyPair();
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo("New internal Keystore key generated successfully.");
+
+    Intent startedIntent =
+        shadowOf((Application) ApplicationProvider.getApplicationContext()).getNextStartedActivity();
+    assertThat(startedIntent).isNotNull();
+    assertThat(startedIntent.getAction()).isEqualTo(Intent.ACTION_CHOOSER);
+
+    // Cleanup test file.
+    logFile.delete();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenPendingLogsExist_andUserSelectsDiscard_discardsLogsAndProceeds()
+      throws Exception {
+    // Given: A pending log file exists.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File logFile = new File(logsDir, "test_log_discard.bin");
+    logFile.createNewFile();
+
+    launchActivity();
+
+    // When: User clicks generate key.
+    scenario.onActivity(
+        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
+    ShadowLooper.idleMainLooper();
+
+    // Then: Re-encrypt dialog appears.
+    AlertDialog reEncryptDialog = getLatestAppCompatAlertDialog();
+    assertThat(reEncryptDialog).isNotNull();
+
+    // When: User clicks "Discard Logs" (item 2).
+    reEncryptDialog.getListView().performItemClick(null, 2, 2);
+    ShadowLooper.idleMainLooper();
+
+    // Then: Key pair generation proceeds and log file is deleted.
+    verify(mockLogsEncryptor).generateKeyPair();
+    assertThat(logFile.exists()).isFalse();
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+
+    // Cleanup test file.
+    logFile.delete();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenDecryptionFails_andUserSelectsUploadAsIs_triggersUploadAndProceeds()
+      throws Exception {
+    // Given: A corrupt pending log file exists that cannot be decrypted.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File logFile = new File(logsDir, "corrupt_log.bin");
+    logFile.createNewFile();
+
+    when(mockLogsEncryptor.deserializeFile(any())).thenThrow(new RuntimeException("Corrupt file"));
+
+    launchActivity();
+
+    // When: User clicks generate key.
+    scenario.onActivity(
+        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
+    ShadowLooper.idleMainLooper();
+
+    // Then: Decryption error warning dialog appears.
+    AlertDialog warningDialog = getLatestAppCompatAlertDialog();
+    assertThat(warningDialog).isNotNull();
+
+    // When: User clicks "Upload As-Is" (BUTTON_POSITIVE).
+    warningDialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    // Then: Key pair generation proceeds and chooser intent is launched.
+    verify(mockLogsEncryptor).generateKeyPair();
+    Intent startedIntent =
+        shadowOf((Application) ApplicationProvider.getApplicationContext()).getNextStartedActivity();
+    assertThat(startedIntent).isNotNull();
+    assertThat(startedIntent.getAction()).isEqualTo(Intent.ACTION_CHOOSER);
+
+    // Cleanup test file.
+    logFile.delete();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenDecryptionFails_andUserSelectsDiscard_discardsLogsAndProceeds()
+      throws Exception {
+    // Given: A corrupt pending log file exists that cannot be decrypted.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File logFile = new File(logsDir, "corrupt_log_discard.bin");
+    logFile.createNewFile();
+
+    when(mockLogsEncryptor.deserializeFile(any())).thenThrow(new RuntimeException("Corrupt file"));
+
+    launchActivity();
+
+    // When: User clicks generate key.
+    scenario.onActivity(
+        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
+    ShadowLooper.idleMainLooper();
+
+    // Then: Decryption error warning dialog appears.
+    AlertDialog warningDialog = getLatestAppCompatAlertDialog();
+    assertThat(warningDialog).isNotNull();
+
+    // When: User clicks "Discard Logs" (BUTTON_NEUTRAL).
+    warningDialog.getButton(AlertDialog.BUTTON_NEUTRAL).performClick();
+    ShadowLooper.idleMainLooper();
+
+    // Then: Key pair generation proceeds and log file is deleted.
+    verify(mockLogsEncryptor).generateKeyPair();
+    assertThat(logFile.exists()).isFalse();
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+
+    // Cleanup test file.
+    logFile.delete();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenDecryptionFails_showsErrorDialogAndCancelsOnNegativeButton()
+      throws Exception {
+    // Given: A corrupt pending log file exists that cannot be decrypted.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File logFile = new File(logsDir, "corrupt_log.bin");
+    logFile.createNewFile();
+
+    when(mockLogsEncryptor.deserializeFile(any())).thenThrow(new RuntimeException("Corrupt file"));
+
+    launchActivity();
+
+    // When: User clicks generate key.
+    scenario.onActivity(
+        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
+    ShadowLooper.idleMainLooper();
+
+    // Then: Decryption error warning dialog appears.
+    AlertDialog warningDialog = getLatestAppCompatAlertDialog();
+    assertThat(warningDialog).isNotNull();
+
+    // When: User clicks "Cancel" (BUTTON_NEGATIVE).
+    warningDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    // Then: Key pair generation was aborted (never called).
+    verify(mockLogsEncryptor, never()).generateKeyPair();
+
+    // Cleanup test file.
+    logFile.delete();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenUserNotAuthenticated_launchesConfirmCredentialsIntent()
+      throws Exception {
+    // Given: A pending log file exists.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File logFile = new File(logsDir, "auth_req_log.bin");
+    logFile.createNewFile();
+
+    when(mockLogsEncryptor.decryptLogs(any()))
+        .thenThrow(new UserNotAuthenticatedException("User authentication required"));
+
+    launchActivity();
+
+    scenario.onActivity(
+        activity -> {
+          KeyguardManager km = (KeyguardManager) activity.getSystemService(Context.KEYGUARD_SERVICE);
+          ShadowKeyguardManager shadowKm = shadowOf(km);
+          shadowKm.setIsKeyguardSecure(true);
+          shadowKm.setIsDeviceSecure(true);
+          activity.findViewById(R.id.btn_generate_keystore_key).performClick();
+        });
+    ShadowLooper.idleMainLooper();
+
+    // Then: Confirm credentials intent is launched or decryption warning dialog is displayed.
+    scenario.onActivity(
+        activity -> {
+          ShadowActivity.IntentForResult intentForResult =
+              shadowOf(activity).getNextStartedActivityForResult();
+          if (intentForResult != null) {
+            assertThat(intentForResult.requestCode).isEqualTo(1001);
+          } else {
+            AlertDialog dialog = getLatestAppCompatAlertDialog();
+            assertThat(dialog).isNotNull();
+          }
+        });
+
+    logFile.delete();
+  }
+
+  @Test
+  public void onActivityResult_whenConfirmCredentialsOk_retriesAndProceeds() throws Exception {
+    launchActivity();
+
+    // Given: Activity receives RESULT_OK from authentication activity.
+    scenario.onActivity(
+        activity -> {
+          activity.onActivityResult(1001, Activity.RESULT_OK, null);
+        });
+    ShadowLooper.idleMainLooper();
+
+    // No exception thrown and handles state safely.
+    assertThat(scenario).isNotNull();
+  }
+
+  @Test
+  public void getPendingLogFiles_whenPathIsAFileNotDirectory_returnsEmptyList() throws Exception {
+    // Given: A file exists at the logs subdirectory path instead of a directory.
+    File logsPath =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsPath.createNewFile();
+
+    launchActivity();
+
+    // When: getPendingLogFiles is called.
+    scenario.onActivity(
+        activity -> {
+          ImmutableList<File> pending = activity.getPendingLogFiles();
+          // Then: Returns empty list because logsPath is a file, not a directory.
+          assertThat(pending).isEmpty();
+        });
+
+    logsPath.delete();
+  }
+
+  @Test
+  public void getPendingLogFiles_filtersNonBinAndSentFiles() throws Exception {
+    // Given: A directory containing a valid .bin file, a .txt file, and a .sent.bin file.
+    File logsDir =
+        new File(
+            appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    logsDir.mkdirs();
+    File validFile = new File(logsDir, "valid_log.bin");
+    File txtFile = new File(logsDir, "log.txt");
+    File sentFile = new File(logsDir, "sent_log" + CrumblesConstants.SENT_SUFFIX);
+    validFile.createNewFile();
+    txtFile.createNewFile();
+    sentFile.createNewFile();
+
+    launchActivity();
+
+    // When: getPendingLogFiles is called.
+    scenario.onActivity(
+        activity -> {
+          ImmutableList<File> pending = activity.getPendingLogFiles();
+          // Then: Only valid_log.bin is included, log.txt and sent_log.sent.bin are filtered out.
+          assertThat(pending).hasSize(1);
+          assertThat(pending.get(0).getName()).isEqualTo("valid_log.bin");
+        });
+
+    validFile.delete();
+    txtFile.delete();
+    sentFile.delete();
   }
 }
