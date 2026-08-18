@@ -26,22 +26,23 @@ import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
+import com.google.protobuf.Timestamp;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
 import java.security.Provider;
 import java.security.PublicKey;
 import java.security.Security;
 import java.security.UnrecoverableKeyException;
 import java.security.spec.RSAKeyGenParameterSpec;
-import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicReference;
 import java.time.Duration;
-import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -391,6 +392,46 @@ public final class CrumblesLogsEncryptorTest {
   public void getPublicKeyHash_whenKeyIsNull_returnsUnknown() {
     String actualHash = CrumblesLogsEncryptor.getPublicKeyHash(null);
     assertThat(actualHash).isEqualTo("Unknown");
+  }
+
+  @Test
+  public void assembleCipherText_createsValidLogBatchWithTimestamp() {
+    // Given: Valid log components
+    byte[] encryptedLogs = "encryptedLogs".getBytes(UTF_8);
+    byte[] cipherSymKey = "cipherSymKey".getBytes(UTF_8);
+    byte[] cipherIv = "cipherIv".getBytes(UTF_8);
+
+    // When: LogBatch is assembled
+    LogBatch logBatch =
+        CrumblesLogsEncryptor.assembleCipherText(encryptedLogs, cipherSymKey, cipherIv);
+
+    // Then: All components and timestamp metadata are correctly constructed
+    assertThat(logBatch).isNotNull();
+    assertThat(logBatch.getData().getLogBlob().toByteArray()).isEqualTo(encryptedLogs);
+    assertThat(logBatch.getKey().getEncryptedSymmetricKey().toByteArray()).isEqualTo(cipherSymKey);
+    assertThat(logBatch.getKey().getIv().toByteArray()).isEqualTo(cipherIv);
+    assertThat(logBatch.getMetadata().getBlobSize()).isEqualTo(encryptedLogs.length);
+    assertThat(logBatch.getMetadata().getTimestamp().getSeconds()).isGreaterThan(0L);
+    assertThat(logBatch.getMetadata().getTimestamp().getNanos()).isAtLeast(0);
+    assertThat(logBatch.getMetadata().getTimestamp().getNanos()).isLessThan(1_000_000_000);
+  }
+
+  @Test
+  public void timestampFromMillis_correctlyComputesSecondsAndNanos() {
+    long millis = 1700000123456L;
+    Timestamp timestamp = CrumblesLogsEncryptor.timestampFromMillis(millis);
+
+    assertThat(timestamp.getSeconds()).isEqualTo(1700000123L);
+    assertThat(timestamp.getNanos()).isEqualTo(456_000_000);
+  }
+
+  @Test
+  public void timestampFromMillis_withZeroFraction_returnsZeroNanos() {
+    long millis = 1700000000000L;
+    Timestamp timestamp = CrumblesLogsEncryptor.timestampFromMillis(millis);
+
+    assertThat(timestamp.getSeconds()).isEqualTo(1700000000L);
+    assertThat(timestamp.getNanos()).isEqualTo(0);
   }
 
   // --- Serialization/Deserialization Test ---

@@ -32,7 +32,7 @@ import com.google.common.time.TimeSource;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.ExtensionRegistryLite;
-import com.google.protobuf.util.Timestamps;
+import com.google.protobuf.Timestamp;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.KeyEncryptionType;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
@@ -48,7 +48,6 @@ import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
-import java.time.Duration;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
@@ -56,6 +55,7 @@ import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.cert.Certificate;
 import java.security.spec.X509EncodedKeySpec;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -474,6 +474,14 @@ public class CrumblesLogsEncryptor {
     }
   }
 
+  @VisibleForTesting
+  static Timestamp timestampFromMillis(long millis) {
+    return Timestamp.newBuilder()
+        .setSeconds(Math.floorDiv(millis, 1000L))
+        .setNanos((int) (Math.floorMod(millis, 1000L) * 1_000_000L))
+        .build();
+  }
+
   public static LogBatch assembleCipherText(
       byte[] encryptedLogsBytes, byte[] cipherSymKeyBytes, byte[] cipherIvBytes) {
     LogData logData =
@@ -491,7 +499,7 @@ public class CrumblesLogsEncryptor {
     LogMetadata logMetadata =
         LogMetadata.newBuilder()
             .setBlobSize(encryptedLogsBytes.length)
-            .setTimestamp(Timestamps.fromMillis(TimeSource.system().instant().toEpochMilli()))
+            .setTimestamp(timestampFromMillis(TimeSource.system().instant().toEpochMilli()))
             .setDevice(deviceId)
             .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
             .build();
