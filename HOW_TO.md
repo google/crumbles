@@ -1,4 +1,5 @@
 # Crumbles User & Administrator Guide
+<!-- disableFinding(LINE_OVER_80) -->
 
 ## What is Crumbles?
 Crumbles is a privacy-first Android security application designed for high-risk individuals, journalists, human rights defenders, and security teams. It continuously records Android **Security Logs** (system events, authentication attempts) and **Network Logs** (connection activity) to help detect mobile exploits and suspicious behavior.
