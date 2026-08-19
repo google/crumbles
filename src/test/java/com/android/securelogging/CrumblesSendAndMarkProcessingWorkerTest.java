@@ -19,26 +19,20 @@ package com.android.securelogging;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
-import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import android.app.NotificationManager;
-import android.content.ComponentName;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.net.Uri;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.work.ListenableWorker.Result;
 import androidx.work.testing.TestListenableWorkerBuilder;
-import com.android.securelogging.exceptions.CrumblesKeysException;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
 import java.time.InstantSource;
 import java.util.concurrent.ExecutionException;
 import org.junit.After;
@@ -48,10 +42,7 @@ import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.robolectric.RobolectricTestRunner;
-import org.robolectric.Shadows;
 import org.robolectric.shadows.ShadowLog;
-import org.robolectric.shadows.ShadowNotificationManager;
-import org.robolectric.shadows.ShadowPackageManager;
 
 /** Unit tests for {@link CrumblesSendAndMarkProcessingWorker}. */
 @RunWith(RobolectricTestRunner.class)
@@ -60,38 +51,20 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
   private File testDirectory;
 
   @Mock private CrumblesLogsEncryptor mockLogsEncryptor;
-  @Mock private CrumblesUriGenerator mockUriGenerator;
-  private KeyPair testKeyPair;
-
-  /**
-   * Helper method to insert a suffix before the extension of a filename.
-   *
-   * @param filename The filename to modify.
-   * @param suffix The suffix to insert.
-   * @return The modified filename with the suffix inserted.
-   */
-  private String insertSuffixBeforeExtension(String filename, String suffix) {
-    int dotIndex = filename.lastIndexOf('.');
-    if (dotIndex != -1) {
-      return filename.substring(0, dotIndex) + suffix + filename.substring(dotIndex);
-    }
-    return filename + suffix;
-  }
+  @Mock private CrumblesAppAuditLogger mockAuditLogger;
 
   private void deleteRecursive(File fileOrDirectory) {
     if (fileOrDirectory.isDirectory()) {
-      for (File child : fileOrDirectory.listFiles()) {
-        deleteRecursive(child);
+      File[] children = fileOrDirectory.listFiles();
+      if (children != null) {
+        for (File child : children) {
+          deleteRecursive(child);
+        }
       }
     }
     fileOrDirectory.delete();
   }
 
-  /**
-   * Helper method to create a file with a specific timestamp, processing status, and sent status.
-   * The file name is based on the timestamp, and it is marked as processing or sent if the
-   * corresponding parameter is true.
-   */
   @CanIgnoreReturnValue
   private File createFile(String namePrefix, long timestamp, String suffix, String content)
       throws IOException {
@@ -102,33 +75,21 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     return file;
   }
 
-  private void setupMockEmailClient(ShadowPackageManager shadowPackageManager) {
-    ComponentName emailClientComponent = new ComponentName("com.example.email", "EmailActivity");
-    shadowPackageManager.addActivityIfNotPresent(emailClientComponent);
-    IntentFilter intentFilter = new IntentFilter(Intent.ACTION_SEND_MULTIPLE);
-    intentFilter.addCategory(Intent.CATEGORY_DEFAULT);
-    try {
-      intentFilter.addDataType("application/octet-stream");
-    } catch (IntentFilter.MalformedMimeTypeException e) {
-      fail("Test setup failed: Malformed MIME type: " + e.getMessage());
-    }
-    shadowPackageManager.addIntentFilterForActivity(emailClientComponent, intentFilter);
-  }
-
-  private Uri createDummyUriForFile(File file) {
-    return Uri.parse("content://com.android.securelogging.fileprovider/test/" + file.getName());
-  }
-
   @Before
   public void setUp() throws Exception {
     MockitoAnnotations.openMocks(this);
     context = ApplicationProvider.getApplicationContext();
     ShadowLog.stream = System.out;
 
-    testKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
     CrumblesMain.setLogsEncryptorInstanceForTest(mockLogsEncryptor);
+    CrumblesAppAuditLogger.setInstanceForTest(mockAuditLogger);
 
-    CrumblesSendAndMarkProcessingWorker.testUriGeneratorInstance = mockUriGenerator;
+    // Clear shared preferences
+    context
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .clear()
+        .commit();
 
     File baseDir = context.getFilesDir();
     testDirectory = new File(baseDir, CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
@@ -147,94 +108,123 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
       deleteRecursive(testDirectory);
     }
     CrumblesMain.setLogsEncryptorInstanceForTest(null);
-    // Clean up the static mock instances.
-    CrumblesSendAndMarkProcessingWorker.testUriGeneratorInstance = null;
+    CrumblesAppAuditLogger.setInstanceForTest(null);
   }
 
   @Test
-  public void doWork_whenInternalKeyAvailable_proceedsWithUpload()
+  public void doWork_whenNoKeyAvailable_deletesAllLogsAndReturnsSuccess()
       throws IOException, ExecutionException, InterruptedException {
-    // Given: An internal key is available.
-    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
-    // And: An unprocessed file exists.
-    File fileToProcess =
-        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
-    // And: An email client is available.
-    setupMockEmailClient(Shadows.shadowOf(context.getPackageManager()));
-    // And: Our mock UriGenerator will successfully return a dummy URI for any file.
-    when(mockUriGenerator.getUriForFile(any(Context.class), any(File.class)))
-        .thenAnswer(invocation -> createDummyUriForFile(invocation.getArgument(1)));
-
-    // When: The worker executes.
-    CrumblesSendAndMarkProcessingWorker worker =
-        TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
-            .build();
-    Result result = worker.startWork().get();
-
-    // Then: The worker succeeds and shows a notification.
-    assertEquals(Result.success(), result);
-    File processingFile =
-        new File(
-            testDirectory, insertSuffixBeforeExtension(fileToProcess.getName(), "_processing"));
-    assertTrue("File should have been renamed to processing.", processingFile.exists());
-    assertFalse("Original file should have been removed.", fileToProcess.exists());
-    ShadowNotificationManager shadowManager =
-        Shadows.shadowOf(
-            (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE));
-    assertTrue("A notification should have been shown.", shadowManager.size() > 0);
-  }
-
-  @Test
-  public void doWork_unprocessedFilesExistAndNoEmailClient_returnsRetry()
-      throws IOException, ExecutionException, InterruptedException {
-    // Given: Keys are available.
-    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
-    // And: An unprocessed file exists.
-    File fileToProcess =
-        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
-    // And: No email client is available.
-    // And: Our mock UriGenerator will successfully return a dummy URI.
-    when(mockUriGenerator.getUriForFile(any(Context.class), any(File.class)))
-        .thenAnswer(invocation -> createDummyUriForFile(invocation.getArgument(1)));
-
-    // When: The worker executes.
-    CrumblesSendAndMarkProcessingWorker worker =
-        TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
-            .build();
-    Result result = worker.startWork().get();
-
-    // Then: The result should be retry because no email client was found.
-    assertEquals(Result.retry(), result);
-    // And: The file was still renamed.
-    File processingFile =
-        new File(
-            testDirectory, insertSuffixBeforeExtension(fileToProcess.getName(), "_processing"));
-    assertTrue("File should have been renamed to processing.", processingFile.exists());
-  }
-
-  @Test
-  public void doWork_whenExternalKeyAvailable_proceedsWithUpload()
-      throws IOException, ExecutionException, InterruptedException, CrumblesKeysException {
-    // Given: An external key is available.
+    // Given: No keys exist
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
 
-    // Use a real manager to save the key to the test's shared preferences.
-    CrumblesExternalPublicKeyManager.getInstance(context)
-        .saveActiveExternalPublicKey(testKeyPair.getPublic());
-
-    // And: An email client is available.
-    setupMockEmailClient(Shadows.shadowOf(context.getPackageManager()));
-    // And: Our mock UriGenerator will successfully return a dummy URI.
-    when(mockUriGenerator.getUriForFile(any(Context.class), any(File.class)))
-        .thenAnswer(invocation -> createDummyUriForFile(invocation.getArgument(1)));
-
-    // When: The worker executes.
+    // When: Worker runs
     CrumblesSendAndMarkProcessingWorker worker =
         TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
             .build();
     Result result = worker.startWork().get();
 
-    // Then: The worker succeeds.
+    // Then: Returns success and orphaned log file is deleted
+    assertEquals(Result.success(), result);
+    assertFalse("Orphaned log file should be deleted", fileToProcess.exists());
+  }
+
+  @Test
+  public void doWork_whenDestinationNotConfigured_returnsRetryAndPreservesLogFiles()
+      throws IOException, ExecutionException, InterruptedException {
+    // Given: Key is available, but upload destination is not configured
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    // When: Worker runs
+    CrumblesSendAndMarkProcessingWorker worker =
+        TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
+            .build();
+    Result result = worker.startWork().get();
+
+    // Then: Returns retry to prevent data loss, and original log file remains intact
+    assertEquals(Result.retry(), result);
+    assertTrue("Original log file must be preserved without data loss", fileToProcess.exists());
+  }
+
+  @Test
+  public void doWork_whenDestinationPermissionMissing_returnsRetryAndPreservesLogFiles()
+      throws IOException, ExecutionException, InterruptedException {
+    // Given: Key is available and destination URI is saved, but OS persistable permission is missing
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    context
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(
+            CrumblesConstants.PREF_UPLOAD_DESTINATION_URI,
+            "content://com.android.externalstorage.documents/tree/fake")
+        .commit();
+
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    // When: Worker runs
+    CrumblesSendAndMarkProcessingWorker worker =
+        TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
+            .build();
+    Result result = worker.startWork().get();
+
+    // Then: Returns retry due to missing permission grant, logs audit event, and original file is preserved
+    assertEquals(Result.retry(), result);
+    assertTrue("Original log file must be preserved on permission check failure", fileToProcess.exists());
+    verify(mockAuditLogger)
+        .logEvent(eq("UPLOAD_DESTINATION_PERMISSION_REVOKED"), anyString());
+  }
+
+  @Test
+  public void doWork_whenFileCannotBeRenamedToProcessing_returnsRetry()
+      throws IOException, ExecutionException, InterruptedException {
+    // Given: Key is available and destination URI is configured
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    context
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(
+            CrumblesConstants.PREF_UPLOAD_DESTINATION_URI,
+            "content://com.android.externalstorage.documents/tree/fake")
+        .commit();
+
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    // Make testDirectory read-only so renaming fails
+    testDirectory.setWritable(false);
+
+    try {
+      // When: Worker runs
+      CrumblesSendAndMarkProcessingWorker worker =
+          TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
+              .build();
+      Result result = worker.startWork().get();
+
+      // Then: Returns retry and preserves original log file
+      assertEquals(Result.retry(), result);
+      assertTrue("Original log file must be preserved on rename failure", fileToProcess.exists());
+    } finally {
+      testDirectory.setWritable(true);
+    }
+  }
+
+  @Test
+  public void doWork_noUnprocessedFiles_returnsSuccess()
+      throws ExecutionException, InterruptedException {
+    // Given: Key is available, but no .bin files exist
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+
+    // When: Worker runs
+    CrumblesSendAndMarkProcessingWorker worker =
+        TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
+            .build();
+    Result result = worker.startWork().get();
+
+    // Then: Returns success
     assertEquals(Result.success(), result);
   }
 }

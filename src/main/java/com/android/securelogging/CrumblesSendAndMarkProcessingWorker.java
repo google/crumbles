@@ -16,49 +16,43 @@
 
 package com.android.securelogging;
 
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.content.Context;
-import android.content.Intent;
+import android.content.UriPermission;
 import android.net.Uri;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.annotation.VisibleForTesting;
-import androidx.core.app.NotificationCompat;
-import androidx.core.content.FileProvider;
+import androidx.documentfile.provider.DocumentFile;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.google.android.libraries.security.content.SafeContentResolver;
+import com.google.android.libraries.security.content.SafeContentResolver.SourcePolicy;
+import com.google.common.io.ByteStreams;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.security.PublicKey;
-import java.time.InstantSource;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
- * A WorkManager worker class that handles the processing and sending of encrypted log files.
+ * A WorkManager worker class that handles the automated upload of encrypted log files.
  *
  * <p>This worker performs the following tasks:
  *
  * <ul>
  *   <li>Checks for encryption key availability. If no key, deletes existing logs.
  *   <li>Finds unprocessed crumble log files (.bin files) in the designated directory.
- *   <li>Marks the filtered files as "processing" by renaming them.
- *   <li>Creates a notification with an intent to allow the user to upload the files using the
- *       preferred upload method (e.g., email, drive, etc.).
- *   <li>Handles cases where no uploading client is available.
- *   <li>Includes retry logic if the uploading fails.
+ *   <li>Verifies the configured Google Drive destination folder and its persistable write permissions.
+ *   <li>Streams encrypted log files directly to the destination folder using DocumentFile.
+ *   <li>Transitions files to _sent.bin only on verified write completion.
+ *   <li>Safely reverts files to .bin on any failure for automatic retry, preventing data loss.
  * </ul>
  */
 public class CrumblesSendAndMarkProcessingWorker extends Worker {
 
   private static final String TAG = "CrumblesSendAndMarkProcessingWorker";
-  private final CrumblesUriGenerator uriGenerator;
-
-  @SuppressWarnings("NonFinalStaticField")
-  @VisibleForTesting
-  static CrumblesUriGenerator testUriGeneratorInstance = null;
 
   /**
    * Constructor for the CrumblesSendAndMarkProcessingWorker.
@@ -69,16 +63,6 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
   public CrumblesSendAndMarkProcessingWorker(
       @NonNull Context context, @NonNull WorkerParameters workerParams) {
     super(context, workerParams);
-    // Use the test instance if it's been set, otherwise use the real one.
-    if (testUriGeneratorInstance != null) {
-      this.uriGenerator = testUriGeneratorInstance;
-    } else {
-      this.uriGenerator = new CrumblesUriGenerator();
-    }
-  }
-
-  private static int createNotificationId() {
-    return (int) InstantSource.system().instant().toEpochMilli();
   }
 
   /*
@@ -109,7 +93,6 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
       return Result.success();
     }
 
-    createNotificationChannel(context);
     File directory =
         new File(
             context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
@@ -130,12 +113,139 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
       return Result.success();
     }
 
-    List<Uri> filesToSendUris = markFilesAsProcessing(context, unprocessedBinFiles, directory);
-    if (filesToSendUris.isEmpty()) {
-      Log.d(TAG, "No files were marked for processing (e.g., due to URI generation errors).");
-      return Result.success();
+    return processAndUploadFiles(context, unprocessedBinFiles, directory);
+  }
+
+  /**
+   * Processes unprocessed .bin files, streams them to the configured Google Drive destination,
+   * and transitions files to _sent.bin only on verified stream write completion. On any error,
+   * files are safely restored to .bin for automated retry.
+   */
+  private Result processAndUploadFiles(
+      Context context, File[] unprocessedBinFiles, File directory) {
+    DocumentFile targetDir = resolveUploadDestination(context);
+    if (targetDir == null) {
+      return Result.retry();
     }
-    return triggerUploading(context, filesToSendUris);
+
+    int uploadedCount = 0;
+    boolean hasFailures = false;
+
+    for (File file : unprocessedBinFiles) {
+      if (uploadSingleFile(context, targetDir, file, directory)) {
+        uploadedCount++;
+      } else {
+        hasFailures = true;
+      }
+    }
+
+    if (uploadedCount > 0) {
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "LOGS_UPLOAD_SUCCESS",
+              "Successfully automatically uploaded "
+                  + uploadedCount
+                  + " log file(s) to Google Drive destination.");
+    }
+
+    return hasFailures ? Result.retry() : Result.success();
+  }
+
+  @Nullable
+  private static DocumentFile resolveUploadDestination(Context context) {
+    String uriString =
+        context
+            .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, null);
+
+    if (uriString == null) {
+      Log.w(TAG, "Upload destination URI not configured. Logs will remain safely on device.");
+      return null;
+    }
+
+    Uri treeUri = Uri.parse(uriString);
+    boolean hasValidPersistedGrant = false;
+    for (UriPermission perm : context.getContentResolver().getPersistedUriPermissions()) {
+      if (perm.getUri().equals(treeUri) && perm.isWritePermission()) {
+        hasValidPersistedGrant = true;
+        break;
+      }
+    }
+
+    if (!hasValidPersistedGrant) {
+      Log.e(TAG, "Persisted write permission missing or revoked for: " + uriString);
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "UPLOAD_DESTINATION_PERMISSION_REVOKED",
+              "Upload failed because persistable write permission was missing or revoked.");
+      return null;
+    }
+
+    DocumentFile targetDir = DocumentFile.fromTreeUri(context, treeUri);
+    if (targetDir == null || !targetDir.isDirectory() || !targetDir.canWrite()) {
+      Log.e(TAG, "Target directory is invalid or not writable: " + uriString);
+      return null;
+    }
+    return targetDir;
+  }
+
+  private static boolean uploadSingleFile(
+      Context context, DocumentFile targetDir, File file, File directory) {
+    String originalName = file.getName();
+    if (!originalName.endsWith(".bin")) {
+      Log.e(TAG, "Unexpected non-bin file in unprocessed list: " + originalName);
+      return false;
+    }
+
+    String baseName = originalName.substring(0, originalName.length() - ".bin".length());
+    String newProcessingName = baseName + CrumblesConstants.PROCESSING_SUFFIX;
+    File processingFile = new File(directory, newProcessingName);
+    if (!file.renameTo(processingFile)) {
+      Log.e(TAG, "Could not rename to processing: " + originalName);
+      return false;
+    }
+
+    boolean uploadSuccess =
+        streamFileToDestination(context, targetDir, processingFile, originalName);
+
+    if (uploadSuccess) {
+      File sentFile = new File(directory, baseName + CrumblesConstants.SENT_SUFFIX);
+      if (processingFile.renameTo(sentFile)) {
+        Log.d(TAG, "Successfully uploaded and marked as sent: " + sentFile.getName());
+        return true;
+      }
+      Log.e(TAG, "Failed to rename to sent: " + processingFile.getName());
+    }
+
+    // Safe rollback to ensure no logs are lost
+    File originalFile = new File(directory, originalName);
+    if (!processingFile.renameTo(originalFile)) {
+      Log.e(TAG, "Failed to revert processing file to original: " + processingFile.getName());
+    }
+    Log.w(TAG, "Reverted processing file back to original for retry: " + originalName);
+    return false;
+  }
+
+  private static boolean streamFileToDestination(
+      Context context, DocumentFile targetDir, File processingFile, String originalName) {
+    try {
+      DocumentFile targetDocFile = targetDir.createFile("application/octet-stream", originalName);
+      if (targetDocFile != null) {
+        try (InputStream in = new FileInputStream(processingFile);
+            OutputStream out =
+                SafeContentResolver.openOutputStream(
+                    context, targetDocFile.getUri(), SourcePolicy.EXTERNAL_ONLY)) {
+          if (out != null) {
+            ByteStreams.copy(in, out);
+            out.flush();
+            return true;
+          }
+        }
+      }
+    } catch (IOException | SecurityException e) {
+      Log.e(TAG, "Failed to upload file " + originalName + " to destination", e);
+    }
+    return false;
   }
 
   /**
@@ -184,145 +294,5 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
             + directory.getAbsolutePath());
   }
 
-  /**
-   * Triggers the upload of the files by showing a notification with an intent to launch the
-   * uploading client chooser. The notification is shown to the user, and when the user taps it, the
-   * intent is launched.
-   *
-   * @param context The application context.
-   * @param filesToSendUris The list of URIs to send.
-   * @return The result of the upload operation.
-   */
-  @SuppressWarnings("PendingIntentMutability")
-  private Result triggerUploading(Context context, List<Uri> filesToSendUris) {
-    // Create the email intent - this will be launched by the notification.
-    Intent emailIntent = new Intent(Intent.ACTION_SEND_MULTIPLE);
-    emailIntent.setType("application/octet-stream");
-    emailIntent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, (ArrayList<Uri>) filesToSendUris);
-    emailIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
 
-    // Verify if there's any uploading client to handle the intent (before showing notification).
-    if (emailIntent.resolveActivity(context.getPackageManager()) == null) {
-      Log.w(TAG, "No uploading client found. Cannot show notification to upload logs.");
-      // If no uploading client, then the work can't proceed.
-      // Return retry - maybe an email client will be installed later.
-      return Result.retry();
-    }
-
-    // Create a PendingIntent to launch the uploading client chooser.
-    // Request code should be unique, here using a fixed ID.
-    // FLAG_UPDATE_CURRENT will update the PendingIntent if a new one is created for the same ID.
-    int notificationId = createNotificationId();
-    // The use of PendingIntent in the current implementation is already secure and changing it to
-    // SaferPendingIntent would be non-trivial as well as restricting the supported Android versions
-    // while Crumbles is meant to support older versions instead.
-    PendingIntent pendingIntent =
-        PendingIntent.getActivity(
-            context,
-            notificationId, // Use a unique request code.
-            Intent.createChooser(emailIntent, "Upload Filtered Log Files..."),
-            PendingIntent.FLAG_UPDATE_CURRENT
-                | PendingIntent.FLAG_IMMUTABLE // FLAG_IMMUTABLE is required for API 23+.
-            );
-
-    // Build the notification.
-    NotificationCompat.Builder builder =
-        new NotificationCompat.Builder(context, CrumblesConstants.NOTIFICATION_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_dialog_email)
-            .setContentTitle("New Encrypted Log Files Ready to Upload")
-            .setContentText("Tap to upload " + filesToSendUris.size() + " encrypted log file(s).")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true);
-
-    NotificationManager notificationManager =
-        (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
-    if (notificationManager != null) {
-      notificationManager.notify(notificationId, builder.build());
-      Log.d(TAG, "Notification shown to upload.");
-      return Result.success(); // Task succeeded by showing notification.
-    } else {
-      Log.e(TAG, "NotificationManager is null. Cannot show notification.");
-      return Result.failure(); // Critical failure to get NotificationManager.
-    }
-  }
-
-  @Nullable
-  protected Uri getUriForFileInternal(
-      @NonNull Context context, @NonNull String authority, @NonNull File file) {
-    try {
-      return FileProvider.getUriForFile(context, authority, file);
-    } catch (IllegalArgumentException e) {
-      Log.e(TAG, "Error getting URI for file " + file.getName() + ": " + e.getMessage());
-      return null; // Return null on failure so markFilesAsProcessing can handle it.
-    }
-  }
-
-  private List<Uri> markFilesAsProcessing(
-      Context context, File[] unprocessedBinFiles, File directory) {
-    List<Uri> filesToSendUris = new ArrayList<>();
-    for (File file : unprocessedBinFiles) {
-      String fileName = file.getName();
-      String newProcessingName = insertSuffixBeforeExtension(fileName, "_processing");
-      if (newProcessingName == null) {
-        Log.e(TAG, "Failed to create new processing name for: " + fileName);
-        continue;
-      }
-      File newProcessingFile = new File(directory, newProcessingName);
-
-      if (file.renameTo(newProcessingFile)) {
-        Log.d(TAG, "Renamed " + fileName + " to " + newProcessingName);
-
-        Uri fileUri = this.uriGenerator.getUriForFile(context, newProcessingFile);
-
-        if (fileUri != null) {
-          filesToSendUris.add(fileUri);
-          Log.d(TAG, "Added file URI (matches filter): " + fileUri);
-        } else {
-          Log.w(
-              TAG, "URI for " + newProcessingName + " was null. File will not be sent this cycle.");
-          // If URI generation fails, the file remains _processing. It will be retried next time.
-          // No explicit retry here, as we'll rely on WorkManager's retry for the whole worker if
-          // notification fails.
-        }
-      } else {
-        Log.e(TAG, "Failed to rename file to _processing: " + fileName);
-      }
-    }
-    return filesToSendUris;
-  }
-
-  /**
-   * Creates the notification channel for the encrypted log files.
-   *
-   * @param context The application context.
-   */
-  private void createNotificationChannel(Context context) {
-    String name = "Upload Log Notifications";
-    String description = "Notifications for uploading encrypted log files.";
-    int importance = NotificationManager.IMPORTANCE_HIGH;
-    NotificationChannel channel =
-        new NotificationChannel(CrumblesConstants.NOTIFICATION_CHANNEL_ID, name, importance);
-    channel.setDescription(description);
-
-    NotificationManager notificationManager = context.getSystemService(NotificationManager.class);
-    if (notificationManager != null) {
-      notificationManager.createNotificationChannel(channel);
-    }
-  }
-
-  /**
-   * Inserts a suffix before the extension of a filename.
-   *
-   * @param filename The filename to modify.
-   * @param suffix The suffix to insert.
-   * @return The modified filename with the suffix inserted.
-   */
-  private String insertSuffixBeforeExtension(String filename, String suffix) {
-    int dotIndex = filename.lastIndexOf('.');
-    if (dotIndex != -1) {
-      return filename.substring(0, dotIndex) + suffix + filename.substring(dotIndex);
-    }
-    return filename + suffix;
-  }
 }

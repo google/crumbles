@@ -48,6 +48,7 @@ public final class CrumblesConstants {
   public static final String PREFS_NAME = "CrumblesPrefs";
   public static final String PREF_EXTERNAL_PUBLIC_KEY_B64 = "externalPublicKeyBase64";
   public static final String PREF_RE_ENCRYPT_PUBLIC_KEY_B64 = "reEncryptPublicKeyBase64";
+  public static final String PREF_UPLOAD_DESTINATION_URI = "uploadDestinationUri";
 
   public static final String ZXING_PACKAGE_NAME = "com.google.zxing.client.android";
 
