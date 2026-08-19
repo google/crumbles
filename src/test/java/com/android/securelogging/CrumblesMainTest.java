@@ -28,7 +28,9 @@ import static org.robolectric.Shadows.shadowOf;
 import android.Manifest;
 import android.app.Activity;
 import android.app.Application;
+import android.app.KeyguardManager;
 import android.app.admin.DevicePolicyManager;
+import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.ContentProvider;
 import android.content.ContentValues;
@@ -515,7 +517,7 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           try {
-            byte[] unused = activity.readBytesFromUri(externalFileUri);
+            var _ = activity.readBytesFromUri(externalFileUri);
           } catch (SecurityException se) {
             caughtException[0] = se;
           } catch (IOException e) {
@@ -713,8 +715,243 @@ public class CrumblesMainTest {
         .isFalse();
 
     verify(mockLogsEncryptor).doesPrivateKeyExist();
+  }
 
-    controller.destroy();
+  @Test
+  public void testSelectUploadDestination_whenDeviceSecure_launchesKeyguardIntent() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    shadowOf((KeyguardManager) activity.getSystemService(Context.KEYGUARD_SERVICE))
+        .setIsDeviceSecure(true);
+
+    Button selectDestButton = activity.findViewById(R.id.btn_select_upload_dest);
+    assertThat(selectDestButton).isNotNull();
+    assertThat(selectDestButton.isEnabled()).isTrue();
+    assertThat(selectDestButton.hasOnClickListeners()).isTrue();
+
+    shadowOf(activity).clearNextStartedActivities();
+    selectDestButton.performClick();
+
+    Intent nextIntent = shadowOf(activity).getNextStartedActivity();
+    assertThat(nextIntent).isNotNull();
+  }
+
+  @Test
+  public void testSelectUploadDestination_whenDeviceNotSecure_launchesDocumentTreePicker() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    shadowOf((KeyguardManager) activity.getSystemService(Context.KEYGUARD_SERVICE))
+        .setIsDeviceSecure(false);
+
+    Button selectDestButton = activity.findViewById(R.id.btn_select_upload_dest);
+    shadowOf(activity).clearNextStartedActivities();
+    selectDestButton.performClick();
+
+    Intent nextIntent = shadowOf(activity).getNextStartedActivity();
+    assertThat(nextIntent).isNotNull();
+    assertThat(nextIntent.getAction()).isEqualTo(Intent.ACTION_OPEN_DOCUMENT_TREE);
+  }
+
+  @Test
+  public void testUploadDestination_authSucceeded_launchesDocumentTreePicker() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    activity.onActivityResult(
+        CrumblesConstants.KEYGUARD_DESTINATION_REQUEST_CODE, Activity.RESULT_OK, null);
+
+    Intent nextIntent = shadowOf(activity).getNextStartedActivity();
+    assertThat(nextIntent).isNotNull();
+    assertThat(nextIntent.getAction()).isEqualTo(Intent.ACTION_OPEN_DOCUMENT_TREE);
+  }
+
+  @Test
+  public void testUploadDestination_authCancelled_showsToastAndLogs() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    activity.onActivityResult(
+        CrumblesConstants.KEYGUARD_DESTINATION_REQUEST_CODE, Activity.RESULT_CANCELED, null);
+
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo("Authentication cancelled. Destination unchanged.");
+  }
+
+  @Test
+  public void testUploadDestination_fileTreeCancelled_showsToast() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    activity.onActivityResult(
+        CrumblesConstants.FILE_TREE_REQUEST_CODE, Activity.RESULT_CANCELED, null);
+
+    assertThat(ShadowToast.getTextOfLatestToast()).isEqualTo("Destination selection cancelled.");
+  }
+
+  @Test
+  public void testUploadDestination_invalidNonContentUri_showsToast() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    Intent data = new Intent();
+    data.setData(Uri.parse("file:///sdcard/Download"));
+
+    activity.onActivityResult(CrumblesConstants.FILE_TREE_REQUEST_CODE, Activity.RESULT_OK, data);
+
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo("Invalid destination: write permission could not be verified.");
+  }
+
+  @Test
+  public void testUpdateUploadDestinationStatusUi_whenValidGrant_showsConfigured() {
+    Uri treeUri = Uri.parse("content://com.android.externalstorage.documents/tree/my_drive");
+    ApplicationProvider.getApplicationContext()
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, treeUri.toString())
+        .commit();
+
+    ApplicationProvider.getApplicationContext()
+        .getContentResolver()
+        .takePersistableUriPermission(
+            treeUri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
+    assertThat(statusTextView).isNotNull();
+    assertThat(statusTextView.getText().toString()).contains("Google Drive (Active)");
+  }
+
+  @Test
+  public void testUpdateUploadDestinationStatusUi_whenNotConfigured_showsNotSet() {
+    ApplicationProvider.getApplicationContext()
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .remove(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI)
+        .commit();
+
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
+    assertThat(statusTextView).isNotNull();
+    assertThat(statusTextView.getText().toString())
+        .isEqualTo(activity.getString(R.string.upload_dest_status_not_set));
+  }
+
+  @Test
+  public void testUpdateUploadDestinationStatusUi_whenUriConfiguredButGrantMissing_showsNotSet() {
+    Uri treeUri = Uri.parse("content://com.android.externalstorage.documents/tree/revoked_drive");
+    ApplicationProvider.getApplicationContext()
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, treeUri.toString())
+        .commit();
+
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
+    assertThat(statusTextView).isNotNull();
+    assertThat(statusTextView.getText().toString())
+        .isEqualTo(activity.getString(R.string.upload_dest_status_not_set));
+  }
+
+  @Test
+  public void testChangeUploadDestinationButton_whenDeviceInsecure_launchesOpenDocumentTree() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    Button changeDestButton = activity.findViewById(R.id.btn_select_upload_dest);
+    assertThat(changeDestButton).isNotNull();
+    changeDestButton.performClick();
+
+    Intent startedIntent = shadowOf(activity).getNextStartedActivityForResult().intent;
+    assertThat(startedIntent).isNotNull();
+    assertThat(startedIntent.getAction()).isEqualTo(Intent.ACTION_OPEN_DOCUMENT_TREE);
+    assertThat(startedIntent.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION).isNotEqualTo(0);
+    assertThat(startedIntent.getFlags() & Intent.FLAG_GRANT_WRITE_URI_PERMISSION).isNotEqualTo(0);
+    assertThat(startedIntent.getFlags() & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        .isNotEqualTo(0);
+  }
+
+  @Test
+  public void testUploadDestination_keyguardSuccess_launchesOpenDocumentTree() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    activity.onActivityResult(
+        CrumblesConstants.KEYGUARD_DESTINATION_REQUEST_CODE, Activity.RESULT_OK, null);
+
+    Intent startedIntent = shadowOf(activity).getNextStartedActivityForResult().intent;
+    assertThat(startedIntent).isNotNull();
+    assertThat(startedIntent.getAction()).isEqualTo(Intent.ACTION_OPEN_DOCUMENT_TREE);
+  }
+
+  @Test
+  public void testUploadDestination_validTreeUri_persistsPermissionAndUpdatesUi() {
+    Uri treeUri = Uri.parse("content://com.android.externalstorage.documents/tree/valid_folder");
+    ApplicationProvider.getApplicationContext()
+        .getContentResolver()
+        .takePersistableUriPermission(
+            treeUri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    CrumblesMain activity = controller.get();
+
+    Intent data = new Intent();
+    data.setData(treeUri);
+    data.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+    activity.onActivityResult(CrumblesConstants.FILE_TREE_REQUEST_CODE, Activity.RESULT_OK, data);
+
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(activity.getString(R.string.toast_upload_dest_set_success));
+
+    String savedUri =
+        ApplicationProvider.getApplicationContext()
+            .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, null);
+    assertThat(savedUri).isEqualTo(treeUri.toString());
+
+    TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
+    assertThat(statusTextView.getText().toString()).contains("Google Drive (Active)");
+  }
+
+  private static class ThrowingTreePickerActivity extends CrumblesMain {
+    @Override
+    public void startActivityForResult(Intent intent, int requestCode) {
+      throw new ActivityNotFoundException("Simulated missing document tree picker");
+    }
+  }
+
+  @Test
+  public void launchDocumentTreePicker_whenActivityNotFound_showsToast() {
+    ActivityController<ThrowingTreePickerActivity> controller =
+        Robolectric.buildActivity(ThrowingTreePickerActivity.class).setup();
+    ThrowingTreePickerActivity activity = controller.get();
+
+    activity.launchDocumentTreePicker();
+
+    assertThat(ShadowToast.getTextOfLatestToast()).isEqualTo("Could not open directory picker.");
   }
 
   /** Fake implementation of ContentProvider for testing purposes. */

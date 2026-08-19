@@ -22,10 +22,12 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.KeyguardManager;
 import android.app.admin.DevicePolicyManager;
+import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.UriPermission;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
@@ -72,6 +74,7 @@ public class CrumblesMain extends FragmentActivity {
 
   private CrumblesExternalPublicKeyManager publicKeyManager;
   private TextView encryptionKeyStatusTextView;
+  private TextView uploadDestinationStatusTextView;
 
   private List<Uri> pendingFileUrisForDecryption;
 
@@ -127,6 +130,7 @@ public class CrumblesMain extends FragmentActivity {
 
     // Field initialization is now handled by the lazy getter.
     encryptionKeyStatusTextView = findViewById(R.id.encryption_key_status_textview);
+    uploadDestinationStatusTextView = findViewById(R.id.upload_destination_status_textview);
 
     // Single key management button.
     Button manageKeyButton = findViewById(R.id.btn_manage_encryption_key);
@@ -154,6 +158,11 @@ public class CrumblesMain extends FragmentActivity {
           });
     }
 
+    Button selectUploadDestButton = findViewById(R.id.btn_select_upload_dest);
+    if (selectUploadDestButton != null) {
+      selectUploadDestButton.setOnClickListener(v -> onSelectUploadDestinationClicked());
+    }
+
     // Schedule work manager tasks once.
     Log.d(TAG, "Cancelling any previously scheduled WorkManager tasks...");
     WorkManager.getInstance(this).cancelUniqueWork(CrumblesConstants.SEND_WORK_TAG);
@@ -164,11 +173,13 @@ public class CrumblesMain extends FragmentActivity {
   @Override
   protected void onResume() {
     super.onResume();
-    // Refresh the key status and UI every time the activity becomes visible.
+    // Refresh the key status, upload destination status, and UI every time the activity becomes
+    // visible.
     loadAndApplyExternalPublicKey();
     setLoggingToggle();
     setDecryptLogsButton();
     updateUiBasedOnKeyState();
+    updateUploadDestinationStatusUi();
   }
 
   /**
@@ -331,46 +342,181 @@ public class CrumblesMain extends FragmentActivity {
     }
   }
 
+  /** Persists read and write permissions for the selected tree URI. */
+  // Suppress WrongConstant because Intent#getFlags() returns a general int bitmask
+  // that is masked with Intent#FLAG_GRANT_READ_URI_PERMISSION and
+  // Intent#FLAG_GRANT_WRITE_URI_PERMISSION as required by
+  // ContentResolver#takePersistableUriPermission(Uri, int).
+  @SuppressWarnings("WrongConstant")
+  private void takePersistableUriPermission(Uri uri, Intent data) {
+    int takeFlags =
+        data.getFlags()
+            & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+    getContentResolver().takePersistableUriPermission(uri, takeFlags);
+  }
+
   /* onActivityResult triggers the biometric prompt instead of directly processing files. */
   @Override
   protected void onActivityResult(int requestCode, int resultCode, Intent data) {
     super.onActivityResult(requestCode, resultCode, data);
 
     switch (requestCode) {
-      case CrumblesConstants.FILE_PICKER_REQUEST_CODE:
-        if (resultCode == Activity.RESULT_OK && data != null) {
-          List<Uri> fileUris = new ArrayList<>();
-          if (data.getClipData() != null) {
-            for (int i = 0; i < data.getClipData().getItemCount(); i++) {
-              fileUris.add(data.getClipData().getItemAt(i).getUri());
-            }
-          } else if (data.getData() != null) {
-            fileUris.add(data.getData());
-          }
-
-          if (!fileUris.isEmpty()) {
-            // Store the URIs and make the FIRST attempt.
-            this.pendingFileUrisForDecryption = fileUris;
-            attemptDecryption();
-          } else {
-            showToast("No files selected.");
-          }
-        } else {
-          showToast("File selection cancelled.");
-        }
-        break;
-      case CrumblesConstants.KEYGUARD_REQUEST_CODE:
-        if (resultCode == Activity.RESULT_OK) {
-          // User authenticated successfully. Retry the decryption.
-          attemptDecryption();
-        } else {
-          showToast("Authentication cancelled.");
-          this.pendingFileUrisForDecryption = null; // Clear pending files.
-        }
-        break;
-      default:
-        break;
+      case CrumblesConstants.FILE_PICKER_REQUEST_CODE -> handleFilePickerResult(resultCode, data);
+      case CrumblesConstants.KEYGUARD_REQUEST_CODE -> handleKeyguardResult(resultCode);
+      case CrumblesConstants.KEYGUARD_DESTINATION_REQUEST_CODE ->
+          handleKeyguardDestinationResult(resultCode);
+      case CrumblesConstants.FILE_TREE_REQUEST_CODE -> handleFileTreeResult(resultCode, data);
+      default -> {}
     }
+  }
+
+  private void handleFilePickerResult(int resultCode, Intent data) {
+    if (resultCode == Activity.RESULT_OK && data != null) {
+      List<Uri> fileUris = new ArrayList<>();
+      if (data.getClipData() != null) {
+        for (int i = 0; i < data.getClipData().getItemCount(); i++) {
+          fileUris.add(data.getClipData().getItemAt(i).getUri());
+        }
+      } else if (data.getData() != null) {
+        fileUris.add(data.getData());
+      }
+
+      if (!fileUris.isEmpty()) {
+        // Store the URIs and make the FIRST attempt.
+        this.pendingFileUrisForDecryption = fileUris;
+        attemptDecryption();
+      } else {
+        showToast("No files selected.");
+      }
+    } else {
+      showToast("File selection cancelled.");
+    }
+  }
+
+  private void handleKeyguardResult(int resultCode) {
+    if (resultCode == Activity.RESULT_OK) {
+      // User authenticated successfully. Retry the decryption.
+      attemptDecryption();
+    } else {
+      showToast("Authentication cancelled.");
+      this.pendingFileUrisForDecryption = null; // Clear pending files.
+    }
+  }
+
+  private void handleKeyguardDestinationResult(int resultCode) {
+    if (resultCode == Activity.RESULT_OK) {
+      launchDocumentTreePicker();
+    } else {
+      showToast(getString(R.string.toast_upload_dest_auth_cancelled));
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              "UPLOAD_DESTINATION_AUTH_FAILED",
+              "User authentication cancelled when attempting to change upload destination.");
+    }
+  }
+
+  private void handleFileTreeResult(int resultCode, Intent data) {
+    if (resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
+      Uri treeUri = data.getData();
+      if (!Objects.equals(treeUri.getScheme(), ContentResolver.SCHEME_CONTENT)) {
+        showToast(getString(R.string.toast_upload_dest_invalid_uri));
+        return;
+      }
+      try {
+        takePersistableUriPermission(treeUri, data);
+      } catch (SecurityException e) {
+        Log.e(TAG, "Failed to take persistable URI permission for: " + treeUri, e);
+        showToast(getString(R.string.toast_upload_dest_invalid_uri));
+        return;
+      }
+
+      // Double check that persistable write permission was confirmed by the Android OS.
+      boolean verifiedWrite = false;
+      for (UriPermission perm : getContentResolver().getPersistedUriPermissions()) {
+        if (perm.getUri().equals(treeUri) && perm.isWritePermission()) {
+          verifiedWrite = true;
+          break;
+        }
+      }
+
+      if (!verifiedWrite) {
+        Log.w(TAG, "Persisted permission write check failed for: " + treeUri);
+        showToast(getString(R.string.toast_upload_dest_invalid_uri));
+        return;
+      }
+
+      getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+          .edit()
+          .putString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, treeUri.toString())
+          .apply();
+
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              "UPLOAD_DESTINATION_CONFIGURED",
+              "Configured upload destination URI with verified persistable write permissions.");
+      showToast(getString(R.string.toast_upload_dest_set_success));
+      updateUploadDestinationStatusUi();
+    } else {
+      showToast(getString(R.string.toast_upload_dest_set_cancelled));
+    }
+  }
+
+  private void onSelectUploadDestinationClicked() {
+    KeyguardManager keyguardManager = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+    if (keyguardManager != null && keyguardManager.isDeviceSecure()) {
+      Intent intent =
+          keyguardManager.createConfirmDeviceCredentialIntent(
+              getString(R.string.upload_dest_auth_title),
+              getString(R.string.upload_dest_auth_subtitle));
+      if (intent != null) {
+        startActivityForResult(intent, CrumblesConstants.KEYGUARD_DESTINATION_REQUEST_CODE);
+        return;
+      }
+    }
+    launchDocumentTreePicker();
+  }
+
+  @VisibleForTesting
+  void launchDocumentTreePicker() {
+    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+    intent.addFlags(
+        Intent.FLAG_GRANT_READ_URI_PERMISSION
+            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+    try {
+      startActivityForResult(intent, CrumblesConstants.FILE_TREE_REQUEST_CODE);
+    } catch (ActivityNotFoundException | SecurityException e) {
+      // Devices without a documents provider or customized ROMs throw when resolving
+      // ACTION_OPEN_DOCUMENT_TREE.
+      Log.e(TAG, "Failed to launch document tree picker", e);
+      showToast("Could not open directory picker.");
+    }
+  }
+
+  @VisibleForTesting
+  void updateUploadDestinationStatusUi() {
+    if (uploadDestinationStatusTextView == null) {
+      Log.e(TAG, "uploadDestinationStatusTextView is null, cannot update upload destination UI.");
+      return;
+    }
+    String uriString =
+        getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, null);
+
+    boolean hasValidGrant = false;
+    if (uriString != null) {
+      for (UriPermission permission : getContentResolver().getPersistedUriPermissions()) {
+        if (permission.getUri().toString().equals(uriString) && permission.isWritePermission()) {
+          hasValidGrant = true;
+          break;
+        }
+      }
+    }
+
+    uploadDestinationStatusTextView.setText(
+        hasValidGrant
+            ? getString(R.string.upload_dest_status_configured, "Google Drive (Active)")
+            : getString(R.string.upload_dest_status_not_set));
   }
 
   private void attemptDecryption() {

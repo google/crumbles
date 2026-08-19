@@ -1,6 +1,8 @@
 # Crumbles User & Administrator Guide
 <!-- disableFinding(LINE_OVER_80) -->
 
+<!-- disableFinding(LINE_OVER_80) -->
+
 ## What is Crumbles?
 Crumbles is a privacy-first Android security application designed for high-risk individuals, journalists, human rights defenders, and security teams. It continuously records Android **Security Logs** (system events, authentication attempts) and **Network Logs** (connection activity) to help detect mobile exploits and suspicious behavior.
 
@@ -62,9 +64,10 @@ Once installed, open the Crumbles app, enable the logging toggle, and select you
 ## Daily Log Sharing & Upload
 
 Once configured, Crumbles operates automatically in the background:
-1. At periodic background intervals (default: 8 hours), Crumbles gathers and encrypts accumulated audit logs into `.bin` payload files.
-2. Crumbles displays a daily notification: *"Encrypted logs ready to be shared"*.
-3. Tap the notification to open the standard Android share menu and upload your encrypted logs to any app installed on your phone (e.g., Google Drive, Gmail, Signal, Dropbox).
+1. Tap **Select Google Drive Folder** on the main screen to choose your designated Google Drive upload directory (unlocking device credentials is required to prevent unauthorized redirection).
+2. At periodic background intervals (default: 8 hours), Crumbles gathers and encrypts accumulated audit logs into `.bin` payload files.
+3. Encrypted logs are streamed directly to your configured Google Drive folder. Logs are only cleared on-device after verified stream write completion to prevent data loss.
+4. *(Note: Direct Google Drive folder upload is prioritized first; support for additional cloud storage destinations will be expanded as requested by users.)*
 
 ---
 

@@ -55,6 +55,22 @@
         android:layout_marginTop="16dp"
         android:text="@string/decrypt_logs_button_label" />
 
+    <TextView
+        android:id="@+id/upload_destination_status_textview"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/upload_dest_status_not_set"
+        android:textSize="16sp" />
+
+    <Button
+        android:id="@+id/btn_select_upload_dest"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="16dp"
+        android:text="@string/btn_select_upload_dest_label" />
+
     <Button
         android:id="@+id/btn_view_audit_log"
         android:layout_width="wrap_content"

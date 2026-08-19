@@ -74,6 +74,9 @@ public final class CrumblesConstants {
   public static final int FILE_PICKER_REQUEST_CODE =
       123; // For the file picker needed for decryption.
   public static final int KEYGUARD_REQUEST_CODE = 456; // For the lock screen prompt.
+  public static final int FILE_TREE_REQUEST_CODE = 789; // For selecting the upload destination.
+  public static final int KEYGUARD_DESTINATION_REQUEST_CODE =
+      790; // For authenticating before changing the upload destination.
 
   private CrumblesConstants() {}
 }
