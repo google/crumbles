@@ -25,16 +25,13 @@ import android.app.admin.SecurityLog;
 import android.app.admin.SecurityLog.SecurityEvent;
 import android.content.ComponentName;
 import android.content.Context;
-
-import java.security.PublicKey;
-import com.android.securelogging.audit.CrumblesAppAuditLogger;
-
 import android.content.Intent;
 import android.os.PersistableBundle;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.VisibleForTesting;
 import androidx.work.WorkManager;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.ByteArrayOutputStream;
@@ -42,6 +39,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
 import java.nio.file.Path;
+import java.security.PublicKey;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.InstantSource;
@@ -49,6 +47,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.TimeZone;
 
 /**
@@ -125,16 +124,55 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
         new ComponentName(context.getApplicationContext(), CrumblesDeviceAdminReceiver.class);
   }
 
-  /**
-   * Called each time a new batch of security logs can be retrieved.
-   *
-   * <p>This callback will be re-triggered if the logs are not retrieved, by a foreground broadcast.
-   * If a secondary user or profile is created, this callback won't be received until all users
-   * become affiliated again (even if security logging is enabled).
-   */
+  private Optional<PublicKey> resolveActiveEncryptionKey(Context context) {
+    PublicKey externalKey =
+        CrumblesExternalPublicKeyManager.getInstance(context).getActiveExternalPublicKey();
+    if (externalKey != null) {
+      return Optional.of(externalKey);
+    }
+    CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
+    return encryptor.doesPrivateKeyExist()
+        ? Optional.ofNullable(encryptor.getPublicKey())
+        : Optional.empty();
+  }
+
+  private boolean isReadyForLogging(Context context, Optional<PublicKey> activeKey) {
+    if (activeKey.isEmpty()) {
+      return false;
+    }
+    File baseDir = getLogsDirectory(context);
+    return baseDir.exists() || baseDir.mkdirs();
+  }
+
+  private File getLogsDirectory(Context context) {
+    return new File(
+        context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+  }
+
+  private Optional<PublicKey> prepareLogRetrieval(Context context, String logType) {
+    Log.i(TAG, logType + " logs available.");
+    Optional<PublicKey> activeKey = resolveActiveEncryptionKey(context);
+    if (!isReadyForLogging(context, activeKey)) {
+      Log.w(
+          TAG,
+          "Encryption key or storage not ready; deferring "
+              + logType.toLowerCase(Locale.US)
+              + " log retrieval.");
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "LOG_RETRIEVAL_DEFERRED",
+              logType + " log retrieval deferred: no encryption key or storage ready.");
+      return Optional.empty();
+    }
+    return activeKey;
+  }
+
   @Override
   public void onSecurityLogsAvailable(@NonNull Context context, @NonNull Intent intent) {
-    Log.i(TAG, "Security logs available.");
+    Optional<PublicKey> activeKey = prepareLogRetrieval(context, "Security");
+    if (activeKey.isEmpty()) {
+      return;
+    }
     initDpm(context);
     List<SecurityEvent> securityLogs = dpm.retrieveSecurityLogs(adminComponentName);
     if (securityLogs == null) {
@@ -142,20 +180,20 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
       return;
     }
     try {
-      encryptLogs(context, logsToBytes(getSerializableSecurityLogs(securityLogs)));
+      encryptAndSaveLogs(
+          context, logsToBytes(getSerializableSecurityLogs(securityLogs)), activeKey.get());
     } catch (CrumblesLogsEncryptionException | IOException e) {
       Log.e(TAG, "Failed to encrypt or convert security logs to bytes.", e);
     }
   }
 
-  /**
-   * Called each time a new batch of network logs can be retrieved. This callback method will only
-   * ever be called when network logging is enabled, by a foreground broadcast, whenever either 1200
-   * events are logged or 1.5H timeout is reached, whichever comes first.
-   */
   @Override
   public void onNetworkLogsAvailable(
       @NonNull Context context, @NonNull Intent intent, long batchToken, int networkLogsCount) {
+    Optional<PublicKey> activeKey = prepareLogRetrieval(context, "Network");
+    if (activeKey.isEmpty()) {
+      return;
+    }
     initDpm(context);
     List<NetworkEvent> networkLogs = dpm.retrieveNetworkLogs(adminComponentName, batchToken);
     if (networkLogs == null) {
@@ -163,7 +201,8 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
       return;
     }
     try {
-      encryptLogs(context, logsToBytes(getSerializableNetworkLogs(networkLogs)));
+      encryptAndSaveLogs(
+          context, logsToBytes(getSerializableNetworkLogs(networkLogs)), activeKey.get());
     } catch (CrumblesLogsEncryptionException | IOException e) {
       Log.e(TAG, "Failed to encrypt or convert network logs to bytes.", e);
     }
@@ -334,24 +373,17 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
     return bos.toByteArray();
   }
 
-  private void encryptLogs(Context context, byte[] logsBytes) {
+  private void encryptAndSaveLogs(Context context, byte[] logsBytes, PublicKey activeKey) {
     CrumblesLogsEncryptor logsEncryptor = CrumblesMain.getLogsEncryptorInstance();
-    // The receiver can run in a cold-started process where the singleton has not yet
-    // been primed with the persisted external key. Reload it from durable storage.
-    PublicKey persistedExternal =
-        CrumblesExternalPublicKeyManager.getInstance(context).getActiveExternalPublicKey();
-    logsEncryptor.setExternalEncryptionPublicKey(persistedExternal);
     try {
-      LogBatch logBatch = logsEncryptor.encryptLogs(logsBytes, persistedExternal);
+      LogBatch logBatch = logsEncryptor.encryptLogs(logsBytes, activeKey);
       if (logBatch == null) {
-        Log.e(TAG, "Failed to encrypt logs: no encryption key configured.");
+        Log.e(TAG, "Failed to encrypt logs: encryption returned null.");
         CrumblesAppAuditLogger.getInstance(context)
-            .logEvent("ENCRYPT_NO_KEY", "Log batch dropped: no encryption key configured.");
+            .logEvent("ENCRYPT_FAILED", "Log batch encryption failed.");
         return;
       }
-      File baseDir =
-          new File(
-              context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+      File baseDir = getLogsDirectory(context);
       if (!baseDir.exists()) {
         baseDir.mkdirs();
       }

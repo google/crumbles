@@ -44,32 +44,27 @@ import androidx.work.WorkInfo;
 import androidx.work.WorkManager;
 import androidx.work.testing.SynchronousExecutor;
 import androidx.work.testing.WorkManagerTestInitHelper;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.google.common.collect.ImmutableList;
+import com.google.protobuf.ExtensionRegistryLite;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import java.io.File;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ExecutionException;
-import org.junit.Before;
-
-import java.security.Security;
-import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
-import org.junit.BeforeClass;
-import org.junit.AfterClass;
-
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import java.io.File;
 import java.nio.file.Files;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.Security;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
 import javax.crypto.Cipher;
-import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
-
-import com.google.protobuf.ExtensionRegistryLite;
-
-import java.nio.charset.StandardCharsets;
-
+import org.junit.AfterClass;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
+import org.junit.runner.RunWith;
 
 /**
  * Unit tests for {@link CrumblesDeviceAdminReceiver}.
@@ -201,34 +196,30 @@ public final class CrumblesDeviceAdminReceiverTest {
     assertThat(receiver.getSerializableSecurityLogs(null)).isEmpty();
     assertThat(receiver.getSerializableSecurityLogs(new ArrayList<>())).isEmpty();
   }
+
   /**
-   * Tests that logs are encrypted using the persisted external key after a cold start where the singleton is uninitialized.
+   * Tests that logs are encrypted using the persisted external key after a cold start where the
+   * singleton is uninitialized.
    */
   @Test
-  public void encryptLogs_usesPersistedExternalKey_notKeystore_afterColdStart() throws Exception {
-    // Arrange: persist an external key via the manager (simulating prior QR import).
+  public void onSecurityLogsAvailable_usesPersistedExternalKey_notKeystore_afterColdStart()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
     KeyPair ngo = KeyPairGenerator.getInstance("RSA").generateKeyPair();
-    CrumblesExternalPublicKeyManager mgr =
-        CrumblesExternalPublicKeyManager.getInstance(ApplicationProvider.getApplicationContext());
-    mgr.saveActiveExternalPublicKey(ngo.getPublic());
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(ngo.getPublic());
 
-    // Simulate cold start: do NOT call CrumblesMain.onResume(); do NOT touch the singleton.
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenReturn(new ArrayList<>());
+    Context contextWrapper = createContextWrapper(context, mockDpm);
+
     CrumblesDeviceAdminReceiver receiver = new CrumblesDeviceAdminReceiver();
-    // invoke encryptLogs via reflection
-    Method method =
-        CrumblesDeviceAdminReceiver.class.getDeclaredMethod(
-            "encryptLogs", Context.class, byte[].class);
-    method.setAccessible(true);
-    method.invoke(
-        receiver,
-        ApplicationProvider.getApplicationContext(),
-        "hello".getBytes(StandardCharsets.UTF_8));
+    receiver.onSecurityLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE));
 
-    // Assert: file exists AND its wrapped key decrypts with ngo.getPrivate().
     File logsDir =
         new File(
-            ApplicationProvider.getApplicationContext().getFilesDir(),
-            CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+            context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
     File[] out = logsDir.listFiles((d, n) -> n.endsWith(".bin"));
     assertThat(out).hasLength(1);
     LogBatch batch =
@@ -236,7 +227,6 @@ public final class CrumblesDeviceAdminReceiverTest {
             Files.readAllBytes(out[0].toPath()), ExtensionRegistryLite.getEmptyRegistry());
     Cipher rsa = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
     rsa.init(Cipher.UNWRAP_MODE, ngo.getPrivate());
-    // Throws if wrapped with a different key -> test fails on current code.
     rsa.unwrap(batch.getKey().getEncryptedSymmetricKey().toByteArray(), "AES", Cipher.SECRET_KEY);
   }
 
@@ -409,5 +399,152 @@ public final class CrumblesDeviceAdminReceiverTest {
         return super.getSystemService(name);
       }
     };
+  }
+
+  @Test
+  public void onSecurityLogsAvailable_whenEncryptionNotReady_defersLogRetrieval() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    Context contextWrapper = createContextWrapper(context, mockDpm);
+    CrumblesExternalPublicKeyManager.getInstance(context).saveActiveExternalPublicKey(null);
+    CrumblesMain.getLogsEncryptorInstance().setExternalEncryptionPublicKey(null);
+
+    receiver.onSecurityLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE));
+
+    verify(mockDpm, never()).retrieveSecurityLogs(any(ComponentName.class));
+    assertThat(
+            CrumblesAppAuditLogger.getInstance(context).getMemoryCachedEvents().stream()
+                .anyMatch(e -> e.getEventType().equals("LOG_RETRIEVAL_DEFERRED")))
+        .isTrue();
+  }
+
+  @Test
+  public void onSecurityLogsAvailable_whenEncryptionReadyWithExternalKey_retrievesLogs()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenReturn(new ArrayList<>());
+    Context contextWrapper = createContextWrapper(context, mockDpm);
+    KeyPair externalKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(externalKeyPair.getPublic());
+
+    receiver.onSecurityLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE));
+
+    verify(mockDpm).retrieveSecurityLogs(any(ComponentName.class));
+  }
+
+  @Test
+  public void onSecurityLogsAvailable_whenDirectoryAlreadyExists_retrievesLogs() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    File baseDir =
+        new File(
+            context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    baseDir.mkdirs();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenReturn(new ArrayList<>());
+    Context contextWrapper = createContextWrapper(context, mockDpm);
+    KeyPair externalKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(externalKeyPair.getPublic());
+
+    receiver.onSecurityLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE));
+
+    verify(mockDpm).retrieveSecurityLogs(any(ComponentName.class));
+  }
+
+  @Test
+  public void onSecurityLogsAvailable_whenStorageDirectoryBlocked_defersLogRetrieval()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    File blockedFile = new File(context.getCacheDir(), "blocked_sec_logs_dir");
+    blockedFile.createNewFile();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    Context contextWrapper =
+        new ContextWrapper(createContextWrapper(context, mockDpm)) {
+          @Override
+          public File getFilesDir() {
+            return blockedFile;
+          }
+        };
+    KeyPair externalKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(externalKeyPair.getPublic());
+
+    receiver.onSecurityLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE));
+
+    verify(mockDpm, never()).retrieveSecurityLogs(any(ComponentName.class));
+    assertThat(
+            CrumblesAppAuditLogger.getInstance(context).getMemoryCachedEvents().stream()
+                .anyMatch(e -> e.getEventType().equals("LOG_RETRIEVAL_DEFERRED")))
+        .isTrue();
+  }
+
+  @Test
+  public void onNetworkLogsAvailable_whenEncryptionNotReady_defersLogRetrieval() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    Context contextWrapper = createContextWrapper(context, mockDpm);
+    CrumblesExternalPublicKeyManager.getInstance(context).saveActiveExternalPublicKey(null);
+    CrumblesMain.getLogsEncryptorInstance().setExternalEncryptionPublicKey(null);
+
+    receiver.onNetworkLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_NETWORK_LOGS_AVAILABLE), 123L, 5);
+
+    verify(mockDpm, never()).retrieveNetworkLogs(any(ComponentName.class), eq(123L));
+    assertThat(
+            CrumblesAppAuditLogger.getInstance(context).getMemoryCachedEvents().stream()
+                .anyMatch(e -> e.getEventType().equals("LOG_RETRIEVAL_DEFERRED")))
+        .isTrue();
+  }
+
+  @Test
+  public void onNetworkLogsAvailable_whenEncryptionReadyWithExternalKey_retrievesLogs()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.retrieveNetworkLogs(any(ComponentName.class), eq(123L)))
+        .thenReturn(new ArrayList<>());
+    Context contextWrapper = createContextWrapper(context, mockDpm);
+    KeyPair externalKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(externalKeyPair.getPublic());
+
+    receiver.onNetworkLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_NETWORK_LOGS_AVAILABLE), 123L, 5);
+
+    verify(mockDpm).retrieveNetworkLogs(any(ComponentName.class), eq(123L));
+  }
+
+  @Test
+  public void onNetworkLogsAvailable_whenStorageDirectoryBlocked_defersLogRetrieval()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    File blockedFile = new File(context.getCacheDir(), "blocked_net_logs_dir");
+    blockedFile.createNewFile();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    Context contextWrapper =
+        new ContextWrapper(createContextWrapper(context, mockDpm)) {
+          @Override
+          public File getFilesDir() {
+            return blockedFile;
+          }
+        };
+    KeyPair externalKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(externalKeyPair.getPublic());
+
+    receiver.onNetworkLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_NETWORK_LOGS_AVAILABLE), 123L, 5);
+
+    verify(mockDpm, never()).retrieveNetworkLogs(any(ComponentName.class), eq(123L));
+    assertThat(
+            CrumblesAppAuditLogger.getInstance(context).getMemoryCachedEvents().stream()
+                .anyMatch(e -> e.getEventType().equals("LOG_RETRIEVAL_DEFERRED")))
+        .isTrue();
   }
 }
