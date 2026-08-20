@@ -42,7 +42,9 @@ final class CrumblesWorkScheduler {
    */
   public static void scheduleAllPeriodicWork(Context context, WorkManager workManager) {
     scheduleSendWork(workManager);
-    scheduleMarkSentWork(workManager);
+    // Cancel legacy periodic mark-sent work to avoid race conditions with active uploads.
+    // Stale processing recovery is handled synchronously by CrumblesSendAndMarkProcessingWorker.
+    workManager.cancelUniqueWork(CrumblesConstants.MARK_SENT_WORK_TAG);
     scheduleDailyFileDeletion(workManager);
     Log.d(TAG, "All periodic work scheduled.");
   }
@@ -71,34 +73,6 @@ final class CrumblesWorkScheduler {
         "Periodic send+process work scheduled every "
             + CrumblesConstants.SEND_REPEAT_INTERVAL_HOURS
             + " hours.");
-  }
-
-  /* Schedules the worker that marks _processing files as _sent. */
-  private static void scheduleMarkSentWork(WorkManager workManager) {
-    PeriodicWorkRequest markSentWorkRequest =
-        new PeriodicWorkRequest.Builder(
-                CrumblesMarkProcessingAsSentWorker.class,
-                CrumblesConstants.MARK_SENT_REPEAT_INTERVAL_HOURS,
-                HOURS)
-            .setInitialDelay(
-                Duration.ofMinutes(CrumblesConstants.MARK_SENT_INITIAL_DELAY_MINUTES_OFFSET))
-            .setBackoffCriteria(
-                BackoffPolicy.LINEAR, PeriodicWorkRequest.MIN_BACKOFF_MILLIS, MILLISECONDS)
-            .addTag(CrumblesConstants.MARK_SENT_WORK_TAG)
-            .build();
-
-    workManager.enqueueUniquePeriodicWork(
-        CrumblesConstants.MARK_SENT_WORK_TAG,
-        ExistingPeriodicWorkPolicy.KEEP, // Keep existing work if already scheduled.
-        markSentWorkRequest);
-
-    Log.d(
-        TAG,
-        "Periodic mark as sent work scheduled every "
-            + CrumblesConstants.MARK_SENT_REPEAT_INTERVAL_HOURS
-            + " hours with "
-            + CrumblesConstants.MARK_SENT_INITIAL_DELAY_MINUTES_OFFSET
-            + " min offset.");
   }
 
   /* Schedules the worker that deletes files with _sent suffix once a day at night. */

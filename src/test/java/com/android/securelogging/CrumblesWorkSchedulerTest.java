@@ -59,12 +59,10 @@ public class CrumblesWorkSchedulerTest {
   }
 
   @Test
-  public void scheduleAllPeriodicWork_enqueuesCorrectWork()
+  public void scheduleAllPeriodicWork_enqueuesCorrectWorkAndCancelsLegacyMarkSent()
       throws ExecutionException, InterruptedException {
     // Pass the real test WorkManager instance.
     CrumblesWorkScheduler.scheduleAllPeriodicWork(context, realTestWorkManager);
-
-    // Verify the state of the realTestWorkManager for all scheduled work.
 
     // Check that the SEND_WORK_TAG work is enqueued.
     List<WorkInfo> sendWorkInfos =
@@ -73,18 +71,7 @@ public class CrumblesWorkSchedulerTest {
     assertThat(sendWorkInfos).hasSize(1);
     WorkInfo sendWorkInfo = sendWorkInfos.get(0);
     assertThat(sendWorkInfo.getTags()).contains(CrumblesConstants.SEND_WORK_TAG);
-    // For periodic work, it typically stays ENQUEUED or RUNNING if it's a long-running task.
-    // Here we primarily care that it was scheduled.
     assertThat(sendWorkInfo.getState()).isEqualTo(WorkInfo.State.ENQUEUED);
-
-    // Check that the MARK_SENT_WORK_TAG work is enqueued.
-    List<WorkInfo> markSentWorkInfos =
-        realTestWorkManager.getWorkInfosForUniqueWork(CrumblesConstants.MARK_SENT_WORK_TAG).get();
-    assertThat(markSentWorkInfos).isNotNull();
-    assertThat(markSentWorkInfos).hasSize(1);
-    WorkInfo markSentWorkInfo = markSentWorkInfos.get(0);
-    assertThat(markSentWorkInfo.getTags()).contains(CrumblesConstants.MARK_SENT_WORK_TAG);
-    assertThat(markSentWorkInfo.getState()).isEqualTo(WorkInfo.State.ENQUEUED);
 
     // Check that the DELETE_WORK_TAG work is enqueued.
     List<WorkInfo> deleteWorkInfos =
@@ -94,6 +81,9 @@ public class CrumblesWorkSchedulerTest {
     WorkInfo deleteWorkInfo = deleteWorkInfos.get(0);
     assertThat(deleteWorkInfo.getTags()).contains(CrumblesConstants.DELETE_WORK_TAG);
     assertThat(deleteWorkInfo.getState()).isEqualTo(WorkInfo.State.ENQUEUED);
+
+    // Verify MARK_SENT_WORK_TAG is not active (was cancelled to prevent upload race conditions).
+    assertWorkIsCancelled(CrumblesConstants.MARK_SENT_WORK_TAG);
   }
 
   private void assertWorkIsCancelled(String workTag)
@@ -112,28 +102,20 @@ public class CrumblesWorkSchedulerTest {
           break;
         }
       }
-      assertThat(activeWorkFound)
-          .isFalse(); // No active (ENQUEUED or RUNNING) work should be found for this tag.
+      assertThat(activeWorkFound).isFalse();
     }
   }
 
   @Test
   public void cancelAllPeriodicWork_cancelsAllUniqueWork()
       throws ExecutionException, InterruptedException {
-    // Schedule something to cancel.
+    // Schedule periodic work first.
     CrumblesWorkScheduler.scheduleAllPeriodicWork(context, realTestWorkManager);
 
-    // Verify work is initially enqueued for all tags
+    // Verify work is initially enqueued for active tags
     assertThat(
             realTestWorkManager
                 .getWorkInfosForUniqueWork(CrumblesConstants.SEND_WORK_TAG)
-                .get()
-                .get(0)
-                .getState())
-        .isEqualTo(WorkInfo.State.ENQUEUED);
-    assertThat(
-            realTestWorkManager
-                .getWorkInfosForUniqueWork(CrumblesConstants.MARK_SENT_WORK_TAG)
                 .get()
                 .get(0)
                 .getState())
@@ -149,7 +131,7 @@ public class CrumblesWorkSchedulerTest {
     // Call the cancel method, passing the real test WorkManager.
     CrumblesWorkScheduler.cancelAllPeriodicWork(context, realTestWorkManager);
 
-    // Verify all work is cancelled.
+    // Verify each piece of unique work is cancelled.
     assertWorkIsCancelled(CrumblesConstants.SEND_WORK_TAG);
     assertWorkIsCancelled(CrumblesConstants.MARK_SENT_WORK_TAG);
     assertWorkIsCancelled(CrumblesConstants.DELETE_WORK_TAG);
