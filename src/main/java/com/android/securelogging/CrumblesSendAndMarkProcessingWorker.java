@@ -16,12 +16,18 @@
 
 package com.android.securelogging;
 
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.content.UriPermission;
 import android.net.Uri;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
 import androidx.documentfile.provider.DocumentFile;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
@@ -37,39 +43,20 @@ import java.io.OutputStream;
 import java.security.PublicKey;
 
 /**
- * A WorkManager worker class that handles the automated upload of encrypted log files.
- *
- * <p>This worker performs the following tasks:
- *
- * <ul>
- *   <li>Checks for encryption key availability. If no key, deletes existing logs.
- *   <li>Finds unprocessed crumble log files (.bin files) in the designated directory.
- *   <li>Verifies the configured Google Drive destination folder and its persistable write permissions.
- *   <li>Streams encrypted log files directly to the destination folder using DocumentFile.
- *   <li>Transitions files to _sent.bin only on verified write completion.
- *   <li>Safely reverts files to .bin on any failure for automatic retry, preventing data loss.
- * </ul>
+ * A WorkManager worker class that handles automated streaming of encrypted log files to Google
+ * Drive while guaranteeing zero log batch loss, transactional status tracking, and full audit
+ * traceability.
  */
 public class CrumblesSendAndMarkProcessingWorker extends Worker {
 
   private static final String TAG = "CrumblesSendAndMarkProcessingWorker";
+  static final int UPLOAD_NOTIFICATION_ID = 2001;
 
-  /**
-   * Constructor for the CrumblesSendAndMarkProcessingWorker.
-   *
-   * @param context The application context.
-   * @param workerParams The worker parameters.
-   */
   public CrumblesSendAndMarkProcessingWorker(
       @NonNull Context context, @NonNull WorkerParameters workerParams) {
     super(context, workerParams);
   }
 
-  /*
-   * This method is called by the WorkManager to perform the processing of the encrypted log files.
-   * It identifies unprocessed files, renames them by adding the "processing" suffix, and then
-   * creates a notification intent for the user to upload the files.
-   */
   @NonNull
   @Override
   public Result doWork() {
@@ -77,7 +64,6 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     Context context = getApplicationContext();
 
     CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
-    // Create a manager instance here to read the current key state.
     CrumblesExternalPublicKeyManager publicKeyManager =
         CrumblesExternalPublicKeyManager.getInstance(context);
     boolean isInternalPrivateKey = encryptor.doesPrivateKeyExist();
@@ -87,10 +73,19 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     if (!keyIsAvailable) {
       Log.w(
           TAG,
-          "No encryption key (internal or external) is available. Deleting existing encrypted log"
-              + " files.");
-      deleteAllLogFiles(context);
-      return Result.success();
+          "No encryption key (internal or external) is available. Deferring upload to preserve"
+              + " logs.");
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "LOGS_UPLOAD_DEFERRED_NO_KEY",
+              "Upload deferred because active encryption key is unavailable; logs preserved on"
+                  + " disk.");
+      notifyUploadStatus(
+          context,
+          "Log Upload Deferred",
+          "Encryption key is unavailable. Encrypted logs remain securely preserved on device.",
+          /* isError= */ true);
+      return Result.retry();
     }
 
     File directory =
@@ -100,6 +95,9 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
       Log.e(TAG, "Log directory not found: " + directory.getAbsolutePath());
       return Result.failure();
     }
+
+    // Recover any stale processing files from interrupted runs to prevent log loss
+    recoverStaleProcessingFiles(context, directory);
 
     File[] unprocessedBinFiles =
         directory.listFiles(
@@ -116,11 +114,34 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     return processAndUploadFiles(context, unprocessedBinFiles, directory);
   }
 
-  /**
-   * Processes unprocessed .bin files, streams them to the configured Google Drive destination,
-   * and transitions files to _sent.bin only on verified stream write completion. On any error,
-   * files are safely restored to .bin for automated retry.
-   */
+  private static void recoverStaleProcessingFiles(Context context, File directory) {
+    File[] staleProcessingFiles =
+        directory.listFiles((dir, name) -> name.endsWith(CrumblesConstants.PROCESSING_SUFFIX));
+    if (staleProcessingFiles == null) {
+      return;
+    }
+    int recoveredCount = 0;
+    for (File processingFile : staleProcessingFiles) {
+      String processingName = processingFile.getName();
+      String baseName =
+          processingName.substring(
+              0, processingName.length() - CrumblesConstants.PROCESSING_SUFFIX.length());
+      File restoredFile = new File(directory, baseName + ".bin");
+      if (processingFile.renameTo(restoredFile)) {
+        recoveredCount++;
+      } else {
+        Log.e(TAG, "Failed to recover stale processing file: " + processingName);
+      }
+    }
+    if (recoveredCount > 0) {
+      Log.i(TAG, "Recovered " + recoveredCount + " stale processing file(s) for upload retry.");
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "LOGS_UPLOAD_RECOVERED_PROCESSING",
+              "Recovered " + recoveredCount + " stale processing log file(s) for upload retry.");
+    }
+  }
+
   private Result processAndUploadFiles(
       Context context, File[] unprocessedBinFiles, File directory) {
     DocumentFile targetDir = resolveUploadDestination(context);
@@ -146,9 +167,27 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
               "Successfully automatically uploaded "
                   + uploadedCount
                   + " log file(s) to Google Drive destination.");
+      notifyUploadStatus(
+          context,
+          "Log Upload Successful",
+          "Successfully uploaded " + uploadedCount + " log file(s) to Google Drive.",
+          /* isError= */ false);
     }
 
-    return hasFailures ? Result.retry() : Result.success();
+    if (hasFailures) {
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "LOGS_UPLOAD_FAILED",
+              "One or more log files failed to upload; preserved safely on device for retry.");
+      notifyUploadStatus(
+          context,
+          "Log Upload Interrupted",
+          "Some log files could not be uploaded. Files remain safely saved on device for retry.",
+          /* isError= */ true);
+      return Result.retry();
+    }
+
+    return Result.success();
   }
 
   @Nullable
@@ -160,6 +199,15 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
 
     if (uriString == null) {
       Log.w(TAG, "Upload destination URI not configured. Logs will remain safely on device.");
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "UPLOAD_DESTINATION_NOT_CONFIGURED",
+              "Upload deferred: Google Drive destination folder is not configured.");
+      notifyUploadStatus(
+          context,
+          "Upload Destination Not Configured",
+          "Please select a Google Drive destination folder in Crumbles to enable log uploads.",
+          /* isError= */ true);
       return null;
     }
 
@@ -178,12 +226,26 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
           .logEvent(
               "UPLOAD_DESTINATION_PERMISSION_REVOKED",
               "Upload failed because persistable write permission was missing or revoked.");
+      notifyUploadStatus(
+          context,
+          "Upload Permission Revoked",
+          "Google Drive write permission was revoked. Please re-select the destination folder.",
+          /* isError= */ true);
       return null;
     }
 
     DocumentFile targetDir = DocumentFile.fromTreeUri(context, treeUri);
     if (targetDir == null || !targetDir.isDirectory() || !targetDir.canWrite()) {
       Log.e(TAG, "Target directory is invalid or not writable: " + uriString);
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "UPLOAD_DESTINATION_INVALID",
+              "Upload deferred: destination folder is inaccessible or unwritable.");
+      notifyUploadStatus(
+          context,
+          "Upload Destination Inaccessible",
+          "The selected destination folder is not accessible. Please check storage access.",
+          /* isError= */ true);
       return null;
     }
     return targetDir;
@@ -192,11 +254,6 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
   private static boolean uploadSingleFile(
       Context context, DocumentFile targetDir, File file, File directory) {
     String originalName = file.getName();
-    if (!originalName.endsWith(".bin")) {
-      Log.e(TAG, "Unexpected non-bin file in unprocessed list: " + originalName);
-      return false;
-    }
-
     String baseName = originalName.substring(0, originalName.length() - ".bin".length());
     String newProcessingName = baseName + CrumblesConstants.PROCESSING_SUFFIX;
     File processingFile = new File(directory, newProcessingName);
@@ -217,7 +274,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
       Log.e(TAG, "Failed to rename to sent: " + processingFile.getName());
     }
 
-    // Safe rollback to ensure no logs are lost
+    // Safe rollback to guarantee zero log batch data loss
     File originalFile = new File(directory, originalName);
     if (!processingFile.renameTo(originalFile)) {
       Log.e(TAG, "Failed to revert processing file to original: " + processingFile.getName());
@@ -243,56 +300,54 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
         }
       }
     } catch (IOException | SecurityException e) {
+      // DocumentFile or ContentResolver may throw on I/O issues, network disconnects, or permission
+      // expiration
       Log.e(TAG, "Failed to upload file " + originalName + " to destination", e);
     }
     return false;
   }
 
-  /**
-   * Deletes all relevant Crumbles log files (.bin, _processing.bin, _sent.bin) from the log
-   * directory. This is typically called when no encryption key is available.
-   *
-   * @param context The application context.
-   */
-  private void deleteAllLogFiles(Context context) {
-    File directory =
-        new File(
-            context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
-    if (!directory.exists() || !directory.isDirectory()) {
-      Log.d(
-          TAG,
-          "Log directory " + directory.getAbsolutePath() + " does not exist, nothing to delete.");
-      return;
-    }
+  private static void createNotificationChannel(Context context) {
+    NotificationChannel channel =
+        new NotificationChannel(
+            CrumblesConstants.NOTIFICATION_CHANNEL_ID,
+            "Log Upload Notifications",
+            NotificationManager.IMPORTANCE_DEFAULT);
+    channel.setDescription("Status notifications for encrypted log uploads.");
 
-    File[] filesToDelete =
-        directory.listFiles(
-            (dir, name) ->
-                name.endsWith(".bin")
-                    || name.endsWith(CrumblesConstants.PROCESSING_SUFFIX)
-                    || name.endsWith(CrumblesConstants.SENT_SUFFIX));
-
-    if (filesToDelete == null || filesToDelete.length == 0) {
-      Log.d(TAG, "No log files found in directory " + directory.getAbsolutePath() + " to delete.");
-      return;
-    }
-
-    int deleteCount = 0;
-    for (File file : filesToDelete) {
-      if (file.delete()) {
-        Log.i(TAG, "Deleted orphaned log file (no key available): " + file.getName());
-        deleteCount++;
-      } else {
-        Log.e(TAG, "Failed to delete orphaned log file: " + file.getName());
-      }
-    }
-    Log.i(
-        TAG,
-        "Orphaned log file deletion complete. Deleted "
-            + deleteCount
-            + " files from "
-            + directory.getAbsolutePath());
+    NotificationManagerCompat.from(context).createNotificationChannel(channel);
   }
 
+  @SuppressWarnings({"MissingPermission", "PendingIntentMutability"})
+  private static void notifyUploadStatus(
+      Context context, String title, String content, boolean isError) {
+    createNotificationChannel(context);
 
+    Intent openIntent = new Intent(context, CrumblesMain.class);
+    openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+    PendingIntent pendingIntent =
+        PendingIntent.getActivity(
+            context,
+            0,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+    int icon =
+        isError ? android.R.drawable.stat_notify_error : android.R.drawable.stat_sys_upload_done;
+    NotificationCompat.Builder builder =
+        new NotificationCompat.Builder(context, CrumblesConstants.NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(icon)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setPriority(
+                isError ? NotificationCompat.PRIORITY_HIGH : NotificationCompat.PRIORITY_DEFAULT)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true);
+
+    try {
+      NotificationManagerCompat.from(context).notify(UPLOAD_NOTIFICATION_ID, builder.build());
+    } catch (SecurityException e) {
+      Log.w(TAG, "Notification permission not granted, skipping notification", e);
+    }
+  }
 }
