@@ -18,12 +18,17 @@ package com.android.securelogging;
 
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 import android.os.Bundle;
 import android.view.View;
+import android.widget.Button;
 import androidx.fragment.app.testing.FragmentScenario;
 import androidx.lifecycle.Lifecycle;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import com.android.securelogging.CrumblesPrivateKeyViewerDialogFragment.KeyCustodyConfirmationListener;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.annotation.Config;
@@ -112,6 +117,61 @@ public class CrumblesPrivateKeyViewerDialogFragmentTest {
   }
 
   @Test
+  public void onClickDone_triggersCustodyConfirmedAndDismisses() {
+    // Given: A fragment with a registered custody confirmation listener.
+    KeyCustodyConfirmationListener mockListener = mock(KeyCustodyConfirmationListener.class);
+    byte[] testKeyBytes = "a-test-private-key".getBytes(UTF_8);
+    Bundle args = new Bundle();
+    args.putByteArray(CrumblesConstants.ARG_PRIVATE_KEY_BYTES, testKeyBytes);
+    args.putBoolean(CrumblesConstants.ARG_SHOW_QR_INITIALLY, false);
+
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        FragmentScenario.launch(
+            CrumblesPrivateKeyViewerDialogFragment.class, args, R.style.Theme_AppCompat);
+    scenario.moveToState(Lifecycle.State.RESUMED);
+
+    // When: User clicks the "Done" (OK, I Understand & Saved It) button.
+    scenario.onFragment(
+        fragment -> {
+          fragment.setKeyCustodyConfirmationListener(mockListener);
+          Button doneButton = fragment.getDialog().findViewById(R.id.btn_done);
+          assertThat(doneButton).isNotNull();
+          doneButton.performClick();
+          fragment.onDismiss(fragment.getDialog());
+        });
+
+    // Then: onKeyCustodyConfirmed is triggered and onKeyCustodyCancelled is never called.
+    verify(mockListener).onKeyCustodyConfirmed();
+    verify(mockListener, never()).onKeyCustodyCancelled();
+  }
+
+  @Test
+  public void onDismiss_withoutDoneClick_triggersCustodyCancelled() {
+    // Given: A fragment with a registered custody confirmation listener.
+    KeyCustodyConfirmationListener mockListener = mock(KeyCustodyConfirmationListener.class);
+    byte[] testKeyBytes = "a-test-private-key".getBytes(UTF_8);
+    Bundle args = new Bundle();
+    args.putByteArray(CrumblesConstants.ARG_PRIVATE_KEY_BYTES, testKeyBytes);
+    args.putBoolean(CrumblesConstants.ARG_SHOW_QR_INITIALLY, false);
+
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        FragmentScenario.launch(
+            CrumblesPrivateKeyViewerDialogFragment.class, args, R.style.Theme_AppCompat);
+    scenario.moveToState(Lifecycle.State.RESUMED);
+
+    // When: Dialog is dismissed without clicking the done button.
+    scenario.onFragment(
+        fragment -> {
+          fragment.setKeyCustodyConfirmationListener(mockListener);
+          fragment.onDismiss(fragment.getDialog());
+        });
+
+    // Then: onKeyCustodyCancelled is triggered and onKeyCustodyConfirmed is never called.
+    verify(mockListener).onKeyCustodyCancelled();
+    verify(mockListener, never()).onKeyCustodyConfirmed();
+  }
+
+  @Test
   public void onCreateDialog_withNullArguments_doesNotCrashAndCreatesDialogObject() {
     // Given: No arguments are provided to the fragment.
     Bundle args = null;
@@ -122,11 +182,9 @@ public class CrumblesPrivateKeyViewerDialogFragmentTest {
             CrumblesPrivateKeyViewerDialogFragment.class, args, R.style.Theme_Crumbles);
 
     // Then: The app does not crash and the Dialog object is still created by the framework.
-    // Our internal logic now gracefully handles the null arguments.
     scenario.onFragment(
         fragment -> {
           assertThat(fragment.getDialog()).isNotNull();
-          // The dialog will show a simple error message, which is the expected behavior.
           assertThat(fragment.getDialog().isShowing()).isTrue();
         });
   }

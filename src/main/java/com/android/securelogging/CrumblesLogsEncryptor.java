@@ -246,14 +246,13 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Generates a new external key pair, sets the public key for encryption, and passes the private
-   * key to the provided consumer. Also deletes any existing keystore key pair.
+   * Generates a new candidate external RSA key pair without activating it or mutating current
+   * state.
    *
-   * @param consumer a consumer that will receive the encoded private key bytes
-   * @throws CrumblesKeysException if the key pair cannot be generated
+   * @return the newly generated candidate KeyPair
+   * @throws CrumblesKeysException if key pair generation fails
    */
- public synchronized void generateAndSetExternalKeyPair(PrivateKeyBytesConsumer consumer)
-      throws CrumblesKeysException {
+  public KeyPair generateCandidateExternalKeyPair() throws CrumblesKeysException {
     try {
       KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(ASYM_ALGORITHM);
       keyPairGenerator.initialize(ASYM_BITS);
@@ -265,17 +264,43 @@ public class CrumblesLogsEncryptor {
         throw new CrumblesKeysException(
             "Generated external KeyPair or its components are null.", null);
       }
-
-      this.setExternalEncryptionPublicKey(generatedPair.getPublic());
-      deleteExistingKeyPair();
-      Log.d(TAG, "New external key pair generated. Public key set for use.");
-
-      byte[] privateKeyBytes = generatedPair.getPrivate().getEncoded();
-      consumer.accept(privateKeyBytes);
-
+      return generatedPair;
     } catch (NoSuchAlgorithmException | RuntimeException e) {
       throw new CrumblesKeysException("Failed to generate external RSA key pair.", e);
     }
+  }
+
+  /**
+   * Commits and activates a candidate external public key for encryption, and removes any existing
+   * internal keystore key pair.
+   *
+   * @param candidatePublicKey the external public key to commit and activate
+   * @throws CrumblesKeysException if the candidate public key is null
+   */
+  public synchronized void commitExternalPublicKey(PublicKey candidatePublicKey)
+      throws CrumblesKeysException {
+    if (candidatePublicKey == null) {
+      throw new CrumblesKeysException("Candidate public key cannot be null.", null);
+    }
+    this.setExternalEncryptionPublicKey(candidatePublicKey);
+    deleteExistingKeyPair();
+    Log.d(TAG, "External public key committed and activated for encryption.");
+  }
+
+  /**
+   * Generates a new external key pair, sets the public key for encryption, and passes the private
+   * key to the provided consumer. Also deletes any existing keystore key pair.
+   *
+   * @param consumer a consumer that will receive the encoded private key bytes
+   * @throws CrumblesKeysException if the key pair cannot be generated
+   */
+  public synchronized void generateAndSetExternalKeyPair(PrivateKeyBytesConsumer consumer)
+      throws CrumblesKeysException {
+    KeyPair generatedPair = generateCandidateExternalKeyPair();
+    byte[] privateKeyBytes = generatedPair.getPrivate().getEncoded();
+    consumer.accept(privateKeyBytes);
+    commitExternalPublicKey(generatedPair.getPublic());
+    Log.d(TAG, "New external key pair generated. Public key set for use.");
   }
 
   /**

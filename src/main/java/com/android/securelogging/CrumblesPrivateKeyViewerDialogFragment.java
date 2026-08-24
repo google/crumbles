@@ -45,9 +45,22 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
 
   private static final String TAG = "CrumblesPrivateKeyViewerDF";
 
+  /**
+   * Listener interface for notifying the caller when private key custody is confirmed or cancelled.
+   */
+  public interface KeyCustodyConfirmationListener {
+    /** Called when the user explicitly confirms custody (e.g. clicking the "Done" button). */
+    void onKeyCustodyConfirmed();
+
+    /** Called when the dialog is dismissed or cancelled without custody confirmation. */
+    void onKeyCustodyCancelled();
+  }
+
   // Hold the fragment's own secure copy.
   private byte[] privateKeyCopy;
   private Runnable cleanupCallback;
+  private KeyCustodyConfirmationListener custodyConfirmationListener;
+  private boolean isCustodyConfirmed = false;
 
   public static CrumblesPrivateKeyViewerDialogFragment newInstance(
       byte[] privateKeyBytes, boolean showQrInitially) {
@@ -62,6 +75,11 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
   /** Method for the Activity to provide the cleanup task. */
   public void setCleanupCallback(Runnable callback) {
     this.cleanupCallback = callback;
+  }
+
+  /** Sets the listener to be notified upon explicit custody confirmation or cancellation. */
+  public void setKeyCustodyConfirmationListener(KeyCustodyConfirmationListener listener) {
+    this.custodyConfirmationListener = listener;
   }
 
   @Override
@@ -148,7 +166,16 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
             switchButton.setText(R.string.dialog_button_view_as_qr);
           }
 
-          doneButton.setOnClickListener(v -> dialog.dismiss());
+          doneButton.setOnClickListener(
+              v -> {
+                isCustodyConfirmed = true;
+                if (custodyConfirmationListener != null) {
+                  custodyConfirmationListener.onKeyCustodyConfirmed();
+                } else if (getActivity() instanceof KeyCustodyConfirmationListener) {
+                  ((KeyCustodyConfirmationListener) getActivity()).onKeyCustodyConfirmed();
+                }
+                dialog.dismiss();
+              });
           switchButton.setOnClickListener(
               v -> {
                 boolean isQrCurrentlyVisible = qrCodeImageView.getVisibility() == View.VISIBLE;
@@ -190,6 +217,13 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
     if (privateKeyCopy != null) {
       Arrays.fill(privateKeyCopy, (byte) 0);
       Log.d(TAG, "Internal defensive copy cleared on dismiss.");
+    }
+    if (!isCustodyConfirmed) {
+      if (custodyConfirmationListener != null) {
+        custodyConfirmationListener.onKeyCustodyCancelled();
+      } else if (getActivity() instanceof KeyCustodyConfirmationListener) {
+        ((KeyCustodyConfirmationListener) getActivity()).onKeyCustodyCancelled();
+      }
     }
   }
 }

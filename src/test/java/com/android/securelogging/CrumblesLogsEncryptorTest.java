@@ -249,6 +249,51 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(FakeAndroidKeyStoreSpi.keystoreEntries).isEmpty();
   }
 
+  @Test
+  public void generateCandidateExternalKeyPair_doesNotMutateActiveKeyOrKeystore() throws Exception {
+    // Given: An existing active external public key is set.
+    PublicKey existingKey = generateTestExternalRsaKeyPair().getPublic();
+    encryptor.setExternalEncryptionPublicKey(existingKey);
+
+    // When: A candidate key pair is generated.
+    KeyPair candidate = encryptor.generateCandidateExternalKeyPair();
+
+    // Then: The candidate pair is valid and non-null.
+    assertThat(candidate).isNotNull();
+    assertThat(candidate.getPublic()).isNotNull();
+    assertThat(candidate.getPrivate()).isNotNull();
+    assertThat(candidate.getPublic().getAlgorithm()).isEqualTo("RSA");
+
+    // And: The active encryption public key was NOT changed.
+    assertThat(encryptor.getExternalEncryptionPublicKey()).isSameInstanceAs(existingKey);
+  }
+
+  @Test
+  public void commitExternalPublicKey_activatesKeyAndDeletesKeystore() throws Exception {
+    // Given: An internal Keystore key pair is generated and present.
+    encryptor.generateKeyPair();
+    assertThat(encryptor.doesPrivateKeyExist()).isTrue();
+    assertThat(FakeAndroidKeyStoreSpi.keystoreEntries).containsKey(CrumblesLogsEncryptor.KEY_ALIAS);
+
+    // And: A candidate external key pair.
+    KeyPair candidate = encryptor.generateCandidateExternalKeyPair();
+
+    // When: commitExternalPublicKey is called.
+    encryptor.commitExternalPublicKey(candidate.getPublic());
+
+    // Then: The candidate public key is now active.
+    assertThat(encryptor.getExternalEncryptionPublicKey()).isEqualTo(candidate.getPublic());
+    // And: The existing internal Keystore key was deleted.
+    assertThat(encryptor.doesPrivateKeyExist()).isFalse();
+    assertThat(FakeAndroidKeyStoreSpi.keystoreEntries)
+        .doesNotContainKey(CrumblesLogsEncryptor.KEY_ALIAS);
+  }
+
+  @Test
+  public void commitExternalPublicKey_withNullKey_throwsException() {
+    assertThrows(CrumblesKeysException.class, () -> encryptor.commitExternalPublicKey(null));
+  }
+
   // --- Encryption Path Tests ---
 
   @Test
