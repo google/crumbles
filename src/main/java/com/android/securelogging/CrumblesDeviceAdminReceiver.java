@@ -16,6 +16,8 @@
 
 package com.android.securelogging;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import android.app.admin.ConnectEvent;
 import android.app.admin.DeviceAdminReceiver;
 import android.app.admin.DevicePolicyManager;
@@ -34,10 +36,7 @@ import androidx.work.WorkManager;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.IOException;
-import java.io.ObjectOutputStream;
 import java.nio.file.Path;
 import java.security.PublicKey;
 import java.text.SimpleDateFormat;
@@ -182,8 +181,8 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
     try {
       encryptAndSaveLogs(
           context, logsToBytes(getSerializableSecurityLogs(securityLogs)), activeKey.get());
-    } catch (CrumblesLogsEncryptionException | IOException e) {
-      Log.e(TAG, "Failed to encrypt or convert security logs to bytes.", e);
+    } catch (CrumblesLogsEncryptionException e) {
+      Log.e(TAG, "Failed to encrypt security logs.", e);
     }
   }
 
@@ -203,8 +202,8 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
     try {
       encryptAndSaveLogs(
           context, logsToBytes(getSerializableNetworkLogs(networkLogs)), activeKey.get());
-    } catch (CrumblesLogsEncryptionException | IOException e) {
-      Log.e(TAG, "Failed to encrypt or convert network logs to bytes.", e);
+    } catch (CrumblesLogsEncryptionException e) {
+      Log.e(TAG, "Failed to encrypt network logs.", e);
     }
   }
 
@@ -367,10 +366,11 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
     return type;
   }
 
-  private byte[] logsToBytes(List<String> logs) throws IOException {
-    ByteArrayOutputStream bos = new ByteArrayOutputStream();
-    new ObjectOutputStream(bos).writeObject(logs);
-    return bos.toByteArray();
+  private static byte[] logsToBytes(List<String> logs) {
+    if (logs == null || logs.isEmpty()) {
+      return new byte[0];
+    }
+    return String.join("", logs).getBytes(UTF_8);
   }
 
   private void encryptAndSaveLogs(Context context, byte[] logsBytes, PublicKey activeKey) {

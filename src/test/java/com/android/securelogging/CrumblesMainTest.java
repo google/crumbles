@@ -29,6 +29,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.Application;
 import android.app.KeyguardManager;
+import android.app.admin.ConnectEvent;
 import android.app.admin.DevicePolicyManager;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
@@ -62,6 +63,7 @@ import com.google.protos.wireless_android_security_exploits_secure_logging_src_m
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.spec.RSAKeyGenParameterSpec;
@@ -952,6 +954,67 @@ public class CrumblesMainTest {
     activity.launchDocumentTreePicker();
 
     assertThat(ShadowToast.getTextOfLatestToast()).isEqualTo("Could not open directory picker.");
+  }
+
+  @Test
+  public void
+      onActivityResult_withRealCollectedNetworkLogs_encryptsDecryptsAndRendersReadableEntries()
+          throws Exception {
+    // 1. Construct real network event using reflection
+    Constructor<ConnectEvent> constructor =
+        ConnectEvent.class.getConstructor(String.class, int.class, String.class, long.class);
+    ConnectEvent connectEvent =
+        constructor.newInstance("192.168.1.100", 443, "com.android.test", 1672531200000L);
+    CrumblesDeviceAdminReceiver receiver = new CrumblesDeviceAdminReceiver();
+    List<String> formattedLogs =
+        receiver.getSerializableNetworkLogs(ImmutableList.of(connectEvent));
+    byte[] plainLogsBytes = String.join("", formattedLogs).getBytes(UTF_8);
+
+    // 2. Encrypt using real CrumblesLogsEncryptor and test key pair
+    KeyPair keyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesLogsEncryptor realEncryptor = new CrumblesLogsEncryptor();
+    LogBatch logBatch = realEncryptor.encryptLogs(plainLogsBytes, keyPair.getPublic());
+    assertThat(logBatch).isNotNull();
+
+    File testFile = new File(mockAdHocDir, "network_logs.bin");
+    try (FileOutputStream fos = new FileOutputStream(testFile)) {
+      logBatch.writeTo(fos);
+    }
+    Intent resultDataIntent = new Intent().setData(Uri.fromFile(testFile));
+
+    // Mock decryptLogs to return the actual plainLogsBytes produced by receiver.logsToBytes
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptLogs(any(LogBatch.class))).thenReturn(plainLogsBytes);
+
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+    final Intent[] nextActivityIntent = new Intent[1];
+
+    scenario.onActivity(
+        activity -> {
+          activity.onActivityResult(FILE_PICKER_REQUEST_CODE, Activity.RESULT_OK, resultDataIntent);
+          shadowOf(activity.getMainLooper()).idle();
+          nextActivityIntent[0] = shadowOf(activity).getNextStartedActivity();
+        });
+
+    assertThat(nextActivityIntent[0]).isNotNull();
+    ArrayList<CrumblesDecryptedLogEntry> logs =
+        IntentCompat.getParcelableArrayListExtra(
+            nextActivityIntent[0],
+            CrumblesConstants.EXTRA_DECRYPTED_LOGS,
+            CrumblesDecryptedLogEntry.class);
+
+    assertThat(logs).isNotNull();
+    assertThat(logs).hasSize(1);
+    String renderedContent = logs.get(0).getContent();
+    assertThat(renderedContent).contains("Network log ID: 0");
+    assertThat(renderedContent).contains("Timestamp (UTC): 2023-01-01T00:00:00.000Z");
+    assertThat(renderedContent).contains("Package name: com.android.test");
+    assertThat(renderedContent).contains("Connect event ID: 0");
+    assertThat(renderedContent).contains("Inet address: /192.168.1.100");
+    assertThat(renderedContent).contains("Port: 443");
+    // Verify no Java binary serialization stream markers are present
+    assertThat(renderedContent).doesNotContain("\u00ac\u00ed");
+    assertThat(renderedContent).doesNotContain("java.util.ArrayList");
   }
 
   /** Fake implementation of ContentProvider for testing purposes. */
