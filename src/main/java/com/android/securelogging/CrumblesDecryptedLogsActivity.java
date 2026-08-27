@@ -159,15 +159,11 @@ public class CrumblesDecryptedLogsActivity extends Activity {
 
     PublicKey reEncryptionKey = null;
     try {
-      if (isInternal) {
-        reEncryptionKey = logsEncryptor.getPublicKey(keyIdentifier);
-      } else {
-        List<PublicKey> externalKeys = publicKeyManager.getExternalReEncryptPublicKeys();
-        for (PublicKey key : externalKeys) {
-          if (CrumblesLogsEncryptor.getPublicKeyHash(key).equals(keyIdentifier)) {
-            reEncryptionKey = key;
-            break;
-          }
+      List<PublicKey> externalKeys = publicKeyManager.getExternalReEncryptPublicKeys();
+      for (PublicKey key : externalKeys) {
+        if (CrumblesLogsEncryptor.getPublicKeyHash(key).equals(keyIdentifier)) {
+          reEncryptionKey = key;
+          break;
         }
       }
     } catch (RuntimeException e) {

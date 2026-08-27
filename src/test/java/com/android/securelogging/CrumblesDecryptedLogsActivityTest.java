@@ -19,7 +19,6 @@ package com.android.securelogging;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -171,12 +170,11 @@ public class CrumblesDecryptedLogsActivityTest {
 
   @Test
   public void handleReEncryption_withMismatchedKey_showsToast() throws Exception {
-    when(mockLogsEncryptor.getPublicKey(anyString())).thenReturn(null);
     when(mockPublicKeyManager.getExternalReEncryptPublicKeys()).thenReturn(ImmutableList.of());
 
     scenario = ActivityScenario.launch(createTestIntent(TEST_FILE_NAME_1));
 
-    scenario.onActivity(activity -> activity.handleReEncryption("non_existent_id", true));
+    scenario.onActivity(activity -> activity.handleReEncryption("non_existent_id", false));
     shadowOf(Looper.getMainLooper()).idle();
 
     assertThat(ShadowToast.getTextOfLatestToast())

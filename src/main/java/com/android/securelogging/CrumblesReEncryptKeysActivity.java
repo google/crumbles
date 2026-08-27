@@ -41,18 +41,16 @@ import androidx.annotation.VisibleForTesting;
 import androidx.core.content.ContextCompat;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import java.security.PublicKey;
-import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
 
-/** An activity to select or create a key for re-encryption. */
+/** An activity to select or import an external public key for re-encryption. */
 public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
 
   private static final String TAG = "CrumblesReEncryptKeys";
   public static final String EXTRA_SELECTED_KEY_ALIAS = "selected_key_alias";
   public static final String EXTRA_SELECTED_KEY_IS_INTERNAL = "is_internal_key";
 
-  private CrumblesLogsEncryptor logsEncryptor;
   private CrumblesExternalPublicKeyManager publicKeyManager;
   private List<KeyInfo> availableKeys;
   private ArrayAdapter<KeyInfo> adapter;
@@ -98,7 +96,6 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
       getSupportActionBar().setTitle("Select Re-encryption Key");
     }
 
-    logsEncryptor = CrumblesMain.getLogsEncryptorInstance();
     // Use the test manager if it's been injected.
     if (publicKeyManagerForTest != null) {
       publicKeyManager = publicKeyManagerForTest;
@@ -117,13 +114,10 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
           KeyInfo selectedKey = availableKeys.get(position);
           Intent resultIntent = new Intent();
           resultIntent.putExtra(EXTRA_SELECTED_KEY_ALIAS, selectedKey.getAlias());
-          resultIntent.putExtra(EXTRA_SELECTED_KEY_IS_INTERNAL, selectedKey.isInternal());
+          resultIntent.putExtra(EXTRA_SELECTED_KEY_IS_INTERNAL, false);
           setResult(Activity.RESULT_OK, resultIntent);
           finish();
         });
-
-    Button createInternalKey = findViewById(R.id.btn_create_internal_re_encrypt_key);
-    createInternalKey.setOnClickListener(v -> createNewInternalKey());
 
     Button importExternalKey = findViewById(R.id.btn_import_external_re_encrypt_key);
     importExternalKey.setOnClickListener(v -> startQrScan());
@@ -138,15 +132,6 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
   private void loadAvailableKeys() {
     availableKeys.clear();
 
-    // Load internal keys from Keystore
-    List<PublicKey> internalKeys = logsEncryptor.getInternalReEncryptPublicKeys();
-    for (PublicKey key : internalKeys) {
-      String alias = CrumblesLogsEncryptor.getPublicKeyAlias(key);
-      if (alias != null) {
-        availableKeys.add(new KeyInfo(alias, "Keystore Key", true));
-      }
-    }
-
     // Load external keys from EncryptedSharedPreferences
     List<PublicKey> externalKeys = publicKeyManager.getExternalReEncryptPublicKeys();
     for (PublicKey key : externalKeys) {
@@ -155,20 +140,6 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
     }
 
     adapter.notifyDataSetChanged();
-  }
-
-  private void createNewInternalKey() {
-    try {
-      String newAlias =
-          CrumblesLogsEncryptor.RE_ENCRYPT_KEY_ALIAS_PREFIX
-              + InstantSource.system().instant().toEpochMilli();
-      logsEncryptor.generateKeyPair(newAlias, /* requireUserAuthentication= */ false);
-      Toast.makeText(this, "New internal re-encryption key created.", Toast.LENGTH_SHORT).show();
-      loadAvailableKeys(); // Refresh the list
-    } catch (Exception e) {
-      Toast.makeText(this, "Failed to create new key.", Toast.LENGTH_SHORT).show();
-      Log.e(TAG, "Failed to create new internal re-encryption key", e);
-    }
   }
 
   private void startQrScan() {

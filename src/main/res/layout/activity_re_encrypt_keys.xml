@@ -38,14 +38,6 @@
         android:layout_weight="1" />
 
     <Button
-        android:id="@+id/btn_create_internal_re_encrypt_key"
-        style="@style/Widget.AppCompat.Button.Colored"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="@string/re_encrypt_keys_new_internal_key_button" />
-
-    <Button
         android:id="@+id/btn_import_external_re_encrypt_key"
         style="@style/Widget.AppCompat.Button.Colored"
         android:layout_width="match_parent"

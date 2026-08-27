@@ -95,8 +95,7 @@
     <string name="generate_keystore_key_pair_button" description="Button label for generating a new Keystore key pair. [CHAR LIMIT=NONE]">Generate Keystore Key Pair (Recommended)</string>
     <string name="encryption_key_status_none" description="Status message indicating that no encryption key is currently configured. [CHAR LIMIT=NONE]">No encryption key configured</string>
 
-    <string name="re_encrypt_keys_options" description="Message displayed to choose a re-encryption key either new or existing. [CHAR LIMIT=NONE]">Select a key to re-encrypt the logs with, or create a new one.</string>
-    <string name="re_encrypt_keys_new_internal_key_button" description="Button label for creating a new internal key for re-encryption. [CHAR LIMIT=NONE]">Create New Internal Key</string>
+    <string name="re_encrypt_keys_options" description="Message displayed to choose a re-encryption key either new or existing. [CHAR LIMIT=NONE]">Select an external public key to re-encrypt the logs with, or import a new one via QR code.</string>
     <string name="re_encrypt_keys_import_external_public_key_qr_button" description="Button label for importing an external public key for re-encryption. [CHAR LIMIT=NONE]">Import External Public Key (QR)</string>
 
     <string name="btn_select_upload_dest_label" description="Label for button to configure the Google Drive upload destination folder. [CHAR LIMIT=NONE]">Select Google Drive Folder</string>

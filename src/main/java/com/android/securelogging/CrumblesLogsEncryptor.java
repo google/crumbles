@@ -53,14 +53,9 @@ import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
-import java.security.cert.Certificate;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.List;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -93,8 +88,6 @@ public class CrumblesLogsEncryptor {
   /** Alias for the primary key used to encrypt preferences. */
   public static final String PREFERENCE_PRIMARY_KEY_ALIAS =
       "com.android.securelogging.CrumblesPreferencePrimaryKey";
-  /** Prefix for key aliases used in re-encryption. */
-  public static final String RE_ENCRYPT_KEY_ALIAS_PREFIX = "re_encrypt_";
   private static final String SERIALIZED_ENCRYPTED_DATA_DELIMITER = ":";
 
   private static final Duration AUTH_VALIDITY_DURATION = Duration.ofSeconds(30);
@@ -576,45 +569,6 @@ public class CrumblesLogsEncryptor {
     }
   }
 
-  public List<PublicKey> getInternalReEncryptPublicKeys() {
-    List<PublicKey> keys = new ArrayList<>();
-    try {
-      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
-      keyStore.load(null);
-      Enumeration<String> aliases = keyStore.aliases();
-      while (aliases.hasMoreElements()) {
-        String alias = aliases.nextElement();
-        if (alias.startsWith(RE_ENCRYPT_KEY_ALIAS_PREFIX)) {
-          PublicKey publicKey = keyStore.getCertificate(alias).getPublicKey();
-          if (publicKey != null) {
-            keys.add(publicKey);
-          }
-        }
-      }
-    } catch (Exception e) {
-      Log.e(TAG, "Failed to retrieve re-encryption keys from Keystore.", e);
-    }
-    return Collections.unmodifiableList(keys);
-  }
-
-  @Nullable
-  public static String getPublicKeyAlias(PublicKey publicKey) {
-    try {
-      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
-      keyStore.load(null);
-      Enumeration<String> aliases = keyStore.aliases();
-      while (aliases.hasMoreElements()) {
-        String alias = aliases.nextElement();
-        Certificate cert = keyStore.getCertificate(alias);
-        if (cert != null && cert.getPublicKey().equals(publicKey)) {
-          return alias;
-        }
-      }
-    } catch (Exception e) {
-      Log.e(TAG, "Failed to get alias for public key.", e);
-    }
-    return null;
-  }
 
   @Nullable
   public static String publicKeyToBase64(@Nullable PublicKey publicKey) {
