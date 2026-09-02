@@ -171,8 +171,6 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
                 isCustodyConfirmed = true;
                 if (custodyConfirmationListener != null) {
                   custodyConfirmationListener.onKeyCustodyConfirmed();
-                } else if (getActivity() instanceof KeyCustodyConfirmationListener) {
-                  ((KeyCustodyConfirmationListener) getActivity()).onKeyCustodyConfirmed();
                 }
                 dialog.dismiss();
               });
@@ -221,8 +219,6 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
     if (!isCustodyConfirmed) {
       if (custodyConfirmationListener != null) {
         custodyConfirmationListener.onKeyCustodyCancelled();
-      } else if (getActivity() instanceof KeyCustodyConfirmationListener) {
-        ((KeyCustodyConfirmationListener) getActivity()).onKeyCustodyCancelled();
       }
     }
   }

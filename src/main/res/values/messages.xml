@@ -56,6 +56,8 @@
     <string name="toast_qr_generation_failed_for_private_key" description="Toast message if generating a QR code for the private key fails. [CHAR LIMIT=NONE] ">Could not generate QR code for private key.</string>
     <string name="toast_qr_scan_failed_no_data" description="Toast message if QR scan was technically successful but no content data was found in the result. [CHAR LIMIT=NONE]">Scan completed, but no data found.</string>
 
+    <string name="toast_key_export_cancelled_active_key_preserved" description="Toast message shown when external key export is cancelled and the active encryption key is preserved without changes. [CHAR LIMIT=NONE]">Key export cancelled. Active encryption key was not changed.</string>
+
     <string name="toast_external_key_cleared_successfully" description="Toast message shown when the active external key is cleared. [CHAR LIMIT=NONE] ">External public key cleared.</string>
 
     <string name="dialog_title_private_key_security_warning" description="Title for the dialog that displays the newly generated private key and warns the user. [CHAR LIMIT=NONE] ">Your New Private Key (SAVE SECURELY!)</string>

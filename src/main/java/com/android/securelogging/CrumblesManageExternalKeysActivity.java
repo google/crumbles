@@ -48,19 +48,26 @@ import com.google.common.collect.ImmutableList;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.File;
 import java.nio.file.Path;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.NoSuchAlgorithmException;
 import java.security.PublicKey;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
 /** Activity for managing external keys. */
-public class CrumblesManageExternalKeysActivity extends AppCompatActivity {
+public class CrumblesManageExternalKeysActivity extends AppCompatActivity
+    implements CrumblesPrivateKeyViewerDialogFragment.KeyCustodyConfirmationListener {
 
   private static final String TAG = "CrumblesManageExtKeysActivity";
   private static final int REQUEST_CODE_CONFIRM_CREDENTIALS = 1001;
 
   private CrumblesExternalPublicKeyManager publicKeyManager;
+  @Nullable private PublicKey pendingCandidatePublicKey;
   private TextView tvCurrentExternalKeyStatus;
   @Nullable private Runnable pendingKeyChangeAction;
   private CrumblesUriGenerator uriGenerator = new CrumblesUriGenerator();
@@ -149,9 +156,31 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity {
   }
 
   @Override
+  protected void onSaveInstanceState(@NonNull Bundle outState) {
+    super.onSaveInstanceState(outState);
+    if (pendingCandidatePublicKey != null) {
+      outState.putByteArray("pending_candidate_public_key", pendingCandidatePublicKey.getEncoded());
+    }
+  }
+
+  @Override
   protected void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
     setContentView(R.layout.activity_manage_external_keys);
+
+    if (savedInstanceState != null
+        && savedInstanceState.containsKey("pending_candidate_public_key")) {
+      byte[] keyBytes = savedInstanceState.getByteArray("pending_candidate_public_key");
+      if (keyBytes != null) {
+        try {
+          KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+          this.pendingCandidatePublicKey =
+              keyFactory.generatePublic(new X509EncodedKeySpec(keyBytes));
+        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
+          Log.e(TAG, "Failed to restore pending candidate public key from saved instance state", e);
+        }
+      }
+    }
 
     if (getSupportActionBar() != null) {
       getSupportActionBar().setDisplayHomeAsUpEnabled(true);
@@ -400,11 +429,12 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity {
         String.format(
             Locale.getDefault(),
             "Failed to decrypt %d out of %d pending log file(s) with your current key pair:%s\n\n"
-                + "Changing your key pair now will prevent those logs from being decrypted in the future. "
-                + "Would you like to upload all remaining logs as-is, discard them, or cancel the key change?",
+                + "Changing your key pair now will prevent those logs from being decrypted in the"
+                + " future. Would you like to upload all remaining logs as-is, discard them, or"
+                + " cancel the key change?",
             failedCount,
             totalCount,
-            detailsBuilder.toString());
+            detailsBuilder);
 
     new AlertDialog.Builder(this)
         .setTitle("Log Decryption Warning")
@@ -538,32 +568,15 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity {
     confirmAndPerformKeyChange(
         () -> {
           try {
-            CrumblesMain.getLogsEncryptorInstance()
-                .generateAndSetExternalKeyPair(
-                    privateKeyBytes -> {
-                      PublicKey newPublicKey =
-                          CrumblesMain.getLogsEncryptorInstance()
-                              .getExternalEncryptionPublicKey();
-                      if (newPublicKey == null) {
-                        throw new CrumblesKeysException(
-                            "Generated public key was null after generation.", null);
-                      }
-
-                      publicKeyManager.saveActiveExternalPublicKey(newPublicKey);
-                      CrumblesAppAuditLogger.getInstance(this)
-                          .logEvent(
-                              "KEY_EXPORTABLE_GENERATED", "New exportable key pair generated.");
-                      showToast(
-                          getString(
-                              R.string.toast_new_external_key_generated_successfully));
-
-                      showPrivateKeyExportChoiceDialog(privateKeyBytes);
-                    });
+            KeyPair candidatePair =
+                CrumblesMain.getLogsEncryptorInstance().generateCandidateExternalKeyPair();
+            this.pendingCandidatePublicKey = candidatePair.getPublic();
+            byte[] privateKeyBytes = candidatePair.getPrivate().getEncoded();
+            showPrivateKeyExportChoiceDialog(privateKeyBytes);
           } catch (CrumblesKeysException e) {
-            Log.e(TAG, "Failed to generate or process exportable key pair", e);
+            Log.e(TAG, "Failed to generate exportable key pair", e);
             showToast(
-                getString(
-                    R.string.toast_generate_external_key_error_with_message, e.getMessage()));
+                getString(R.string.toast_generate_external_key_error_with_message, e.getMessage()));
           }
         });
   }
@@ -574,29 +587,61 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity {
         .setMessage(R.string.dialog_message_choose_key_format)
         .setPositiveButton(
             R.string.dialog_button_view_as_text,
-            (dialog, which) ->
-                // Pass the key to the viewer. The viewer is now responsible for cleanup.
-                showPrivateKeyViewer(privateKeyBytes, false))
-        // The Arrays.fill() call is REMOVED from here.
+            (dialog, which) -> showPrivateKeyViewer(privateKeyBytes, false))
         .setNegativeButton(
             R.string.dialog_button_view_as_qr,
-            (dialog, which) ->
-                // Pass the key to the viewer. The viewer is now responsible for cleanup.
-                showPrivateKeyViewer(privateKeyBytes, true))
-        // The Arrays.fill() call is REMOVED from here.
+            (dialog, which) -> showPrivateKeyViewer(privateKeyBytes, true))
         .setOnCancelListener(
             (dialog) -> {
-              // The cleanup when the user cancels the choice is still correct.
               Arrays.fill(privateKeyBytes, (byte) 0);
-              Log.d(TAG, "Defensive copy cleared after user cancelled export choice.");
+              pendingCandidatePublicKey = null;
+              Log.d(
+                  TAG,
+                  "Defensive copy cleared after user cancelled export choice; active key"
+                      + " preserved.");
+              showToast(getString(R.string.toast_key_export_cancelled_active_key_preserved));
+              updateStatusUi();
             })
         .show();
   }
 
   @VisibleForTesting
   public void showPrivateKeyViewer(byte[] privateKeyBytes, boolean showQrInitially) {
-    CrumblesPrivateKeyViewerDialogFragment.newInstance(privateKeyBytes, showQrInitially)
-        .show(getSupportFragmentManager(), "private_key_viewer");
+    CrumblesPrivateKeyViewerDialogFragment fragment =
+        CrumblesPrivateKeyViewerDialogFragment.newInstance(privateKeyBytes, showQrInitially);
+    fragment.setKeyCustodyConfirmationListener(this);
+    fragment.show(getSupportFragmentManager(), "private_key_viewer");
+  }
+
+  @Override
+  public void onKeyCustodyConfirmed() {
+    if (pendingCandidatePublicKey == null) {
+      Log.w(TAG, "Custody confirmed but pendingCandidatePublicKey is null.");
+      return;
+    }
+    try {
+      publicKeyManager.saveActiveExternalPublicKey(pendingCandidatePublicKey);
+      CrumblesMain.getLogsEncryptorInstance().commitExternalPublicKey(pendingCandidatePublicKey);
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              "KEY_EXPORTABLE_GENERATED",
+              "New exportable key pair generated and custody confirmed.");
+      showToast(getString(R.string.toast_new_external_key_generated_successfully));
+      updateStatusUi();
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to commit candidate public key", e);
+      showToast("Error activating external key: " + e.getMessage());
+    } finally {
+      pendingCandidatePublicKey = null;
+    }
+  }
+
+  @Override
+  public void onKeyCustodyCancelled() {
+    pendingCandidatePublicKey = null;
+    Log.d(TAG, "Key custody cancelled or dismissed; active key preserved.");
+    showToast(getString(R.string.toast_key_export_cancelled_active_key_preserved));
+    updateStatusUi();
   }
 
   private void startQrScan() {

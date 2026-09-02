@@ -20,7 +20,10 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.robolectric.Shadows.shadowOf;
@@ -39,11 +42,11 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.ScrollView;
+import android.widget.TextView;
 import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
-import com.android.securelogging.CrumblesLogsEncryptor.PrivateKeyBytesConsumer;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.google.common.collect.ImmutableList;
@@ -52,9 +55,11 @@ import com.google.protos.wireless_android_security_exploits_secure_logging_src_m
 import java.io.File;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.spec.RSAKeyGenParameterSpec;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -155,15 +160,10 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   private void mockSuccessfulKeyGeneration(byte[] keyBytes) throws CrumblesKeysException {
-    doAnswer(
-            invocation -> {
-              invocation.getArgument(0, PrivateKeyBytesConsumer.class).accept(keyBytes);
-              return null;
-            })
-        .when(mockLogsEncryptor)
-        .generateAndSetExternalKeyPair(any(PrivateKeyBytesConsumer.class));
-    when(mockLogsEncryptor.getExternalEncryptionPublicKey())
-        .thenReturn(testExternalKeyPair.getPublic());
+    PrivateKey mockPrivateKey = mock(PrivateKey.class);
+    when(mockPrivateKey.getEncoded()).thenReturn(keyBytes);
+    KeyPair keyPair = new KeyPair(testExternalKeyPair.getPublic(), mockPrivateKey);
+    when(mockLogsEncryptor.generateCandidateExternalKeyPair()).thenReturn(keyPair);
   }
 
   @Test
@@ -316,38 +316,197 @@ public class CrumblesManageExternalKeysActivityTest {
         });
   }
 
-  @Test
-  public void onChoiceDialog_whenCancelled_clearsTheKey() throws Exception {
-    // Given: We have a reference to the key bytes that will be generated.
-    final byte[] privateKeyBytes = testExternalKeyPair.getPrivate().getEncoded();
-    mockSuccessfulKeyGeneration(privateKeyBytes);
-    launchActivity();
-
-    // When: The generate button is clicked to show the choice dialog.
+  private void triggerExportChoiceAndClick(int buttonId) {
     scenario.onActivity(
         activity -> {
           activity.findViewById(R.id.btn_generate_exportable_key).performClick();
           ShadowLooper.idleMainLooper();
-
-          // And: The user cancels the choice dialog.
           AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
           assertThat(choiceDialog).isNotNull();
-          choiceDialog.cancel(); // This triggers the OnCancelListener
+          choiceDialog.getButton(buttonId).performClick();
+        });
+    ShadowLooper.idleMainLooper();
+  }
+
+  private DialogFragment getViewerDialogFragment() {
+    AtomicReference<DialogFragment> fragmentRef = new AtomicReference<>();
+    scenario.onActivity(
+        activity -> {
+          activity.getSupportFragmentManager().executePendingTransactions();
+          fragmentRef.set(
+              (DialogFragment)
+                  activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer"));
+        });
+    return fragmentRef.get();
+  }
+
+  @Test
+  public void onChoiceDialog_whenCancelled_clearsTheKeyAndPreservesActiveKey() throws Exception {
+    // Given: A candidate exportable key pair is generated.
+    final byte[] privateKeyBytes = testExternalKeyPair.getPrivate().getEncoded();
+    mockSuccessfulKeyGeneration(privateKeyBytes);
+    launchActivity();
+
+    // When: The user generates a key and cancels the export format choice dialog.
+    scenario.onActivity(
+        activity -> {
+          activity.findViewById(R.id.btn_generate_exportable_key).performClick();
+          ShadowLooper.idleMainLooper();
+          AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
+          assertThat(choiceDialog).isNotNull();
+          choiceDialog.cancel();
           ShadowLooper.idleMainLooper();
         });
 
-    // Then: The original byte array is cleared (filled with zeros).
-    byte[] expectedClearedBytes = new byte[privateKeyBytes.length];
-    assertThat(privateKeyBytes).isEqualTo(expectedClearedBytes);
+    // Then: The private key buffer is zeroed, candidate is rolled back, and toast is shown.
+    assertThat(privateKeyBytes).isEqualTo(new byte[privateKeyBytes.length]);
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
+    verify(mockLogsEncryptor, never()).commitExternalPublicKey(any());
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(appContext.getString(R.string.toast_key_export_cancelled_active_key_preserved));
+    assertThat(getViewerDialogFragment()).isNull();
 
-    // And: Verify the main viewer fragment was never shown.
+    // And: A subsequent custody confirmation does nothing because candidate key was cleared.
+    scenario.onActivity(CrumblesManageExternalKeysActivity::onKeyCustodyConfirmed);
+    ShadowLooper.idleMainLooper();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
+    verify(mockLogsEncryptor, never()).commitExternalPublicKey(any());
+  }
+
+  @Test
+  public void onViewerDialog_whenDoneClicked_commitsAndActivatesCandidateKey() throws Exception {
+    // Given: A candidate exportable key pair is generated.
+    mockSuccessfulKeyGeneration(testExternalKeyPair.getPrivate().getEncoded());
+    doAnswer(
+            invocation -> {
+              when(mockPublicKeyManager.getActiveExternalPublicKey())
+                  .thenReturn(testExternalKeyPair.getPublic());
+              return null;
+            })
+        .when(mockPublicKeyManager)
+        .saveActiveExternalPublicKey(testExternalKeyPair.getPublic());
+
+    launchActivity();
+
+    // When: The export format is chosen and the viewer "Done" button is clicked.
+    triggerExportChoiceAndClick(AlertDialog.BUTTON_POSITIVE);
+    DialogFragment dialogFragment = getViewerDialogFragment();
+    assertThat(dialogFragment).isNotNull();
+    Dialog dialog = dialogFragment.getDialog();
+    assertThat(dialog).isNotNull();
+    dialog.findViewById(R.id.btn_done).performClick();
+    ShadowLooper.idleMainLooper();
+
+    // Then: The candidate public key is saved and committed, and audit log is recorded.
+    verify(mockPublicKeyManager).saveActiveExternalPublicKey(testExternalKeyPair.getPublic());
+    verify(mockLogsEncryptor).commitExternalPublicKey(testExternalKeyPair.getPublic());
+    verify(mockAuditLogger)
+        .logEvent(
+            "KEY_EXPORTABLE_GENERATED", "New exportable key pair generated and custody confirmed.");
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(appContext.getString(R.string.toast_new_external_key_generated_successfully));
+
+    // And: The UI status text and clear button are updated to reflect the active key.
     scenario.onActivity(
         activity -> {
-          DialogFragment dialogFragment =
-              (DialogFragment)
-                  activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
-          assertThat(dialogFragment).isNull();
+          TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
+          String expectedKeyHash =
+              CrumblesLogsEncryptor.getPublicKeyHash(testExternalKeyPair.getPublic());
+          assertThat(tvStatus.getText().toString())
+              .isEqualTo(
+                  appContext.getString(
+                      R.string.status_external_key_active_formatted, expectedKeyHash));
+          Button clearBtn = activity.findViewById(R.id.btn_clear_active_external_key);
+          assertThat(clearBtn.getVisibility()).isEqualTo(View.VISIBLE);
         });
+  }
+
+  @Test
+  public void onViewerDialog_whenDismissedWithoutDone_rollsBackCandidateKey() throws Exception {
+    // Given: An active key is already present.
+    when(mockPublicKeyManager.getActiveExternalPublicKey())
+        .thenReturn(testExternalKeyPair.getPublic());
+    mockSuccessfulKeyGeneration(testExternalKeyPair.getPrivate().getEncoded());
+    launchActivity();
+
+    // When: The export dialog is shown and dismissed without clicking Done.
+    triggerExportChoiceAndClick(AlertDialog.BUTTON_POSITIVE);
+    DialogFragment dialogFragment = getViewerDialogFragment();
+    assertThat(dialogFragment).isNotNull();
+    scenario.onActivity(
+        activity -> {
+          TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
+          tvStatus.setText("temporary_pending_state");
+        });
+    dialogFragment.dismiss();
+    ShadowLooper.idleMainLooper();
+
+    // Then: The candidate key is never committed, and UI status is restored.
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
+    verify(mockLogsEncryptor, never()).commitExternalPublicKey(any());
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(appContext.getString(R.string.toast_key_export_cancelled_active_key_preserved));
+
+    scenario.onActivity(
+        activity -> {
+          TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
+          String expectedKeyHash =
+              CrumblesLogsEncryptor.getPublicKeyHash(testExternalKeyPair.getPublic());
+          assertThat(tvStatus.getText().toString())
+              .isEqualTo(
+                  appContext.getString(
+                      R.string.status_external_key_active_formatted, expectedKeyHash));
+        });
+
+    // And: A subsequent custody confirmation does nothing because candidate key was cleared.
+    scenario.onActivity(CrumblesManageExternalKeysActivity::onKeyCustodyConfirmed);
+    ShadowLooper.idleMainLooper();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
+    verify(mockLogsEncryptor, never()).commitExternalPublicKey(any());
+  }
+
+  @Test
+  public void onKeyCustodyConfirmed_whenNoPendingCandidatePublicKey_doesNothing() throws Exception {
+    // Given: Activity is launched without any pending candidate key.
+    launchActivity();
+
+    // When: onKeyCustodyConfirmed is invoked directly.
+    scenario.onActivity(CrumblesManageExternalKeysActivity::onKeyCustodyConfirmed);
+    ShadowLooper.idleMainLooper();
+
+    // Then: No public key is saved or committed.
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
+    verify(mockLogsEncryptor, never()).commitExternalPublicKey(any());
+  }
+
+  @Test
+  public void onKeyCustodyConfirmed_whenCommitFails_showsErrorToastAndClearsPending()
+      throws Exception {
+    // Given: Key generation succeeds but committing fails.
+    mockSuccessfulKeyGeneration(testExternalKeyPair.getPrivate().getEncoded());
+    doThrow(new CrumblesKeysException("Commit failed"))
+        .when(mockLogsEncryptor)
+        .commitExternalPublicKey(any());
+
+    launchActivity();
+
+    // When: Format is chosen and Done is clicked.
+    triggerExportChoiceAndClick(AlertDialog.BUTTON_POSITIVE);
+    DialogFragment dialogFragment = getViewerDialogFragment();
+    assertThat(dialogFragment).isNotNull();
+    Dialog dialog = dialogFragment.getDialog();
+    assertThat(dialog).isNotNull();
+    dialog.findViewById(R.id.btn_done).performClick();
+    ShadowLooper.idleMainLooper();
+
+    // Then: Error toast is displayed.
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo("Error activating external key: Commit failed");
+
+    // And: Pending key was cleared in finally block, so subsequent confirmation does nothing.
+    scenario.onActivity(CrumblesManageExternalKeysActivity::onKeyCustodyConfirmed);
+    ShadowLooper.idleMainLooper();
+    verify(mockPublicKeyManager).saveActiveExternalPublicKey(any());
   }
 
   @Test
