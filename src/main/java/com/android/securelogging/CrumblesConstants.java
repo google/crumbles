@@ -40,7 +40,7 @@ public final class CrumblesConstants {
   public static final long SEND_REPEAT_INTERVAL_HOURS = 8;
 
   public static final String ENCRYPTED_LOGS_SUBDIRECTORY = "CrumblesEncryptedFiles";
-  public static final String EXTRA_DECRYPTED_LOGS = "extra_decrypted_logs";
+  public static final String EXTRA_DECRYPTED_SESSION_ID = "extra_decrypted_session_id";
   public static final String FILE_PROVIDER_AUTHORITY =
       "com.android.securelogging.fileprovider"; // Matches what is defined in the Manifest.
   public static final String TEMP_RE_ENCRYPTED_DIR = "reencrypted_logs";

@@ -37,8 +37,7 @@ public class CrumblesDecryptedLogEntryTest {
 
   @Test
   public void constructor_withRawBytes_initializesCorrectly() {
-    CrumblesDecryptedLogEntry entry =
-        new CrumblesDecryptedLogEntry(TEST_FILE_NAME, TEST_CONTENT, testRawBytes);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, testRawBytes);
 
     assertThat(entry.getFileName()).isEqualTo(TEST_FILE_NAME);
     assertThat(entry.getContent()).isEqualTo(TEST_CONTENT);
@@ -47,50 +46,73 @@ public class CrumblesDecryptedLogEntryTest {
 
   @Test
   public void constructor_withoutRawBytes_initializesCorrectly() {
-    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, TEST_CONTENT);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, null);
 
     assertThat(entry.getFileName()).isEqualTo(TEST_FILE_NAME);
-    assertThat(entry.getContent()).isEqualTo(TEST_CONTENT);
-    assertThat(entry.getRawBytes()).isNull(); // Raw bytes should be null initially.
+    assertThat(entry.getContent()).isNull();
+    assertThat(entry.getRawBytes()).isNull();
+    entry.setRawBytes(testRawBytes);
+    assertThat(entry.getRawBytes()).isEqualTo(testRawBytes);
+  }
+
+  @Test
+  public void wipe_zeroesRawBytesBuffer() {
+    byte[] mutableBytes = "sensitive".getBytes(UTF_8);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, mutableBytes);
+
+    entry.wipe();
+
+    assertThat(entry.getRawBytes()).isNull();
+    assertThat(entry.getContent()).isNull();
+    assertThat(mutableBytes).isEqualTo(new byte[mutableBytes.length]);
   }
 
   @Test
   public void getFileName_returnsCorrectValue() {
-    CrumblesDecryptedLogEntry entry =
-        new CrumblesDecryptedLogEntry(TEST_FILE_NAME, TEST_CONTENT, testRawBytes);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, testRawBytes);
     assertThat(entry.getFileName()).isEqualTo(TEST_FILE_NAME);
   }
 
   @Test
   public void getContent_returnsCorrectValue() {
-    CrumblesDecryptedLogEntry entry =
-        new CrumblesDecryptedLogEntry(TEST_FILE_NAME, TEST_CONTENT, testRawBytes);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, testRawBytes);
     assertThat(entry.getContent()).isEqualTo(TEST_CONTENT);
   }
 
   @Test
   public void getRawBytes_returnsCorrectValue() {
-    CrumblesDecryptedLogEntry entry =
-        new CrumblesDecryptedLogEntry(TEST_FILE_NAME, TEST_CONTENT, testRawBytes);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, testRawBytes);
     assertThat(entry.getRawBytes()).isEqualTo(testRawBytes);
   }
 
   @Test
-  public void setRawBytes_updatesRawBytesCorrectly() {
-    CrumblesDecryptedLogEntry entry =
-        new CrumblesDecryptedLogEntry(TEST_FILE_NAME, TEST_CONTENT); // Start with null rawBytes.
-    assertThat(entry.getRawBytes()).isNull();
-
+  public void setRawBytes_updatesRawBytesAndWipesPreviousBuffer() {
+    byte[] initialBytes = "initial".getBytes(UTF_8);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, initialBytes);
     byte[] newRawBytes = "new raw data".getBytes(UTF_8);
+
     entry.setRawBytes(newRawBytes);
 
     assertThat(entry.getRawBytes()).isEqualTo(newRawBytes);
+    assertThat(entry.getContent()).isEqualTo("new raw data");
+    assertThat(initialBytes).isEqualTo(new byte[initialBytes.length]);
+  }
+
+  @Test
+  public void setRawBytes_withNull_clearsRawBytesAndWipesPreviousBuffer() {
+    byte[] initialBytes = "initial".getBytes(UTF_8);
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, initialBytes);
+
+    entry.setRawBytes(null);
+
+    assertThat(entry.getRawBytes()).isNull();
+    assertThat(initialBytes).isEqualTo(new byte[initialBytes.length]);
   }
 
   @Test
   public void serialization_deserialization_preservesData() throws Exception {
     CrumblesDecryptedLogEntry originalEntry =
-        new CrumblesDecryptedLogEntry(TEST_FILE_NAME, TEST_CONTENT, testRawBytes);
+        new CrumblesDecryptedLogEntry(TEST_FILE_NAME, testRawBytes);
 
     // Serialize
     ByteArrayOutputStream baos = new ByteArrayOutputStream();

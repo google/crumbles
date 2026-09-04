@@ -16,38 +16,50 @@
 
 package com.android.securelogging;
 
-import java.io.Serializable;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
-/** Represents a decrypted log entry from Crumbles. */
+import androidx.annotation.Nullable;
+import java.io.Serializable;
+import java.util.Arrays;
+
+/** Represents a decrypted log entry retaining mutable raw bytes in volatile memory. */
 public class CrumblesDecryptedLogEntry implements Serializable {
   private final String fileName;
-  private final String content;
-  private byte[] rawBytes; // Store the raw decrypted bytes for re-encryption.
+  private byte[] rawBytes;
 
-  public CrumblesDecryptedLogEntry(String fileName, String content, byte[] rawBytes) {
+  /** Constructs a new entry with the file name and optional mutable raw bytes buffer. */
+  public CrumblesDecryptedLogEntry(String fileName, @Nullable byte[] rawBytes) {
     this.fileName = fileName;
-    this.content = content;
     this.rawBytes = rawBytes;
-  }
-
-  public CrumblesDecryptedLogEntry(String fileName, String content) {
-    this.fileName = fileName;
-    this.content = content;
   }
 
   public String getFileName() {
     return fileName;
   }
 
+  @Nullable
   public String getContent() {
-    return content;
+    return rawBytes != null ? new String(rawBytes, UTF_8) : null;
   }
 
+  @Nullable
   public byte[] getRawBytes() {
     return rawBytes;
   }
 
-  public void setRawBytes(byte[] rawBytes) {
-    this.rawBytes = rawBytes;
+  /** Sets the raw bytes buffer, securely zeroing any previous buffer if replaced. */
+  public void setRawBytes(@Nullable byte[] newRawBytes) {
+    if (this.rawBytes != null && !Arrays.equals(this.rawBytes, newRawBytes)) {
+      Arrays.fill(this.rawBytes, (byte) 0);
+    }
+    this.rawBytes = newRawBytes;
+  }
+
+  /** Securely zeroes the decrypted byte buffer in memory. */
+  public void wipe() {
+    if (rawBytes != null) {
+      Arrays.fill(rawBytes, (byte) 0);
+      rawBytes = null;
+    }
   }
 }

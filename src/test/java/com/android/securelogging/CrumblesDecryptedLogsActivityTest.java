@@ -29,7 +29,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ProviderInfo;
 import android.os.Looper;
+import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.TextView;
 import androidx.core.content.FileProvider;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.core.app.ApplicationProvider;
@@ -89,16 +91,17 @@ public class CrumblesDecryptedLogsActivityTest {
     }
     CrumblesMain.setLogsEncryptorInstanceForTest(null);
     CrumblesDecryptedLogsActivity.publicKeyManagerForTest = null;
+    CrumblesDecryptedLogsSession.destroyActiveSession();
   }
 
   private Intent createTestIntent(String fileName) {
     ArrayList<CrumblesDecryptedLogEntry> entries = new ArrayList<>();
-    entries.add(
-        new CrumblesDecryptedLogEntry(fileName, new String(testRawBytes1, UTF_8), testRawBytes1));
+    entries.add(new CrumblesDecryptedLogEntry(fileName, testRawBytes1.clone()));
+    long sessionId = CrumblesDecryptedLogsSession.startSession(entries);
     Intent intent =
         new Intent(
             ApplicationProvider.getApplicationContext(), CrumblesDecryptedLogsActivity.class);
-    intent.putExtra(CrumblesConstants.EXTRA_DECRYPTED_LOGS, entries);
+    intent.putExtra(CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, sessionId);
     return intent;
   }
 
@@ -180,5 +183,40 @@ public class CrumblesDecryptedLogsActivityTest {
     assertThat(ShadowToast.getTextOfLatestToast())
         .isEqualTo("Selected re-encryption key could not be found.");
     verify(mockLogsEncryptor, never()).reEncryptLogBatch(any(), any());
+  }
+
+  @Test
+  public void onCreate_withoutSession_disablesReencryptButton() {
+    Context ctx = ApplicationProvider.getApplicationContext();
+    scenario = ActivityScenario.launch(new Intent(ctx, CrumblesDecryptedLogsActivity.class));
+    scenario.onActivity(
+        a -> assertThat(a.findViewById(R.id.reencrypt_and_share_button).isEnabled()).isFalse());
+  }
+
+  @Test
+  public void activityLifecycle_withSession_enforcesSecurityDisplaysLogsAndCleansUp() {
+    Context ctx = ApplicationProvider.getApplicationContext();
+    byte[] mutableBytes = "secret_to_wipe".getBytes(UTF_8);
+    long sessionId =
+        CrumblesDecryptedLogsSession.startSession(
+            ImmutableList.of(new CrumblesDecryptedLogEntry("to_wipe.bin", mutableBytes)));
+    Intent intent =
+        new Intent(ctx, CrumblesDecryptedLogsActivity.class)
+            .putExtra(CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, sessionId);
+
+    scenario = ActivityScenario.launch(intent);
+    scenario.onActivity(
+        a -> {
+          assertThat(a.getWindow().getAttributes().flags & WindowManager.LayoutParams.FLAG_SECURE)
+              .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE);
+          assertThat(
+                  ((TextView) a.findViewById(R.id.decrypted_logs_text_view)).getText().toString())
+              .contains("to_wipe.bin");
+        });
+    scenario.close();
+    scenario = null;
+
+    assertThat(CrumblesDecryptedLogsSession.getSession(sessionId)).isEmpty();
+    assertThat(mutableBytes).isEqualTo(new byte[mutableBytes.length]);
   }
 }

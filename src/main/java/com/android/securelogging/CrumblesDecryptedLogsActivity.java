@@ -17,7 +17,6 @@
 package com.android.securelogging;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
@@ -26,6 +25,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.text.SpannableStringBuilder;
 import android.util.Log;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -41,6 +41,7 @@ import java.security.PublicKey;
 import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 /** An activity to display decrypted Crumbles logs and offer re-encryption and sharing options. */
@@ -58,11 +59,8 @@ public class CrumblesDecryptedLogsActivity extends Activity {
   static CrumblesExternalPublicKeyManager publicKeyManagerForTest = null;
 
   @Override
-  @SuppressWarnings({
-    "unchecked",
-    "deprecation"
-  }) // Need to use deprecated methods for compatibility
   protected void onCreate(Bundle savedInstanceState) {
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     super.onCreate(savedInstanceState);
     setContentView(R.layout.activity_decrypted_logs);
     setTitle(R.string.decrypted_logs_viewer_title);
@@ -87,10 +85,15 @@ public class CrumblesDecryptedLogsActivity extends Activity {
     }
 
     Intent intent = getIntent();
-    if (intent != null && intent.hasExtra(CrumblesConstants.EXTRA_DECRYPTED_LOGS)) {
-      decryptedLogEntries =
-          (ArrayList<CrumblesDecryptedLogEntry>)
-              intent.getSerializableExtra(CrumblesConstants.EXTRA_DECRYPTED_LOGS);
+    long sessionId =
+        intent != null
+            ? intent.getLongExtra(
+                CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, /* defaultValue= */ -1)
+            : -1;
+    Optional<CrumblesDecryptedLogsSession> sessionOpt =
+        CrumblesDecryptedLogsSession.getSession(sessionId);
+    if (sessionOpt.isPresent()) {
+      decryptedLogEntries = new ArrayList<>(sessionOpt.get().getEntries());
       if (decryptedLogEntries != null && !decryptedLogEntries.isEmpty()) {
         SpannableStringBuilder fullLogText = new SpannableStringBuilder();
         for (int i = 0; i < decryptedLogEntries.size(); i++) {
@@ -101,9 +104,6 @@ public class CrumblesDecryptedLogsActivity extends Activity {
             fullLogText.append(entry.getContent());
           } else {
             fullLogText.append("[Content Unavailable]\n");
-          }
-          if (entry.getRawBytes() == null && entry.getContent() != null) {
-            entry.setRawBytes(entry.getContent().getBytes(UTF_8));
           }
           if (i < decryptedLogEntries.size() - 1) {
             fullLogText.append("\n\n");
@@ -345,8 +345,14 @@ public class CrumblesDecryptedLogsActivity extends Activity {
   @Override
   protected void onDestroy() {
     super.onDestroy();
-    Log.d(TAG, "onDestroy called. Cleaning up temporary files.");
     cleanUpTemporaryFiles();
+    CrumblesDecryptedLogsSession.destroyActiveSession();
+    if (decryptedLogEntries != null) {
+      for (CrumblesDecryptedLogEntry entry : decryptedLogEntries) {
+        entry.wipe();
+      }
+      decryptedLogEntries.clear();
+    }
   }
 
   /** FOR TESTING PURPOSES ONLY to allow tests to populate the list. */

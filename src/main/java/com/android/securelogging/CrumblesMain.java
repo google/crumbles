@@ -16,8 +16,6 @@
 
 package com.android.securelogging;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
-
 import android.Manifest;
 import android.app.Activity;
 import android.app.KeyguardManager;
@@ -685,9 +683,7 @@ public class CrumblesMain extends FragmentActivity {
         // This call will trigger the system authentication prompt if required.
         // If auth fails or is cancelled, it will throw UserNotAuthenticatedException.
         byte[] decryptedBytes = getLogsEncryptorInstance().decryptLogs(logBatch);
-        String decryptedContent = new String(decryptedBytes, UTF_8);
-        decryptedEntries.add(
-            new CrumblesDecryptedLogEntry(fileName, decryptedContent, decryptedBytes));
+        decryptedEntries.add(new CrumblesDecryptedLogEntry(fileName, decryptedBytes));
         Log.i(TAG, "Successfully decrypted: " + fileName);
         CrumblesAppAuditLogger.getInstance(this)
             .logEvent("DECRYPTION_SUCCESS", "Successfully decrypted file: " + fileName);
@@ -702,8 +698,9 @@ public class CrumblesMain extends FragmentActivity {
       }
     }
     if (!decryptedEntries.isEmpty()) {
+      long sessionId = CrumblesDecryptedLogsSession.startSession(decryptedEntries);
       Intent intent = new Intent(this, CrumblesDecryptedLogsActivity.class);
-      intent.putExtra(CrumblesConstants.EXTRA_DECRYPTED_LOGS, decryptedEntries);
+      intent.putExtra(CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, sessionId);
       startActivity(intent);
       if (allSuccessful) {
         showToast("All selected logs decrypted and displayed.");

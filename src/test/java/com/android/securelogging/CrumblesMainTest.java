@@ -47,7 +47,6 @@ import android.security.keystore.UserNotAuthenticatedException;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.TextView;
-import androidx.core.content.IntentCompat;
 import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.core.app.ApplicationProvider;
@@ -67,7 +66,6 @@ import java.lang.reflect.Constructor;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.spec.RSAKeyGenParameterSpec;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import org.junit.After;
@@ -136,6 +134,7 @@ public class CrumblesMainTest {
   @After
   public void tearDown() {
     CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    CrumblesDecryptedLogsSession.destroyActiveSession();
     if (rootOfTestCleanup != null) {
       deleteRecursive(rootOfTestCleanup);
     }
@@ -427,12 +426,11 @@ public class CrumblesMainTest {
     assertThat(nextActivityIntent[0].getComponent().getClassName())
         .isEqualTo(CrumblesDecryptedLogsActivity.class.getName());
 
-    ArrayList<CrumblesDecryptedLogEntry> logs =
-        IntentCompat.getParcelableArrayListExtra(
-            nextActivityIntent[0],
-            CrumblesConstants.EXTRA_DECRYPTED_LOGS,
-            CrumblesDecryptedLogEntry.class);
-
+    long sessionId =
+        nextActivityIntent[0].getLongExtra(
+            CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, /* defaultValue= */ -1);
+    List<CrumblesDecryptedLogEntry> logs =
+        CrumblesDecryptedLogsSession.getSession(sessionId).orElseThrow().getEntries();
     assertThat(logs).isNotNull();
     assertThat(logs).hasSize(1);
     assertThat(logs.get(0).getFileName()).isEqualTo("good_log.bin");
@@ -997,12 +995,11 @@ public class CrumblesMainTest {
         });
 
     assertThat(nextActivityIntent[0]).isNotNull();
-    ArrayList<CrumblesDecryptedLogEntry> logs =
-        IntentCompat.getParcelableArrayListExtra(
-            nextActivityIntent[0],
-            CrumblesConstants.EXTRA_DECRYPTED_LOGS,
-            CrumblesDecryptedLogEntry.class);
-
+    long sessionId =
+        nextActivityIntent[0].getLongExtra(
+            CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, /* defaultValue= */ -1);
+    List<CrumblesDecryptedLogEntry> logs =
+        CrumblesDecryptedLogsSession.getSession(sessionId).orElseThrow().getEntries();
     assertThat(logs).isNotNull();
     assertThat(logs).hasSize(1);
     String renderedContent = logs.get(0).getContent();
