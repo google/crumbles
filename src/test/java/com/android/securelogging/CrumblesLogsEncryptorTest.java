@@ -459,6 +459,31 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(logBatch.getMetadata().getTimestamp().getSeconds()).isGreaterThan(0L);
     assertThat(logBatch.getMetadata().getTimestamp().getNanos()).isAtLeast(0);
     assertThat(logBatch.getMetadata().getTimestamp().getNanos()).isLessThan(1_000_000_000);
+    assertThat(logBatch.getMetadata().getDevice().getDeviceId()).isNotEmpty();
+  }
+
+
+
+  @Test
+  public void assembleCipherText_withExplicitDeviceId_setsDeviceIdInMetadata() {
+    byte[] encryptedLogs = "encryptedLogs".getBytes(UTF_8);
+    byte[] cipherSymKey = "cipherSymKey".getBytes(UTF_8);
+    byte[] cipherIv = "cipherIv".getBytes(UTF_8);
+
+    LogBatch logBatch =
+        CrumblesLogsEncryptor.assembleCipherText(
+            encryptedLogs, cipherSymKey, cipherIv, "device_pixel_9999");
+
+    assertThat(logBatch.getMetadata().getDevice().getDeviceId()).isEqualTo("device_pixel_9999");
+  }
+
+  @Test
+  public void encryptLogs_populatesDeviceMetadata() throws Exception {
+    PublicKey testKey = generateTestExternalRsaKeyPair().getPublic();
+    LogBatch logBatch = encryptor.encryptLogs("sample logs".getBytes(UTF_8), testKey);
+
+    assertThat(logBatch).isNotNull();
+    assertThat(logBatch.getMetadata().getDevice().getDeviceId()).isNotEmpty();
   }
 
   @Test

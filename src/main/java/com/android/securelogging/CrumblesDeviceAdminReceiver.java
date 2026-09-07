@@ -376,7 +376,7 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   private void encryptAndSaveLogs(Context context, byte[] logsBytes, PublicKey activeKey) {
     CrumblesLogsEncryptor logsEncryptor = CrumblesMain.getLogsEncryptorInstance();
     try {
-      LogBatch logBatch = logsEncryptor.encryptLogs(logsBytes, activeKey);
+      LogBatch logBatch = logsEncryptor.encryptLogs(context, logsBytes, activeKey);
       if (logBatch == null) {
         Log.e(TAG, "Failed to encrypt logs: encryption returned null.");
         CrumblesAppAuditLogger.getInstance(context)

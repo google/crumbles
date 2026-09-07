@@ -19,6 +19,7 @@ package com.android.securelogging;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static java.lang.Math.min;
 
+import android.content.Context;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.security.keystore.UserNotAuthenticatedException;
@@ -92,7 +93,16 @@ public class CrumblesLogsEncryptor {
 
   private static final Duration AUTH_VALIDITY_DURATION = Duration.ofSeconds(30);
 
+  @Nullable private final Context context;
   private PublicKey externalEncryptionPublicKey;
+
+  public CrumblesLogsEncryptor() {
+    this(null);
+  }
+
+  public CrumblesLogsEncryptor(@Nullable Context context) {
+    this.context = context != null ? context.getApplicationContext() : null;
+  }
 
   @VisibleForTesting
   static final class EncryptedData {
@@ -320,9 +330,43 @@ public class CrumblesLogsEncryptor {
    * @param publicKey the specific public key to use for encryption
    * @return a {@link LogBatch} containing the encrypted logs and metadata, or null if encryption fails
    */
+  /**
+   * Encrypts plain logs using the provided public key and context for device attribution.
+   *
+   * @param context the Android context to resolve device ID from, or null
+   * @param plainLogsBytes the plain log data
+   * @param publicKey the specific public key to use for encryption
+   * @return a {@link LogBatch} containing encrypted logs, or null if no key is available
+   */
+  @CanIgnoreReturnValue
+  @Nullable
+  public LogBatch encryptLogs(
+      @Nullable Context context, byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
+    return encryptLogsInternal(
+        plainLogsBytes, publicKey, CrumblesDeviceIdManager.getDeviceId(context));
+  }
+
+  /**
+   * Encrypts plain logs using the provided public key, resolving device ID automatically.
+   *
+   * <p><b>Note:</b> If this instance was constructed without a {@link Context}, {@link
+   * CrumblesDeviceIdManager} cannot fall back to Android ID or a persisted UUID if the hardware
+   * serial is inaccessible. Prefer {@link #encryptLogs(Context, byte[], PublicKey)} or
+   * constructing with {@link #CrumblesLogsEncryptor(Context)}.
+   *
+   * @param plainLogsBytes the plain log data
+   * @param publicKey the specific public key to use for encryption
+   * @return a {@link LogBatch} containing encrypted logs, or null if no key is available
+   */
   @CanIgnoreReturnValue
   @Nullable
   public LogBatch encryptLogs(byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
+    return encryptLogs(this.context, plainLogsBytes, publicKey);
+  }
+
+  @Nullable
+  private LogBatch encryptLogsInternal(
+      byte[] plainLogsBytes, @Nullable PublicKey publicKey, String deviceId) {
     try {
       String keySourceMessage;
       EncryptedData encryptedData;
@@ -344,7 +388,8 @@ public class CrumblesLogsEncryptor {
       return assembleCipherText(
           encryptedData.ciphertext,
           encryptedData.encryptedSymmetricKey,
-          encryptedData.initializationVector);
+          encryptedData.initializationVector,
+          deviceId);
     } catch (CrumblesKeysException | RuntimeException e) {
       Log.e(TAG, "Unexpected runtime error during encryption process.", e);
       throw new CrumblesLogsEncryptionException(
@@ -500,8 +545,14 @@ public class CrumblesLogsEncryptor {
         .build();
   }
 
+  /**
+   * Assembles a {@link LogBatch} proto with the specified device ID.
+   */
   public static LogBatch assembleCipherText(
-      byte[] encryptedLogsBytes, byte[] cipherSymKeyBytes, byte[] cipherIvBytes) {
+      byte[] encryptedLogsBytes,
+      byte[] cipherSymKeyBytes,
+      byte[] cipherIvBytes,
+      String deviceId) {
     LogData logData =
         LogData.newBuilder().setLogBlob(ByteString.copyFrom(encryptedLogsBytes)).build();
     LogKey logKey =
@@ -510,18 +561,48 @@ public class CrumblesLogsEncryptor {
             .setEncryptedSymmetricKey(ByteString.copyFrom(cipherSymKeyBytes))
             .setIv(ByteString.copyFrom(cipherIvBytes))
             .build();
-    DeviceId deviceId =
+    DeviceId deviceProto =
         DeviceId.newBuilder()
-            .setDeviceId("123456789") // Placeholder
+            .setDeviceId(
+                isNullOrEmpty(deviceId) ? CrumblesDeviceIdManager.FALLBACK_DEVICE_ID : deviceId)
             .build();
     LogMetadata logMetadata =
         LogMetadata.newBuilder()
             .setBlobSize(encryptedLogsBytes.length)
             .setTimestamp(timestampFromMillis(TimeSource.system().instant().toEpochMilli()))
-            .setDevice(deviceId)
+            .setDevice(deviceProto)
             .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
             .build();
     return LogBatch.newBuilder().setData(logData).setKey(logKey).setMetadata(logMetadata).build();
+  }
+
+  /**
+   * Assembles a {@link LogBatch} proto with the specified context for device attribution.
+   */
+  public static LogBatch assembleCipherText(
+      @Nullable Context context,
+      byte[] encryptedLogsBytes,
+      byte[] cipherSymKeyBytes,
+      byte[] cipherIvBytes) {
+    return assembleCipherText(
+        encryptedLogsBytes,
+        cipherSymKeyBytes,
+        cipherIvBytes,
+        CrumblesDeviceIdManager.getDeviceId(context));
+  }
+
+  /**
+   * Assembles a {@link LogBatch} proto without a context.
+   *
+   * <p><b>Note:</b> Calling this method without a {@link Context} means {@link
+   * CrumblesDeviceIdManager} cannot fall back to Android ID or a persisted UUID in {@link
+   * SharedPreferences} if the hardware serial is inaccessible. Prefer {@link
+   * #assembleCipherText(Context, byte[], byte[], byte[])}.
+   */
+  public static LogBatch assembleCipherText(
+      byte[] encryptedLogsBytes, byte[] cipherSymKeyBytes, byte[] cipherIvBytes) {
+    return assembleCipherText(
+        /* context= */ null, encryptedLogsBytes, cipherSymKeyBytes, cipherIvBytes);
   }
 
   @CanIgnoreReturnValue
