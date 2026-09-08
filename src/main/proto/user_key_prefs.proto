@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package wireless_android_security_exploits_secure_logging_src_main_proto;
+
+option java_package = "com.android.securelogging";
+option java_multiple_files = true;
+
+// Container for an encrypted payload stored in DataStore.
+message EncryptedPayload {
+  bytes ciphertext = 1;
+  bytes initialization_vector = 2;
+  bytes wrapped_encryption_key = 3;
+}
+
+// User key preferences stored in Jetpack DataStore.
+message UserKeyPreferences {
+  // Map of Key ID -> Encrypted Public Key payload.
+  map<string, EncryptedPayload> external_public_keys = 1;
+
+  // Active public key ID used for log encryption.
+  string active_key_id = 2;
+
+  // Map of Key ID -> Encrypted Re-encryption Key payload.
+  map<string, EncryptedPayload> re_encrypt_public_keys = 3;
+}
