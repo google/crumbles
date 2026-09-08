@@ -78,6 +78,7 @@ public class CrumblesLogsEncryptor {
   private static final String SYM_ALGORITHM = "AES";
   private static final int AES_KEY_SIZE_BITS = 256;
   private static final int GCM_IV_LEN_BYTES = 12;
+  private static final int GCM_TAG_LEN_BITS = 128;
 
   @VisibleForTesting static final String ASYM_ALGORITHM = KeyProperties.KEY_ALGORITHM_RSA;
   private static final String CIPHER_MODE_ASYM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
@@ -472,7 +473,7 @@ public class CrumblesLogsEncryptor {
     try {
       Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
       GCMParameterSpec gcmParameterSpec =
-          new GCMParameterSpec(GCM_IV_LEN_BYTES * 8, ivSpec.getIV());
+          new GCMParameterSpec(GCM_TAG_LEN_BITS, ivSpec.getIV());
       aesCipher.init(Cipher.ENCRYPT_MODE, key, gcmParameterSpec);
       return aesCipher.doFinal(plainTextBytes);
     } catch (Exception e) {
@@ -507,7 +508,7 @@ public class CrumblesLogsEncryptor {
     try {
       Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
       GCMParameterSpec gcmParameterSpec =
-          new GCMParameterSpec(GCM_IV_LEN_BYTES * 8, ivSpec.getIV());
+          new GCMParameterSpec(GCM_TAG_LEN_BITS, ivSpec.getIV());
       aesCipher.init(Cipher.DECRYPT_MODE, key, gcmParameterSpec);
       return aesCipher.doFinal(cipherTextBytes);
     } catch (Exception e) {

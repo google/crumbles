@@ -43,6 +43,10 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -331,6 +335,50 @@ public final class CrumblesLogsEncryptorTest {
 
     // Then: The encryption proceeds without accessing or generating a Keystore key.
     assertThat(FakeAndroidKeyStoreSpi.keystoreEntries).isEmpty();
+  }
+
+  @Test
+  public void encryptLogs_ciphertextHas128BitAuthenticationTag() throws Exception {
+    // Given: An external public key and a known 100-byte plaintext log payload.
+    KeyPair keyPair = generateTestExternalRsaKeyPair();
+    byte[] plainText = new byte[100];
+    Arrays.fill(plainText, (byte) 'a');
+
+    // When: encryptLogs is called.
+    LogBatch logBatch = encryptor.encryptLogs(plainText, keyPair.getPublic());
+
+    // Then: The log blob ciphertext length is exactly plaintext length + 16 bytes (128-bit tag).
+    assertThat(logBatch).isNotNull();
+    byte[] cipherText = logBatch.getData().getLogBlob().toByteArray();
+    assertThat(cipherText.length - plainText.length).isEqualTo(16);
+  }
+
+  @Test
+  public void encryptData_ciphertextDecryptableWithSpecCompliant128BitReader() throws Exception {
+    // Given: An external RSA key pair and a plaintext payload.
+    KeyPair keyPair = generateTestExternalRsaKeyPair();
+    byte[] plainText = "test payload for external 128-bit GCM reader".getBytes(UTF_8);
+    CrumblesLogsEncryptor.EncryptedData encrypted =
+        encryptor.encryptData(plainText, keyPair.getPublic());
+
+    // When: An external reader unwraps the symmetric key and decrypts using a 128-bit GCM tag.
+    Cipher rsaCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+    rsaCipher.init(Cipher.UNWRAP_MODE, keyPair.getPrivate());
+    SecretKey aesKey =
+        (SecretKey) rsaCipher.unwrap(encrypted.encryptedSymmetricKey, "AES", Cipher.SECRET_KEY);
+
+    Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
+    GCMParameterSpec spec128 = new GCMParameterSpec(128, encrypted.initializationVector);
+    aesCipher.init(Cipher.DECRYPT_MODE, aesKey, spec128);
+    byte[] decrypted = aesCipher.doFinal(encrypted.ciphertext);
+
+    // Then: Decryption succeeds and matches the original plaintext.
+    assertThat(decrypted).isEqualTo(plainText);
+
+    // And: Decrypting the same ciphertext with a 96-bit tag length fails authentication.
+    GCMParameterSpec spec96 = new GCMParameterSpec(96, encrypted.initializationVector);
+    aesCipher.init(Cipher.DECRYPT_MODE, aesKey, spec96);
+    assertThrows(AEADBadTagException.class, () -> aesCipher.doFinal(encrypted.ciphertext));
   }
 
   @Test
