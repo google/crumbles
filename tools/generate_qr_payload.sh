@@ -14,12 +14,12 @@
 # limitations under the License.
 
 # Helper script to generate Android Enterprise QR Code provisioning JSON payload for Crumbles.
-# Calculates the URL-safe base64 SHA-256 checksum required by Android DevicePolicyManager.
+# Calculates the URL-safe base64 SHA-256 signing certificate checksum required by Android DevicePolicyManager.
 
 set -euo pipefail
 
 APK_PATH="${1:-}"
-DOWNLOAD_URL="${2:-https://github.com/google/crumbles/releases/latest/download/CrumblesApp.apk}"
+DOWNLOAD_URL="${2:-https://github.com/google/crumbles/releases/download/v1.0/CrumblesApp.apk}"
 ENABLE_LOGGING="${3:-true}"
 
 if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
@@ -28,8 +28,26 @@ if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
   exit 1
 fi
 
-# Calculate URL-safe Base64 SHA-256 checksum of the APK file
-CHECKSUM=$(openssl dgst -sha256 -binary "$APK_PATH" | openssl base64 | tr '+/' '-_' | tr -d '=')
+# PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM requires the URL-safe base64-encoded
+# SHA-256 digest of the APK's signing certificate (DER bytes), NOT the APK file bytes.
+CERT_HEX=""
+if command -v apksigner >/dev/null 2>&1; then
+  CERT_HEX=$(apksigner verify --print-certs "$APK_PATH" 2>/dev/null \
+    | awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2; exit}')
+fi
+
+if [ -z "$CERT_HEX" ] && command -v keytool >/dev/null 2>&1; then
+  CERT_HEX=$(keytool -printcert -jarfile "$APK_PATH" 2>/dev/null \
+    | awk '/SHA256:/ {gsub(/.*SHA256: |:/, ""); print tolower($0); exit}')
+fi
+
+if [ -z "$CERT_HEX" ]; then
+  echo "ERROR: Could not extract signing certificate SHA-256 digest." >&2
+  echo "Please ensure apksigner (Android build-tools) or keytool (JDK) is installed on PATH." >&2
+  exit 1
+fi
+
+CHECKSUM=$(echo "$CERT_HEX" | xxd -r -p | openssl base64 | tr '+/' '-_' | tr -d '=')
 
 cat <<EOF
 {

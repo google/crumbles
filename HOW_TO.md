@@ -25,7 +25,10 @@ This automated method sets up Crumbles during initial phone setup without requir
 
 ![Official Release Provisioning QR Code](documentation_images/provisioning_qr.png)
 
-5. **Connect to Wi-Fi**: Follow the prompts to connect to Wi-Fi. Android Enterprise will automatically verify the APK checksum, install Crumbles, set permissions, and enable background logging automatically!
+5. **Connect to Wi-Fi**: Follow the prompts to connect to Wi-Fi. Android Enterprise will automatically verify the APK's signing certificate checksum (`android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM`), install Crumbles, set permissions, and enable background logging automatically!
+
+**Built-in Cryptographic Integrity Verification**:
+When scanning the QR payload, the system embeds a trusted SHA-256 signing certificate checksum (`android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM`). Android OS automatically verifies this checksum against the signing certificate of the downloaded APK before installation, guaranteeing that the binary is signed by the trusted official release key and has not been tampered with or substituted.
 
 *(Note: Custom server deployments and helpdesks can generate custom QR code payloads using `./tools/generate_qr_payload.sh <path_to_apk>`.)*
 
@@ -38,11 +41,11 @@ If you prefer installing Crumbles manually using a desktop or laptop computer:
 2. **Enable USB Debugging** on your phone ([Setup Guide](https://developer.android.com/studio/debug/dev-options)).
 3. Plug your phone into your computer via USB cable and tap **Allow USB Debugging** on your phone screen.
 4. Download the [Android Platform-Tools](https://developer.android.com/tools/releases/platform-tools) and the latest [Crumbles APK](https://github.com/google/crumbles/releases).
-5. Run the setup script for your computer's OS:
+5. Run the setup script for your computer's OS (each script automatically verifies the downloaded APK's SHA-256 checksum against `CrumblesApp.apk.sha256` before installation):
    * **Windows**: Double-click `setup_device.bat`
    * **Mac**: Double-click `setup_device.command`
    * **Linux**: Run `./setup_device.sh`
-   * *(Terminal alternative: `adb install -r CrumblesApp.apk` followed by `adb shell dpm set-device-owner com.android.securelogging/.CrumblesDeviceAdminReceiver`)*
+   * *(Terminal alternative: Download `CrumblesApp.apk` and `CrumblesApp.apk.sha256`, verify with `sha256sum -c CrumblesApp.apk.sha256`, then run `adb install -r CrumblesApp.apk` followed by `adb shell dpm set-device-owner com.android.securelogging/.CrumblesDeviceAdminReceiver`)*
 
 ---
 

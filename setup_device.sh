@@ -41,12 +41,46 @@ fi
 echo "Download complete!"
 echo ""
 
+echo "Verifying APK integrity..."
+curl -sL -o CrumblesApp.apk.sha256 "${APK_URL}.sha256"
+if [ $? -ne 0 ] || [ ! -s CrumblesApp.apk.sha256 ]; then
+    echo ""
+    echo "ERROR: Failed to download the APK checksum. Please check your internet connection."
+    rm -f CrumblesApp.apk CrumblesApp.apk.sha256
+    read -p "Press [Enter] to exit."
+    exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c CrumblesApp.apk.sha256
+    CHECKSUM_RESULT=$?
+elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c CrumblesApp.apk.sha256
+    CHECKSUM_RESULT=$?
+else
+    echo ""
+    echo "ERROR: Neither sha256sum nor shasum found on PATH to verify APK checksum."
+    rm -f CrumblesApp.apk CrumblesApp.apk.sha256
+    read -p "Press [Enter] to exit."
+    exit 1
+fi
+
+if [ $CHECKSUM_RESULT -ne 0 ]; then
+    echo ""
+    echo "ERROR: APK checksum verification failed! Download may be corrupted or compromised."
+    rm -f CrumblesApp.apk CrumblesApp.apk.sha256
+    read -p "Press [Enter] to exit."
+    exit 1
+fi
+echo "Integrity verification successful!"
+echo ""
+
 echo "--> Step 3 of 4: Installing the Crumbles APK..."
 ./adb install -r CrumblesApp.apk
 if [ $? -ne 0 ]; then
     echo ""
     echo "ERROR: Failed to install the APK. Please check the connection to your device."
-    rm CrumblesApp.apk
+    rm -f CrumblesApp.apk CrumblesApp.apk.sha256
     read -p "Press [Enter] to exit."
     exit 1
 fi
@@ -67,7 +101,7 @@ echo ""
 echo "=============================================================="
 echo ""
 
-# Clean up the downloaded file
-rm CrumblesApp.apk
+# Clean up the downloaded files
+rm -f CrumblesApp.apk CrumblesApp.apk.sha256
 
 read -p "Press [Enter] to exit."

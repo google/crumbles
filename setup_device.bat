@@ -30,7 +30,7 @@ echo  Device found!
 echo.
 
 echo  --> Step 2 of 4: Downloading the Crumbles APK...
-set "APK_URL=https://github.com/google/crumbles/releases/v1.0/CrumblesApp.apk"
+set "APK_URL=https://github.com/google/crumbles/releases/download/v1.0/CrumblesApp.apk"
 curl -L -o CrumblesApp.apk "%APK_URL%"
 if errorlevel 1 (
     echo.
@@ -41,12 +41,38 @@ if errorlevel 1 (
 echo  Download complete!
 echo.
 
+echo  Verifying APK integrity...
+curl -sL -o CrumblesApp.apk.sha256 "%APK_URL%.sha256"
+if errorlevel 1 (
+    echo.
+    echo  ERROR: Failed to download the APK checksum. Please check your internet connection.
+    del CrumblesApp.apk
+    pause
+    exit /b
+)
+
+where sha256sum >nul 2>nul
+if %errorlevel% equ 0 (
+    sha256sum -c CrumblesApp.apk.sha256
+) else (
+    powershell -NoProfile -Command "$expected = (Get-Content CrumblesApp.apk.sha256 | Select-Object -First 1).Split()[0].Trim(); $actual = (Get-FileHash CrumblesApp.apk -Algorithm SHA256).Hash.ToLower(); if ($actual -ne $expected.ToLower()) { Write-Error 'Checksum mismatch'; exit 1 }"
+)
+if errorlevel 1 (
+    echo.
+    echo  ERROR: APK checksum verification failed! Download may be corrupted or compromised.
+    del CrumblesApp.apk CrumblesApp.apk.sha256
+    pause
+    exit /b
+)
+echo  Integrity verification successful!
+echo.
+
 echo  --> Step 3 of 4: Installing the Crumbles APK...
 adb.exe install -r CrumblesApp.apk
 if errorlevel 1 (
     echo.
     echo  ERROR: Failed to install the APK. Please check the connection to your device.
-    del CrumblesApp.apk
+    del CrumblesApp.apk CrumblesApp.apk.sha256
     pause
     exit /b
 )
@@ -67,7 +93,7 @@ echo.
 echo  ==============================================================
 echo.
 
-:: Clean up the downloaded file
-del CrumblesApp.apk
+:: Clean up the downloaded files
+del CrumblesApp.apk CrumblesApp.apk.sha256
 
 pause
