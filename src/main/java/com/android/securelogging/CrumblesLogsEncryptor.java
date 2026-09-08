@@ -43,6 +43,7 @@ import com.google.protos.wireless_android_security_exploits_secure_logging_src_m
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
 import java.io.File;
 import java.io.IOException;
+import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyFactory;
@@ -54,9 +55,13 @@ import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.RSAKeyGenParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
 import java.util.Base64;
+import java.util.Objects;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -83,6 +88,9 @@ public class CrumblesLogsEncryptor {
   @VisibleForTesting static final String ASYM_ALGORITHM = KeyProperties.KEY_ALGORITHM_RSA;
   private static final String CIPHER_MODE_ASYM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
   private static final int ASYM_BITS = 2048;
+  private static final int MIN_RSA_MODULUS_BITS = 2048;
+  private static final int MAX_RSA_MODULUS_BITS = 4096;
+  private static final BigInteger EXPECTED_RSA_PUBLIC_EXPONENT = RSAKeyGenParameterSpec.F4;
 
   private static final String ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore";
   /** Default alias for the RSA key pair. */
@@ -690,13 +698,24 @@ public class CrumblesLogsEncryptor {
     if (isNullOrEmpty(base64PublicKey)) {
       return null;
     }
+    RSAPublicKey rsa;
     try {
       byte[] decodedKey = Base64.getDecoder().decode(base64PublicKey);
       KeyFactory keyFactory = KeyFactory.getInstance(ASYM_ALGORITHM);
-      return keyFactory.generatePublic(new X509EncodedKeySpec(decodedKey));
-    } catch (Exception e) {
+      rsa = (RSAPublicKey) keyFactory.generatePublic(new X509EncodedKeySpec(decodedKey));
+    } catch (IllegalArgumentException | NoSuchAlgorithmException | InvalidKeySpecException e) {
       throw new CrumblesKeysException("Failed to convert Base64 string to PublicKey.", e);
     }
+    int bits = rsa.getModulus().bitLength();
+    if (bits < MIN_RSA_MODULUS_BITS || bits > MAX_RSA_MODULUS_BITS) {
+      throw new CrumblesKeysException(
+          "Rejected RSA key: modulus " + bits + " bits (require 2048-4096).");
+    }
+    if (!Objects.equals(rsa.getPublicExponent(), EXPECTED_RSA_PUBLIC_EXPONENT)) {
+      throw new CrumblesKeysException(
+          "Rejected RSA key: public exponent must be " + EXPECTED_RSA_PUBLIC_EXPONENT + ".");
+    }
+    return rsa;
   }
 
   public LogBatch reEncryptLogBatch(byte[] plainLogsBytes, PublicKey reEncryptionKey)

@@ -29,8 +29,10 @@ import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.protobuf.Timestamp;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.File;
+import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
@@ -39,6 +41,7 @@ import java.security.PublicKey;
 import java.security.Security;
 import java.security.UnrecoverableKeyException;
 import java.security.spec.RSAKeyGenParameterSpec;
+import java.security.spec.RSAPublicKeySpec;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Base64;
@@ -485,6 +488,102 @@ public final class CrumblesLogsEncryptorTest {
   public void getPublicKeyHash_whenKeyIsNull_returnsUnknown() {
     String actualHash = CrumblesLogsEncryptor.getPublicKeyHash(null);
     assertThat(actualHash).isEqualTo("Unknown");
+  }
+
+  @Test
+  public void getPublicKeyHash_isCryptographicDigest_notSuffix() throws Exception {
+    KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+    g.initialize(2048);
+    PublicKey a = g.generateKeyPair().getPublic();
+    PublicKey b = g.generateKeyPair().getPublic();
+    assertThat(CrumblesLogsEncryptor.getPublicKeyHash(a))
+        .isNotEqualTo(CrumblesLogsEncryptor.getPublicKeyHash(b));
+  }
+
+  @Test
+  public void publicKeyFromBase64_whenNull_returnsNull() throws Exception {
+    PublicKey key = CrumblesLogsEncryptor.publicKeyFromBase64(null);
+
+    assertThat(key).isNull();
+  }
+
+  @Test
+  public void publicKeyFromBase64_whenEmpty_returnsNull() throws Exception {
+    PublicKey key = CrumblesLogsEncryptor.publicKeyFromBase64("");
+
+    assertThat(key).isNull();
+  }
+
+  @Test
+  public void publicKeyFromBase64_whenInvalidBase64_throwsException() {
+    CrumblesKeysException thrown =
+        assertThrows(
+            CrumblesKeysException.class,
+            () -> CrumblesLogsEncryptor.publicKeyFromBase64("not-valid-base64!"));
+
+    assertThat(thrown).hasMessageThat().contains("Failed to convert Base64 string to PublicKey.");
+  }
+
+  @Test
+  public void publicKeyFromBase64_whenInvalidKeySpec_throwsException() {
+    String invalidKeySpecB64 = Base64.getEncoder().encodeToString(new byte[] {0x30, 0x05, 0x00});
+
+    CrumblesKeysException thrown =
+        assertThrows(
+            CrumblesKeysException.class,
+            () -> CrumblesLogsEncryptor.publicKeyFromBase64(invalidKeySpecB64));
+
+    assertThat(thrown).hasMessageThat().contains("Failed to convert Base64 string to PublicKey.");
+  }
+
+  @Test
+  public void publicKeyFromBase64_acceptsValidKey() throws Exception {
+    KeyPair keyPair = generateTestExternalRsaKeyPair();
+    String b64 = Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded());
+
+    PublicKey key = CrumblesLogsEncryptor.publicKeyFromBase64(b64);
+
+    assertThat(key).isEqualTo(keyPair.getPublic());
+  }
+
+  @Test
+  public void publicKeyFromBase64_rejectsSub2048Modulus() throws Exception {
+    KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+    g.initialize(512);
+    String b64 = Base64.getEncoder().encodeToString(g.generateKeyPair().getPublic().getEncoded());
+
+    CrumblesKeysException thrown =
+        assertThrows(
+            CrumblesKeysException.class, () -> CrumblesLogsEncryptor.publicKeyFromBase64(b64));
+
+    assertThat(thrown).hasMessageThat().contains("modulus 512 bits");
+  }
+
+  @Test
+  public void publicKeyFromBase64_rejectsOver4096Modulus() throws Exception {
+    BigInteger modulus5120 = BigInteger.ONE.shiftLeft(5120).setBit(0);
+    RSAPublicKeySpec spec = new RSAPublicKeySpec(modulus5120, BigInteger.valueOf(65537));
+    KeyFactory kf = KeyFactory.getInstance("RSA");
+    String b64 = Base64.getEncoder().encodeToString(kf.generatePublic(spec).getEncoded());
+
+    CrumblesKeysException thrown =
+        assertThrows(
+            CrumblesKeysException.class, () -> CrumblesLogsEncryptor.publicKeyFromBase64(b64));
+
+    assertThat(thrown).hasMessageThat().contains("modulus 5121 bits");
+  }
+
+  @Test
+  public void publicKeyFromBase64_rejectsExponent3() throws Exception {
+    KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+    g.initialize(new RSAKeyGenParameterSpec(2048, BigInteger.valueOf(3)));
+    String b64 = Base64.getEncoder().encodeToString(g.generateKeyPair().getPublic().getEncoded());
+
+    CrumblesKeysException thrown =
+        assertThrows(
+            CrumblesKeysException.class, () -> CrumblesLogsEncryptor.publicKeyFromBase64(b64));
+
+    assertThat(thrown).hasMessageThat().contains("public exponent must be 65537");
   }
 
   @Test
