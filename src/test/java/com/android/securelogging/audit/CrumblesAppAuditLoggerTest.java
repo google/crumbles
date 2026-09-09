@@ -50,7 +50,7 @@ public class CrumblesAppAuditLoggerTest {
   @Before
   public void setUp() {
     appContext = ApplicationProvider.getApplicationContext();
-    File logDir = appContext.getFilesDir();
+    File logDir = appContext.getNoBackupFilesDir();
     currentLogFile = new File(logDir, CrumblesConstants.CURRENT_LOG_FILE_NAME);
     oldLogFile = new File(logDir, CrumblesConstants.OLD_LOG_FILE_NAME);
 
@@ -250,5 +250,16 @@ public class CrumblesAppAuditLoggerTest {
     assertThat(auditLogger.getMemoryCachedEvents()).isEmpty();
     assertThat(currentLogFile.exists()).isFalse();
     assertThat(oldLogFile.exists()).isFalse();
+  }
+
+  @Test
+  public void auditLogger_writesUnderNoBackupFilesDir() {
+    auditLogger.logEvent("TEST", "x");
+
+    File expected =
+        new File(appContext.getNoBackupFilesDir(), CrumblesConstants.CURRENT_LOG_FILE_NAME);
+    assertThat(expected.exists()).isTrue();
+    assertThat(new File(appContext.getFilesDir(), CrumblesConstants.CURRENT_LOG_FILE_NAME).exists())
+        .isFalse();
   }
 }

@@ -30,6 +30,9 @@
 
   <application
       android:label="Crumbles"
+      android:allowBackup="false"
+      android:dataExtractionRules="@xml/data_extraction_rules"
+      android:fullBackupContent="false"
       android:theme="@style/Theme.Crumbles"
       android:icon="@mipmap/ic_launcher"
       android:roundIcon="@mipmap/ic_launcher_round">

@@ -51,7 +51,7 @@ public class CrumblesAppAuditLogger {
 
   private CrumblesAppAuditLogger(Context context) {
     this.appContext = context.getApplicationContext();
-    File logDir = this.appContext.getFilesDir();
+    File logDir = this.appContext.getNoBackupFilesDir();
     this.currentLogFile = new File(logDir, CrumblesConstants.CURRENT_LOG_FILE_NAME);
     this.oldLogFile = new File(logDir, CrumblesConstants.OLD_LOG_FILE_NAME);
     this.memoryCache = new ArrayDeque<>();
