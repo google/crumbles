@@ -27,7 +27,12 @@ import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.protobuf.Timestamp;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.KeyEncryptionType;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogEncryptionType;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
+import com.google.testing.junit.testparameterinjector.TestParameter;
 import java.io.File;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -56,11 +61,11 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.robolectric.RobolectricTestRunner;
+import org.robolectric.RobolectricTestParameterInjector;
 import org.robolectric.annotation.Config;
 
 /** Tests for {@link CrumblesLogsEncryptor} using a fake AndroidKeyStore provider. */
-@RunWith(RobolectricTestRunner.class)
+@RunWith(RobolectricTestParameterInjector.class)
 @Config(sdk = {Build.VERSION_CODES.TIRAMISU})
 public final class CrumblesLogsEncryptorTest {
 
@@ -323,6 +328,8 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(iv1).hasLength(12);
     assertThat(iv2).hasLength(12);
     assertThat(Arrays.equals(iv1, iv2)).isFalse();
+    assertThat(batch1.getMetadata().getBlobSize())
+        .isEqualTo(logData.length + CrumblesLogsEncryptor.GCM_TAG_LEN_BYTES);
   }
 
   @Test
@@ -334,7 +341,9 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(FakeAndroidKeyStoreSpi.keystoreEntries).isEmpty();
 
     // When: encryptLogs is called.
-    encryptor.encryptLogs("test encryption with external key.".getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
+    encryptor.encryptLogs(
+        "test encryption with external key.".getBytes(UTF_8),
+        encryptor.getExternalEncryptionPublicKey());
 
     // Then: The encryption proceeds without accessing or generating a Keystore key.
     assertThat(FakeAndroidKeyStoreSpi.keystoreEntries).isEmpty();
@@ -392,7 +401,10 @@ public final class CrumblesLogsEncryptorTest {
 
     // When: encryptLogs is called.
     // Then: it returns null.
-    assertThat(encryptor.encryptLogs("test encryption with external key.".getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey()))
+    assertThat(
+            encryptor.encryptLogs(
+                "test encryption with external key.".getBytes(UTF_8),
+                encryptor.getExternalEncryptionPublicKey()))
         .isNull();
   }
 
@@ -406,7 +418,9 @@ public final class CrumblesLogsEncryptorTest {
 
     // And: The user provides successful authentication for the fake keystore to allow encryption.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
-    LogBatch logBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
+    LogBatch logBatch =
+        encryptor.encryptLogs(
+            originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // And: A new CrumblesLogsEncryptor instance, simulating an app restart.
     CrumblesLogsEncryptor decryptingEncryptor = new CrumblesLogsEncryptor();
@@ -428,7 +442,9 @@ public final class CrumblesLogsEncryptorTest {
 
     // And: Authenticate temporarily to allow the encryption step to succeed.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
-    LogBatch logBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
+    LogBatch logBatch =
+        encryptor.encryptLogs(
+            originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // And: Lock the keystore again by revoking authentication.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(false);
@@ -450,7 +466,10 @@ public final class CrumblesLogsEncryptorTest {
   public void decryptLogs_whenEncryptedWithExternalKey_thenFailsWithKeystoreKey() throws Exception {
     // Given: A LogBatch encrypted with an external key.
     encryptor.setExternalEncryptionPublicKey(generateTestExternalRsaKeyPair().getPublic());
-    LogBatch logBatch = encryptor.encryptLogs("encrypted with external key.".getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
+    LogBatch logBatch =
+        encryptor.encryptLogs(
+            "encrypted with external key.".getBytes(UTF_8),
+            encryptor.getExternalEncryptionPublicKey());
 
     // When: Decryption is attempted with an encryptor that can only access the Keystore.
     CrumblesLogsEncryptor decryptorWithKeystore = new CrumblesLogsEncryptor();
@@ -662,7 +681,9 @@ public final class CrumblesLogsEncryptorTest {
     encryptor.generateKeyPair();
     // And: The user authenticates before encryption.
     FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
-    LogBatch originalLogBatch = encryptor.encryptLogs(originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
+    LogBatch originalLogBatch =
+        encryptor.encryptLogs(
+            originalContent.getBytes(UTF_8), encryptor.getExternalEncryptionPublicKey());
 
     // And: A temporary directory for file operations.
     Path tempDir = Files.createTempDirectory("crumbles_test_");
@@ -684,5 +705,132 @@ public final class CrumblesLogsEncryptorTest {
     // Cleanup.
     Files.delete(filePath);
     Files.delete(tempDir);
+  }
+
+  // --- AAD Metadata and Key Integrity Tampering Tests ---
+
+  /** Test cases representing single-field tampering in AAD (metadata or key encryption type). */
+  private enum AadTamperingCase {
+    METADATA_TIMESTAMP {
+      @Override
+      LogBatch tamper(LogBatch originalBatch) {
+        Timestamp tamperedTimestamp =
+            Timestamp.newBuilder()
+                .setSeconds(originalBatch.getMetadata().getTimestamp().getSeconds() + 1000)
+                .setNanos(originalBatch.getMetadata().getTimestamp().getNanos())
+                .build();
+        return originalBatch.toBuilder()
+            .setMetadata(
+                originalBatch.getMetadata().toBuilder().setTimestamp(tamperedTimestamp).build())
+            .build();
+      }
+    },
+    METADATA_DEVICE_ID {
+      @Override
+      LogBatch tamper(LogBatch originalBatch) {
+        DeviceId tamperedDeviceId = DeviceId.newBuilder().setDeviceId("tampered-device-id").build();
+        return originalBatch.toBuilder()
+            .setMetadata(
+                originalBatch.getMetadata().toBuilder().setDevice(tamperedDeviceId).build())
+            .build();
+      }
+    },
+    METADATA_BLOB_SIZE {
+      @Override
+      LogBatch tamper(LogBatch originalBatch) {
+        return originalBatch.toBuilder()
+            .setMetadata(
+                originalBatch.getMetadata().toBuilder()
+                    .setBlobSize(originalBatch.getMetadata().getBlobSize() + 1)
+                    .build())
+            .build();
+      }
+    },
+    METADATA_ENCRYPTION_TYPE {
+      @Override
+      LogBatch tamper(LogBatch originalBatch) {
+        return originalBatch.toBuilder()
+            .setMetadata(
+                originalBatch.getMetadata().toBuilder()
+                    .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_UNSPECIFIED)
+                    .build())
+            .build();
+      }
+    },
+    KEY_ENCRYPTION_TYPE {
+      @Override
+      LogBatch tamper(LogBatch originalBatch) {
+        return originalBatch.toBuilder()
+            .setKey(
+                originalBatch.getKey().toBuilder()
+                    .setKeyEncryptionType(KeyEncryptionType.KEY_ENCRYPTION_TYPE_UNSPECIFIED)
+                    .build())
+            .build();
+      }
+    };
+
+    abstract LogBatch tamper(LogBatch batch);
+  }
+
+  @Test
+  public void decryptLogs_whenAadFieldModified_throwsCrumblesLogsDecryptionException(
+      @TestParameter AadTamperingCase tamperingCase) throws Exception {
+    // Given: A valid LogBatch encrypted with a Keystore key.
+    encryptor.generateKeyPair();
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+    byte[] plainLogs = "test log content for AAD tampering".getBytes(UTF_8);
+    LogBatch originalBatch =
+        encryptor.encryptLogs(plainLogs, encryptor.getExternalEncryptionPublicKey());
+
+    // And: An attacker modifies an AAD field (metadata or key encryption type).
+    LogBatch tamperedBatch = tamperingCase.tamper(originalBatch);
+
+    // When & Then: Decryption fails due to AAD authentication tag mismatch.
+    assertThrows(CrumblesLogsDecryptionException.class, () -> encryptor.decryptLogs(tamperedBatch));
+  }
+
+  @Test
+  public void reEncryptLogBatch_bindsAadAndCanBeDecryptedWithNewKey() throws Exception {
+    // Given: A valid plain log payload and an initialized Keystore key.
+    encryptor.generateKeyPair();
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+    byte[] plainLogs = "test log content for re-encryption with AAD".getBytes(UTF_8);
+
+    // When: The plain logs are re-encrypted for the recipient public key.
+    LogBatch reEncryptedBatch = encryptor.reEncryptLogBatch(plainLogs, encryptor.getPublicKey());
+
+    // Then: The re-encrypted batch can be successfully decrypted and content matches.
+    byte[] decryptedLogs = encryptor.decryptLogs(reEncryptedBatch);
+    assertThat(decryptedLogs).isEqualTo(plainLogs);
+    assertThat(reEncryptedBatch.getMetadata().getBlobSize())
+        .isEqualTo(plainLogs.length + CrumblesLogsEncryptor.GCM_TAG_LEN_BYTES);
+
+    // And: When metadata is tampered on the re-encrypted batch, decryption fails.
+    LogBatch tamperedBatch =
+        reEncryptedBatch.toBuilder()
+            .setMetadata(
+                reEncryptedBatch.getMetadata().toBuilder()
+                    .setBlobSize(reEncryptedBatch.getMetadata().getBlobSize() + 10)
+                    .build())
+            .build();
+    assertThrows(CrumblesLogsDecryptionException.class, () -> encryptor.decryptLogs(tamperedBatch));
+  }
+
+  @Test
+  public void computeAssociatedData_returnsDeterministicBytes() {
+    LogMetadata metadata =
+        LogMetadata.newBuilder()
+            .setBlobSize(100)
+            .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
+            .build();
+    byte[] aad1 =
+        CrumblesLogsEncryptor.computeAssociatedData(
+            metadata, KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
+    byte[] aad2 =
+        CrumblesLogsEncryptor.computeAssociatedData(
+            metadata, KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
+
+    assertThat(aad1).isNotEmpty();
+    assertThat(aad1).isEqualTo(aad2);
   }
 }

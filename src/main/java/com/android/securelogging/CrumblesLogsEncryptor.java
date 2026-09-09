@@ -32,6 +32,7 @@ import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.google.common.time.TimeSource;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.Timestamp;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
@@ -41,6 +42,7 @@ import com.google.protos.wireless_android_security_exploits_secure_logging_src_m
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogEncryptionType;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogKey;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -82,8 +84,9 @@ public class CrumblesLogsEncryptor {
 
   private static final String SYM_ALGORITHM = "AES";
   private static final int AES_KEY_SIZE_BITS = 256;
-  private static final int GCM_IV_LEN_BYTES = 12;
-  private static final int GCM_TAG_LEN_BITS = 128;
+  @VisibleForTesting static final int GCM_IV_LEN_BYTES = 12;
+  @VisibleForTesting static final int GCM_TAG_LEN_BITS = 128;
+  @VisibleForTesting static final int GCM_TAG_LEN_BYTES = GCM_TAG_LEN_BITS / 8;
 
   @VisibleForTesting static final String ASYM_ALGORITHM = KeyProperties.KEY_ALGORITHM_RSA;
   private static final String CIPHER_MODE_ASYM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
@@ -93,11 +96,14 @@ public class CrumblesLogsEncryptor {
   private static final BigInteger EXPECTED_RSA_PUBLIC_EXPONENT = RSAKeyGenParameterSpec.F4;
 
   private static final String ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore";
+
   /** Default alias for the RSA key pair. */
   public static final String KEY_ALIAS = "com.android.securelogging.CrumblesRsaKeyAlias";
+
   /** Alias for the primary key used to encrypt preferences. */
   public static final String PREFERENCE_PRIMARY_KEY_ALIAS =
       "com.android.securelogging.CrumblesPreferencePrimaryKey";
+
   private static final String SERIALIZED_ENCRYPTED_DATA_DELIMITER = ":";
 
   private static final Duration AUTH_VALIDITY_DURATION = Duration.ofSeconds(30);
@@ -137,7 +143,6 @@ public class CrumblesLogsEncryptor {
     return getPublicKey(KEY_ALIAS);
   }
 
-  /** getPublicKey method. */
   /** getPublicKey method. */
   @Nullable
   public PublicKey getPublicKey(String keyAlias) {
@@ -182,7 +187,7 @@ public class CrumblesLogsEncryptor {
    * @return the generated {@link KeyPair}
    * @throws CrumblesKeysException if the key pair cannot be generated
    */
- @CanIgnoreReturnValue
+  @CanIgnoreReturnValue
   public synchronized KeyPair generateKeyPair() throws CrumblesKeysException {
     return generateKeyPair(KEY_ALIAS, true);
   }
@@ -195,11 +200,10 @@ public class CrumblesLogsEncryptor {
    * @return the generated {@link KeyPair}
    * @throws CrumblesKeysException if the key pair cannot be generated
    */
- @CanIgnoreReturnValue
+  @CanIgnoreReturnValue
   public synchronized KeyPair generateKeyPair(String keyAlias, boolean requireUserAuthentication)
       throws CrumblesKeysException {
-    return generateKeyPair(
-        keyAlias, requireUserAuthentication, AUTH_VALIDITY_DURATION);
+    return generateKeyPair(keyAlias, requireUserAuthentication, AUTH_VALIDITY_DURATION);
   }
 
   /**
@@ -211,7 +215,7 @@ public class CrumblesLogsEncryptor {
    * @return the generated {@link KeyPair}
    * @throws CrumblesKeysException if the key pair cannot be generated
    */
- @CanIgnoreReturnValue
+  @CanIgnoreReturnValue
   public synchronized KeyPair generateKeyPair(
       String keyAlias, boolean requireUserAuthentication, Duration authValidityDuration)
       throws CrumblesKeysException {
@@ -316,36 +320,73 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Encrypts data using a hybrid encryption scheme: AES-GCM for the data, and RSA for the AES key.
+   * Computes the Additional Authenticated Data (AAD) for binding a {@link LogBatch}'s metadata and
+   * key encryption parameters to the AES-GCM cipher payload.
+   *
+   * @param metadata the {@link LogMetadata} to authenticate
+   * @param keyEncryptionType the {@link KeyEncryptionType} to authenticate
+   * @return deterministic bytes representing the bound associated data
+   */
+  public static byte[] computeAssociatedData(
+      LogMetadata metadata, KeyEncryptionType keyEncryptionType) {
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    CodedOutputStream codedOutput = CodedOutputStream.newInstance(outputStream);
+    // NOMUTANTS -- Scalar fields without maps serialize deterministically by default.
+    codedOutput.useDeterministicSerialization();
+    try {
+      metadata.writeTo(codedOutput);
+      codedOutput.writeEnumNoTag(keyEncryptionType.getNumber());
+      codedOutput.flush();
+    } catch (IOException e) {
+      throw new AssertionError("In-memory serialization to ByteArrayOutputStream failed", e);
+    }
+    return outputStream.toByteArray();
+  }
+
+  public static LogMetadata assembleMetadata(int blobSize, String deviceId) {
+    DeviceId deviceProto =
+        DeviceId.newBuilder()
+            .setDeviceId(
+                isNullOrEmpty(deviceId) ? CrumblesDeviceIdManager.FALLBACK_DEVICE_ID : deviceId)
+            .build();
+    return LogMetadata.newBuilder()
+        .setBlobSize(blobSize)
+        .setTimestamp(timestampFromMillis(TimeSource.system().instant().toEpochMilli()))
+        .setDevice(deviceProto)
+        .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
+        .build();
+  }
+
+  public static LogMetadata assembleMetadata(int blobSize) {
+    return assembleMetadata(blobSize, CrumblesDeviceIdManager.FALLBACK_DEVICE_ID);
+  }
+
+  public EncryptedData encryptData(byte[] data, PublicKey encryptionKey)
+      throws CrumblesKeysException {
+    return encryptData(data, /* aad= */ null, encryptionKey);
+  }
+
+  /**
+   * Encrypts data using a hybrid encryption scheme with Additional Authenticated Data (AAD).
    *
    * @param data the plaintext data to encrypt
+   * @param aad the additional authenticated data to authenticate with AES-GCM, or null if none
    * @param encryptionKey the RSA public key to use for encrypting the symmetric key
-   * @return an {@link EncryptedData} object containing the encrypted data, encrypted symmetric key, and IV
+   * @return an {@link EncryptedData} object containing the encrypted data, encrypted symmetric key,
+   *     and IV
    * @throws CrumblesKeysException if an error occurs during encryption
    */
- public EncryptedData encryptData(byte[] data, PublicKey encryptionKey)
+  public EncryptedData encryptData(byte[] data, @Nullable byte[] aad, PublicKey encryptionKey)
       throws CrumblesKeysException {
     SecretKey symKey = generateSecretKey();
     IvParameterSpec generatedIv = generateAesGcmInitializationVector();
-    byte[] encryptedBytes = encryptDataWithSymKey(symKey, generatedIv, data);
+    byte[] encryptedBytes = encryptDataWithSymKey(symKey, generatedIv, aad, data);
     byte[] encSymKey = wrapAesKey(encryptionKey, symKey);
     return new EncryptedData(encryptedBytes, encSymKey, generatedIv.getIV());
   }
 
   /**
-   * Encrypts log data and packages it into a {@link LogBatch} protobuf message.
-   *
-   * @param plainLogsBytes the serialized log data to encrypt
-   * @param publicKey the specific public key to use for encryption
-   * @return a {@link LogBatch} containing the encrypted logs and metadata, or null if encryption fails
-   */
-  /**
    * Encrypts plain logs using the provided public key and context for device attribution.
-   *
-   * @param context the Android context to resolve device ID from, or null
-   * @param plainLogsBytes the plain log data
-   * @param publicKey the specific public key to use for encryption
-   * @return a {@link LogBatch} containing encrypted logs, or null if no key is available
    */
   @CanIgnoreReturnValue
   @Nullable
@@ -355,18 +396,7 @@ public class CrumblesLogsEncryptor {
         plainLogsBytes, publicKey, CrumblesDeviceIdManager.getDeviceId(context));
   }
 
-  /**
-   * Encrypts plain logs using the provided public key, resolving device ID automatically.
-   *
-   * <p><b>Note:</b> If this instance was constructed without a {@link Context}, {@link
-   * CrumblesDeviceIdManager} cannot fall back to Android ID or a persisted UUID if the hardware
-   * serial is inaccessible. Prefer {@link #encryptLogs(Context, byte[], PublicKey)} or
-   * constructing with {@link #CrumblesLogsEncryptor(Context)}.
-   *
-   * @param plainLogsBytes the plain log data
-   * @param publicKey the specific public key to use for encryption
-   * @return a {@link LogBatch} containing encrypted logs, or null if no key is available
-   */
+  /** Encrypts log data and packages it into a {@link LogBatch} protobuf message bound with AAD. */
   @CanIgnoreReturnValue
   @Nullable
   public LogBatch encryptLogs(byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
@@ -385,11 +415,16 @@ public class CrumblesLogsEncryptor {
         return null;
       }
 
+      LogMetadata logMetadata =
+          assembleMetadata(plainLogsBytes.length + GCM_TAG_LEN_BYTES, deviceId);
+      byte[] aad =
+          computeAssociatedData(logMetadata, KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
+
       if (publicKey != null) {
-        encryptedData = encryptData(plainLogsBytes, publicKey);
+        encryptedData = encryptData(plainLogsBytes, aad, publicKey);
         keySourceMessage = "Using provided public key for encryption.";
       } else {
-        encryptedData = encryptData(plainLogsBytes, getPublicKey());
+        encryptedData = encryptData(plainLogsBytes, aad, getPublicKey());
         keySourceMessage = "Using Keystore public key for encryption.";
       }
       Log.d(TAG, keySourceMessage);
@@ -398,7 +433,7 @@ public class CrumblesLogsEncryptor {
           encryptedData.ciphertext,
           encryptedData.encryptedSymmetricKey,
           encryptedData.initializationVector,
-          deviceId);
+          logMetadata);
     } catch (CrumblesKeysException | RuntimeException e) {
       Log.e(TAG, "Unexpected runtime error during encryption process.", e);
       throw new CrumblesLogsEncryptionException(
@@ -406,7 +441,14 @@ public class CrumblesLogsEncryptor {
     }
   }
 
-  /** decryptLogs method. */
+  /**
+   * Decrypts a {@link LogBatch} protobuf message using the Keystore private key and validates AAD.
+   *
+   * @param logBatch the {@link LogBatch} containing ciphertext, wrapped symmetric key, and metadata
+   * @return the decrypted log bytes
+   * @throws CrumblesKeysException if the private key cannot be accessed or loaded
+   * @throws UserNotAuthenticatedException if user authentication is required
+   */
   @CanIgnoreReturnValue
   public byte[] decryptLogs(LogBatch logBatch)
       throws CrumblesKeysException, UserNotAuthenticatedException {
@@ -431,6 +473,8 @@ public class CrumblesLogsEncryptor {
       byte[] encryptedLogsBytes = logBatch.getData().getLogBlob().toByteArray();
       byte[] cipherSymKeyBytes = logBatch.getKey().getEncryptedSymmetricKey().toByteArray();
       byte[] cipherIvBytes = logBatch.getKey().getIv().toByteArray();
+      byte[] aad =
+          computeAssociatedData(logBatch.getMetadata(), logBatch.getKey().getKeyEncryptionType());
 
       SecretKey decryptedSymKey = unwrapAesKey(privateKey, cipherSymKeyBytes);
       SecretKeySpec decryptedSymKeySpec =
@@ -438,7 +482,7 @@ public class CrumblesLogsEncryptor {
 
       byte[] decryptedLogsBytes =
           decryptUsingAes256Gcm(
-              decryptedSymKeySpec, new IvParameterSpec(cipherIvBytes), encryptedLogsBytes);
+              decryptedSymKeySpec, new IvParameterSpec(cipherIvBytes), aad, encryptedLogsBytes);
       Log.d(TAG, "Log file decrypted successfully using Keystore private key.");
       return decryptedLogsBytes;
     } catch (CrumblesKeysException e) {
@@ -471,18 +515,21 @@ public class CrumblesLogsEncryptor {
   }
 
   private byte[] encryptDataWithSymKey(
-      SecretKey symKey, IvParameterSpec generatedIv, byte[] plainBytes) {
+      SecretKey symKey, IvParameterSpec generatedIv, @Nullable byte[] aad, byte[] plainBytes) {
     SecretKeySpec symKeySpec = new SecretKeySpec(symKey.getEncoded(), SYM_ALGORITHM);
-    return encryptUsingAes256Gcm(symKeySpec, generatedIv, plainBytes);
+    return encryptUsingAes256Gcm(symKeySpec, generatedIv, aad, plainBytes);
   }
 
   private static byte[] encryptUsingAes256Gcm(
-      SecretKeySpec key, IvParameterSpec ivSpec, byte[] plainTextBytes) {
+      SecretKeySpec key, IvParameterSpec ivSpec, @Nullable byte[] aad, byte[] plainTextBytes) {
     try {
       Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
       GCMParameterSpec gcmParameterSpec =
           new GCMParameterSpec(GCM_TAG_LEN_BITS, ivSpec.getIV());
       aesCipher.init(Cipher.ENCRYPT_MODE, key, gcmParameterSpec);
+      if (aad != null) {
+        aesCipher.updateAAD(aad);
+      }
       return aesCipher.doFinal(plainTextBytes);
     } catch (Exception e) {
       throw new CrumblesLogsEncryptionException("AES GCM encryption failed.", e);
@@ -512,12 +559,15 @@ public class CrumblesLogsEncryptor {
   }
 
   private static byte[] decryptUsingAes256Gcm(
-      SecretKeySpec key, IvParameterSpec ivSpec, byte[] cipherTextBytes) {
+      SecretKeySpec key, IvParameterSpec ivSpec, @Nullable byte[] aad, byte[] cipherTextBytes) {
     try {
       Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
       GCMParameterSpec gcmParameterSpec =
           new GCMParameterSpec(GCM_TAG_LEN_BITS, ivSpec.getIV());
       aesCipher.init(Cipher.DECRYPT_MODE, key, gcmParameterSpec);
+      if (aad != null) {
+        aesCipher.updateAAD(aad);
+      }
       return aesCipher.doFinal(cipherTextBytes);
     } catch (Exception e) {
       throw new CrumblesLogsDecryptionException("AES GCM decryption failed.", e);
@@ -555,13 +605,19 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Assembles a {@link LogBatch} proto with the specified device ID.
+   * Assembles a {@link LogBatch} protobuf message from ciphertext components and metadata.
+   *
+   * @param encryptedLogsBytes the encrypted log data blob
+   * @param cipherSymKeyBytes the wrapped symmetric key bytes
+   * @param cipherIvBytes the initialization vector bytes
+   * @param logMetadata the metadata associated with the log batch
+   * @return the assembled {@link LogBatch}
    */
   public static LogBatch assembleCipherText(
       byte[] encryptedLogsBytes,
       byte[] cipherSymKeyBytes,
       byte[] cipherIvBytes,
-      String deviceId) {
+      LogMetadata logMetadata) {
     LogData logData =
         LogData.newBuilder().setLogBlob(ByteString.copyFrom(encryptedLogsBytes)).build();
     LogKey logKey =
@@ -570,24 +626,27 @@ public class CrumblesLogsEncryptor {
             .setEncryptedSymmetricKey(ByteString.copyFrom(cipherSymKeyBytes))
             .setIv(ByteString.copyFrom(cipherIvBytes))
             .build();
-    DeviceId deviceProto =
-        DeviceId.newBuilder()
-            .setDeviceId(
-                isNullOrEmpty(deviceId) ? CrumblesDeviceIdManager.FALLBACK_DEVICE_ID : deviceId)
-            .build();
-    LogMetadata logMetadata =
-        LogMetadata.newBuilder()
-            .setBlobSize(encryptedLogsBytes.length)
-            .setTimestamp(timestampFromMillis(TimeSource.system().instant().toEpochMilli()))
-            .setDevice(deviceProto)
-            .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
-            .build();
     return LogBatch.newBuilder().setData(logData).setKey(logKey).setMetadata(logMetadata).build();
   }
 
   /**
-   * Assembles a {@link LogBatch} proto with the specified context for device attribution.
+   * Assembles a {@link LogBatch} protobuf message from ciphertext components with generated
+   * metadata.
+   *
+   * @param encryptedLogsBytes the encrypted log data blob
+   * @param cipherSymKeyBytes the wrapped symmetric key bytes
+   * @param cipherIvBytes the initialization vector bytes
+   * @return the assembled {@link LogBatch}
    */
+  public static LogBatch assembleCipherText(
+      byte[] encryptedLogsBytes, byte[] cipherSymKeyBytes, byte[] cipherIvBytes, String deviceId) {
+    return assembleCipherText(
+        encryptedLogsBytes,
+        cipherSymKeyBytes,
+        cipherIvBytes,
+        assembleMetadata(encryptedLogsBytes.length, deviceId));
+  }
+
   public static LogBatch assembleCipherText(
       @Nullable Context context,
       byte[] encryptedLogsBytes,
@@ -600,14 +659,6 @@ public class CrumblesLogsEncryptor {
         CrumblesDeviceIdManager.getDeviceId(context));
   }
 
-  /**
-   * Assembles a {@link LogBatch} proto without a context.
-   *
-   * <p><b>Note:</b> Calling this method without a {@link Context} means {@link
-   * CrumblesDeviceIdManager} cannot fall back to Android ID or a persisted UUID in {@link
-   * SharedPreferences} if the hardware serial is inaccessible. Prefer {@link
-   * #assembleCipherText(Context, byte[], byte[], byte[])}.
-   */
   public static LogBatch assembleCipherText(
       byte[] encryptedLogsBytes, byte[] cipherSymKeyBytes, byte[] cipherIvBytes) {
     return assembleCipherText(
@@ -645,7 +696,8 @@ public class CrumblesLogsEncryptor {
 
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
-      PrivateKey primaryPrivateKey = (PrivateKey) keyStore.getKey(PREFERENCE_PRIMARY_KEY_ALIAS, null);
+      PrivateKey primaryPrivateKey =
+          (PrivateKey) keyStore.getKey(PREFERENCE_PRIMARY_KEY_ALIAS, null);
       if (primaryPrivateKey == null) {
         throw new CrumblesKeysException("Failed to load primary private key from Keystore.");
       }
@@ -653,12 +705,12 @@ public class CrumblesLogsEncryptor {
       SecretKey aesKey = unwrapAesKey(primaryPrivateKey, wrappedKeyBytes);
       SecretKeySpec aesKeySpec = new SecretKeySpec(aesKey.getEncoded(), SYM_ALGORITHM);
 
-      return decryptUsingAes256Gcm(aesKeySpec, new IvParameterSpec(ivBytes), ciphertext);
+      return decryptUsingAes256Gcm(
+          aesKeySpec, new IvParameterSpec(ivBytes), /* aad= */ null, ciphertext);
     } catch (Exception e) {
       throw new CrumblesKeysException("Failed to perform AES-GCM decryption.", e);
     }
   }
-
 
   @Nullable
   public static String publicKeyToBase64(@Nullable PublicKey publicKey) {
@@ -718,12 +770,25 @@ public class CrumblesLogsEncryptor {
     return rsa;
   }
 
+  /**
+   * Re-encrypts plain log bytes under a new public key and packages the result into a {@link
+   * LogBatch}.
+   *
+   * @param plainLogsBytes the plain log bytes to re-encrypt
+   * @param reEncryptionKey the public key to wrap the per-batch symmetric key with
+   * @return a newly assembled {@link LogBatch} bound with AAD
+   * @throws CrumblesKeysException if key wrapping fails
+   */
   public LogBatch reEncryptLogBatch(byte[] plainLogsBytes, PublicKey reEncryptionKey)
       throws CrumblesKeysException {
-    EncryptedData encryptedData = encryptData(plainLogsBytes, reEncryptionKey);
+    LogMetadata logMetadata = assembleMetadata(plainLogsBytes.length + GCM_TAG_LEN_BYTES);
+    byte[] aad =
+        computeAssociatedData(logMetadata, KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
+    EncryptedData encryptedData = encryptData(plainLogsBytes, aad, reEncryptionKey);
     return assembleCipherText(
         encryptedData.ciphertext,
         encryptedData.encryptedSymmetricKey,
-        encryptedData.initializationVector);
+        encryptedData.initializationVector,
+        logMetadata);
   }
 }
