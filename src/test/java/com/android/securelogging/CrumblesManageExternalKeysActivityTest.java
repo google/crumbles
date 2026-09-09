@@ -23,7 +23,6 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.robolectric.Shadows.shadowOf;
@@ -39,6 +38,7 @@ import android.security.keystore.UserNotAuthenticatedException;
 import android.support.v4.app.DialogFragment;
 import android.support.v7.app.AlertDialog;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.ScrollView;
@@ -230,6 +230,17 @@ public class CrumblesManageExternalKeysActivityTest {
     // And: A success toast is shown.
     assertThat(ShadowToast.getTextOfLatestToast())
         .isEqualTo(appContext.getString(R.string.toast_external_key_cleared_successfully));
+  }
+
+  @Test
+  public void onCreate_setsFlagSecure() {
+    launchActivity();
+    scenario.onActivity(
+        activity ->
+            assertThat(
+                    activity.getWindow().getAttributes().flags
+                        & WindowManager.LayoutParams.FLAG_SECURE)
+                .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE));
   }
 
   @Test

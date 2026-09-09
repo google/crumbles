@@ -27,6 +27,7 @@ import android.support.v7.app.AlertDialog;
 import android.text.method.LinkMovementMethod;
 import android.util.Log;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
@@ -58,23 +59,19 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
 
   // Hold the fragment's own secure copy.
   private byte[] privateKeyCopy;
-  private Runnable cleanupCallback;
   private KeyCustodyConfirmationListener custodyConfirmationListener;
   private boolean isCustodyConfirmed = false;
 
   public static CrumblesPrivateKeyViewerDialogFragment newInstance(
       byte[] privateKeyBytes, boolean showQrInitially) {
     CrumblesPrivateKeyViewerDialogFragment fragment = new CrumblesPrivateKeyViewerDialogFragment();
+    // Never place key material in the arguments Bundle: FragmentManager persists it to disk.
+    fragment.privateKeyCopy = Arrays.copyOf(privateKeyBytes, privateKeyBytes.length);
+    Arrays.fill(privateKeyBytes, (byte) 0); // Invalidate caller's copy immediately.
     Bundle args = new Bundle();
-    args.putByteArray(CrumblesConstants.ARG_PRIVATE_KEY_BYTES, privateKeyBytes);
     args.putBoolean(CrumblesConstants.ARG_SHOW_QR_INITIALLY, showQrInitially);
     fragment.setArguments(args);
     return fragment;
-  }
-
-  /** Method for the Activity to provide the cleanup task. */
-  public void setCleanupCallback(Runnable callback) {
-    this.cleanupCallback = callback;
   }
 
   /** Sets the listener to be notified upon explicit custody confirmation or cancellation. */
@@ -85,32 +82,24 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
   @Override
   public void onCreate(@Nullable Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
-    Bundle arguments = getArguments();
-    if (arguments != null) {
-      byte[] originalBytes = arguments.getByteArray(CrumblesConstants.ARG_PRIVATE_KEY_BYTES);
-      if (originalBytes != null) {
-        // 1. Make our own secure, defensive copy.
-        this.privateKeyCopy = Arrays.copyOf(originalBytes, originalBytes.length);
-
-        // 2. Execute the callback to tell the Activity it can now clear its key.
-        if (cleanupCallback != null) {
-          cleanupCallback.run();
-          cleanupCallback = null; // Ensure it only runs once.
-        }
-      }
-    }
   }
 
   @NonNull
   @Override
   public Dialog onCreateDialog(@Nullable Bundle savedInstanceState) {
+    // Prevent screenshots / screen-recording / casting of the private key.
+    requireActivity().getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     if (privateKeyCopy == null) {
+      // Process was recreated or key not provided; the key is intentionally gone.
       Log.e(TAG, "Private key data was not provided to the dialog fragment.");
-      return new AlertDialog.Builder(requireActivity())
-          .setTitle("Error")
-          .setMessage("No key data provided.")
-          .setPositiveButton(android.R.string.ok, null)
-          .create();
+      AlertDialog errorDialog =
+          new AlertDialog.Builder(requireActivity())
+              .setTitle("Error")
+              .setMessage("No key data provided.")
+              .setPositiveButton(android.R.string.ok, null)
+              .create();
+      errorDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+      return errorDialog;
     }
 
     AlertDialog.Builder builder = new AlertDialog.Builder(requireActivity());
@@ -120,6 +109,7 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
         .setView(R.layout.dialog_togglable_private_key);
 
     AlertDialog dialog = builder.create();
+    dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
 
     dialog.setOnShowListener(
         d -> {
@@ -143,7 +133,8 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
           keyTextView.setMovementMethod(LinkMovementMethod.getInstance());
 
           boolean showQrInitially =
-              getArguments().getBoolean(CrumblesConstants.ARG_SHOW_QR_INITIALLY, false);
+              getArguments() != null
+                  && getArguments().getBoolean(CrumblesConstants.ARG_SHOW_QR_INITIALLY, false);
 
           if (showQrInitially) {
             try {
