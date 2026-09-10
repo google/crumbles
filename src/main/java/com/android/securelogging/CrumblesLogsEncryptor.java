@@ -665,23 +665,56 @@ public class CrumblesLogsEncryptor {
         /* context= */ null, encryptedLogsBytes, cipherSymKeyBytes, cipherIvBytes);
   }
 
-  @CanIgnoreReturnValue
-  public String encryptDataStoreEntry(byte[] plaintext) throws CrumblesKeysException {
+  /**
+   * Encrypts a plaintext byte array (a data store entry) using AES-GCM + RSA and returns the
+   * encrypted payload.
+   *
+   * @param plaintext The plaintext byte array to encrypt.
+   * @return The encrypted payload.
+   * @throws CrumblesKeysException If encryption fails.
+   */
+  public EncryptedPayload encryptDataStoreEntry(byte[] plaintext) throws CrumblesKeysException {
     PublicKey publicKey = getPublicKey(PREFERENCE_PRIMARY_KEY_ALIAS);
     if (publicKey == null) {
       publicKey = generateKeyPair(PREFERENCE_PRIMARY_KEY_ALIAS, false).getPublic();
     }
     EncryptedData encData = encryptData(plaintext, publicKey);
+    return EncryptedPayload.newBuilder()
+        .setCiphertext(ByteString.copyFrom(encData.ciphertext))
+        .setWrappedEncryptionKey(ByteString.copyFrom(encData.encryptedSymmetricKey))
+        .setInitializationVector(ByteString.copyFrom(encData.initializationVector))
+        .build();
+  }
 
-    String ivString = Base64.getEncoder().encodeToString(encData.initializationVector);
-    String keyString = Base64.getEncoder().encodeToString(encData.encryptedSymmetricKey);
-    String ciphertextString = Base64.getEncoder().encodeToString(encData.ciphertext);
+  /**
+   * Decrypts an EncryptedPayload. It unwraps the AES key using the primary key from the Android
+   * Keystore and then performs AES-GCM decryption.
+   *
+   * @param payload The encrypted payload to decrypt.
+   * @return The original plaintext data.
+   * @throws CrumblesKeysException If decryption fails due to key errors or data tampering.
+   */
+  public byte[] decryptData(EncryptedPayload payload) throws CrumblesKeysException {
+    try {
+      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
+      keyStore.load(null);
+      PrivateKey primaryPrivateKey =
+          (PrivateKey) keyStore.getKey(PREFERENCE_PRIMARY_KEY_ALIAS, null);
+      if (primaryPrivateKey == null) {
+        throw new CrumblesKeysException("Failed to load primary private key from Keystore.");
+      }
 
-    return ivString
-        + SERIALIZED_ENCRYPTED_DATA_DELIMITER
-        + keyString
-        + SERIALIZED_ENCRYPTED_DATA_DELIMITER
-        + ciphertextString;
+      SecretKey aesKey =
+          unwrapAesKey(primaryPrivateKey, payload.getWrappedEncryptionKey().toByteArray());
+      SecretKeySpec aesKeySpec = new SecretKeySpec(aesKey.getEncoded(), SYM_ALGORITHM);
+
+      byte[] ciphertext = payload.getCiphertext().toByteArray();
+      IvParameterSpec iv = new IvParameterSpec(payload.getInitializationVector().toByteArray());
+
+      return decryptUsingAes256Gcm(aesKeySpec, iv, /* aad= */ null, ciphertext);
+    } catch (Exception e) {
+      throw new CrumblesKeysException("Failed to perform AES-GCM decryption.", e);
+    }
   }
 
   public byte[] decryptData(String serializedPayload) throws CrumblesKeysException {

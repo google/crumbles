@@ -17,45 +17,36 @@
 package com.android.securelogging;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.util.Log;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
+import androidx.datastore.guava.GuavaDataStore;
 import com.android.securelogging.exceptions.CrumblesKeysException;
-import com.google.common.collect.ImmutableSet;
+import com.google.common.util.concurrent.Futures;
 import java.security.KeyFactory;
 import java.security.PublicKey;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
-/** Manages the storage and retrieval of external public keys using EncryptedSharedPreferences. */
+/** Manages the storage and retrieval of external public keys using encrypted GuavaDataStore. */
 public class CrumblesExternalPublicKeyManager {
   private static final String TAG = "CrumblesExternalPubKeyManager";
-  private static final String PREFS_FILE_NAME = "crumbles_external_keys";
-  private static final String KEY_VALUE_DELIMITER = "|";
 
-  private static final String PREF_ACTIVE_KEY_ID = "active_external_key_id";
-  private static final String PREF_PRIMARY_KEYS = "primary_external_public_keys";
-  private static final String PREF_RE_ENCRYPT_KEYS = "re_encrypt_external_public_keys";
-
-  private final SharedPreferences prefs;
+  private final GuavaDataStore<UserKeyPreferences> dataStore;
   private final CrumblesLogsEncryptor cryptoManager;
   private static volatile CrumblesExternalPublicKeyManager instance;
 
   private CrumblesExternalPublicKeyManager(Context context) {
-    this.cryptoManager = CrumblesMain.getLogsEncryptorInstance();
-    // Use standard SharedPreferences. Security is handled by encrypting the values.
-    this.prefs = context.getSharedPreferences(PREFS_FILE_NAME, Context.MODE_PRIVATE);
+    this(
+        CrumblesDataStoreHolder.getInstance(context.getApplicationContext()),
+        CrumblesMain.getLogsEncryptorInstance());
   }
 
   @VisibleForTesting
   CrumblesExternalPublicKeyManager(
-      SharedPreferences testPrefs, CrumblesLogsEncryptor testCryptoManager) {
-    this.prefs = testPrefs;
+      GuavaDataStore<UserKeyPreferences> testDataStore, CrumblesLogsEncryptor testCryptoManager) {
+    this.dataStore = testDataStore;
     this.cryptoManager = testCryptoManager;
   }
 
@@ -70,86 +61,123 @@ public class CrumblesExternalPublicKeyManager {
     return instance;
   }
 
+  /**
+   * Deactivates the currently active key by clearing the active key ID pointer. The key itself
+   * remains in storage.
+   */
   public void clearActiveExternalPublicKey() {
     Log.i(TAG, "Deactivating current external key.");
-    prefs.edit().remove(PREF_ACTIVE_KEY_ID).apply();
+    try {
+      Futures.getChecked(
+          dataStore.updateDataAsync(prefs -> prefs.toBuilder().clearActiveKeyId().build()),
+          CrumblesKeysException.class);
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to clear active external public key.", e);
+    }
   }
 
+  /**
+   * Saves the provided public key to the DataStore after encrypting it and sets it as active.
+   *
+   * @param publicKey the external public key to save
+   */
   public void saveActiveExternalPublicKey(@Nullable PublicKey publicKey)
       throws CrumblesKeysException {
     if (publicKey == null) {
       clearActiveExternalPublicKey();
       return;
     }
-    String keyId = CrumblesLogsEncryptor.getPublicKeyHash(publicKey);
-    String encryptedValue = cryptoManager.encryptDataStoreEntry(publicKey.getEncoded());
-    String entry = keyId + KEY_VALUE_DELIMITER + encryptedValue;
+    try {
+      String keyId = CrumblesLogsEncryptor.getPublicKeyHash(publicKey);
+      EncryptedPayload payload = cryptoManager.encryptDataStoreEntry(publicKey.getEncoded());
 
-    Set<String> currentKeys =
-        new HashSet<>(prefs.getStringSet(PREF_PRIMARY_KEYS, ImmutableSet.of()));
-    currentKeys.removeIf(s -> s.startsWith(keyId + KEY_VALUE_DELIMITER));
-    currentKeys.add(entry);
-
-    prefs
-        .edit()
-        .putStringSet(PREF_PRIMARY_KEYS, currentKeys)
-        .putString(PREF_ACTIVE_KEY_ID, keyId)
-        .apply();
-    Log.i(TAG, "Successfully saved and set active public key with ID: " + keyId);
+      Futures.getChecked(
+          dataStore.updateDataAsync(
+              prefs ->
+                  prefs.toBuilder()
+                      .putExternalPublicKeys(keyId, payload)
+                      .setActiveKeyId(keyId)
+                      .build()),
+          CrumblesKeysException.class);
+      Log.i(TAG, "Successfully saved and set active public key with ID: " + keyId);
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to save and encrypt public key.", e);
+      throw e;
+    }
   }
 
+  /**
+   * Retrieves and decrypts the active external public key from the DataStore.
+   *
+   * @return the deserialized PublicKey, or null if not found or invalid
+   */
   @Nullable
   public PublicKey getActiveExternalPublicKey() {
-    String activeKeyId = prefs.getString(PREF_ACTIVE_KEY_ID, null);
-    if (activeKeyId == null) {
+    try {
+      UserKeyPreferences prefs =
+          Futures.getChecked(dataStore.getDataAsync(), CrumblesKeysException.class);
+      String activeKeyId = prefs.getActiveKeyId();
+      if (activeKeyId.isEmpty()) {
+        return null;
+      }
+
+      EncryptedPayload payload = prefs.getExternalPublicKeysOrDefault(activeKeyId, null);
+      if (payload == null) {
+        Log.e(TAG, "Active key ID '" + activeKeyId + "' not found in key map.");
+        return null;
+      }
+
+      byte[] decryptedBytes = cryptoManager.decryptData(payload);
+      KeyFactory kf = KeyFactory.getInstance("RSA");
+      return kf.generatePublic(new X509EncodedKeySpec(decryptedBytes));
+    } catch (Exception e) {
+      Log.e(TAG, "Failed to retrieve and decrypt active public key.", e);
       return null;
     }
-    Set<String> allKeys = prefs.getStringSet(PREF_PRIMARY_KEYS, Collections.emptySet());
-    for (String entry : allKeys) {
-      String[] parts = entry.split("\\" + KEY_VALUE_DELIMITER, 2);
-      if (parts.length == 2 && parts[0].equals(activeKeyId)) {
-        try {
-          byte[] decryptedBytes = cryptoManager.decryptData(parts[1]);
-          KeyFactory kf = KeyFactory.getInstance("RSA");
-          return kf.generatePublic(new X509EncodedKeySpec(decryptedBytes));
-        } catch (Exception e) {
-          Log.e(TAG, "Failed to decrypt active key with ID: " + activeKeyId, e);
-          return null; // Don't clear here, might be a temporary issue.
-        }
-      }
-    }
-    Log.e(TAG, "Active key ID '" + activeKeyId + "' not found in key set.");
-    return null;
   }
 
+  /**
+   * Saves a re-encryption public key to the DataStore after encrypting it.
+   *
+   * @param publicKey the re-encryption public key to save
+   */
   public void saveReEncryptPublicKey(PublicKey publicKey) throws CrumblesKeysException {
-    String keyId = CrumblesLogsEncryptor.getPublicKeyHash(publicKey);
-    String encryptedValue = cryptoManager.encryptDataStoreEntry(publicKey.getEncoded());
-    String entry = keyId + KEY_VALUE_DELIMITER + encryptedValue;
+    try {
+      String keyId = CrumblesLogsEncryptor.getPublicKeyHash(publicKey);
+      EncryptedPayload payload = cryptoManager.encryptDataStoreEntry(publicKey.getEncoded());
 
-    Set<String> currentKeys =
-        new HashSet<>(prefs.getStringSet(PREF_RE_ENCRYPT_KEYS, Collections.emptySet()));
-    currentKeys.removeIf(s -> s.startsWith(keyId + KEY_VALUE_DELIMITER));
-    currentKeys.add(entry);
-
-    prefs.edit().putStringSet(PREF_RE_ENCRYPT_KEYS, currentKeys).apply();
-    Log.i(TAG, "Successfully saved re-encryption key with ID: " + keyId);
+      Futures.getChecked(
+          dataStore.updateDataAsync(
+              prefs -> prefs.toBuilder().putReEncryptPublicKeys(keyId, payload).build()),
+          CrumblesKeysException.class);
+      Log.i(TAG, "Successfully saved re-encryption key with ID: " + keyId);
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to save re-encryption key.", e);
+      throw e;
+    }
   }
 
+  /**
+   * Retrieves and decrypts all external re-encryption public keys from the DataStore.
+   *
+   * @return a list of deserialized re-encryption PublicKeys
+   */
   public List<PublicKey> getExternalReEncryptPublicKeys() {
     List<PublicKey> keys = new ArrayList<>();
-    Set<String> allEntries = prefs.getStringSet(PREF_RE_ENCRYPT_KEYS, Collections.emptySet());
-    for (String entry : allEntries) {
-      try {
-        String[] parts = entry.split("\\" + KEY_VALUE_DELIMITER, 2);
-        if (parts.length == 2) {
-          byte[] decryptedBytes = cryptoManager.decryptData(parts[1]);
+    try {
+      UserKeyPreferences prefs =
+          Futures.getChecked(dataStore.getDataAsync(), CrumblesKeysException.class);
+      for (EncryptedPayload payload : prefs.getReEncryptPublicKeysMap().values()) {
+        try {
+          byte[] decryptedBytes = cryptoManager.decryptData(payload);
           KeyFactory kf = KeyFactory.getInstance("RSA");
           keys.add(kf.generatePublic(new X509EncodedKeySpec(decryptedBytes)));
+        } catch (Exception e) {
+          Log.w(TAG, "Could not decrypt a re-encryption key from DataStore. Skipping.", e);
         }
-      } catch (Exception e) {
-        Log.w(TAG, "Could not decrypt a re-encryption key from SharedPreferences. Skipping.", e);
       }
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to load re-encryption keys from DataStore.", e);
     }
     return keys;
   }
