@@ -18,6 +18,10 @@ package com.android.securelogging;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.admin.ConnectEvent;
 import android.app.admin.DeviceAdminReceiver;
 import android.app.admin.DevicePolicyManager;
@@ -32,6 +36,8 @@ import android.os.PersistableBundle;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.VisibleForTesting;
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
 import androidx.work.WorkManager;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
@@ -56,6 +62,7 @@ import java.util.TimeZone;
  */
 public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   private static final String TAG = "[CrumblesDeviceAdminReceiver]";
+  @VisibleForTesting static final int DEFERRED_LOGS_NOTIFICATION_ID = 2001;
   private DevicePolicyManager dpm;
   private ComponentName adminComponentName;
 
@@ -148,6 +155,46 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
         context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
   }
 
+  // Suppress "MissingPermission" and "PendingIntentMutability" because notification permissions are
+  // checked at runtime and PendingIntent.FLAG_IMMUTABLE is explicitly supplied.
+  @SuppressWarnings({"MissingPermission", "PendingIntentMutability"})
+  private static void notifyLogRetrievalDeferred(Context context, String logType) {
+    NotificationChannel channel =
+        new NotificationChannel(
+            CrumblesConstants.NOTIFICATION_CHANNEL_ID,
+            "Crumbles Status Notifications",
+            NotificationManager.IMPORTANCE_HIGH);
+    channel.setDescription("Status notifications for Crumbles encryption and log retrieval.");
+    NotificationManagerCompat.from(context).createNotificationChannel(channel);
+
+    Intent openIntent = new Intent(context, CrumblesMain.class);
+    openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+    PendingIntent pendingIntent =
+        PendingIntent.getActivity(
+            context,
+            0,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+    Notification notification =
+        new NotificationCompat.Builder(context, CrumblesConstants.NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle("Crumbles Log Retrieval Deferred")
+            .setContentText(
+                logType
+                    + " logs available, but no active encryption key is configured. Tap to set up.")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build();
+
+    try {
+      NotificationManagerCompat.from(context).notify(DEFERRED_LOGS_NOTIFICATION_ID, notification);
+    } catch (SecurityException e) {
+      Log.w(TAG, "Notification permission not granted, skipping notification.", e);
+    }
+  }
+
   private Optional<PublicKey> prepareLogRetrieval(Context context, String logType) {
     Log.i(TAG, logType + " logs available.");
     Optional<PublicKey> activeKey = resolveActiveEncryptionKey(context);
@@ -161,6 +208,7 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
           .logEvent(
               "LOG_RETRIEVAL_DEFERRED",
               logType + " log retrieval deferred: no encryption key or storage ready.");
+      notifyLogRetrievalDeferred(context, logType);
       return Optional.empty();
     }
     return activeKey;

@@ -25,6 +25,9 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.admin.ConnectEvent;
 import android.app.admin.DeviceAdminReceiver;
 import android.app.admin.DevicePolicyManager;
@@ -36,6 +39,7 @@ import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
 import android.os.PersistableBundle;
+import android.service.notification.StatusBarNotification;
 import android.util.Log;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -57,6 +61,7 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.Security;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import javax.crypto.Cipher;
@@ -65,6 +70,7 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.robolectric.Shadows;
 
 /**
  * Unit tests for {@link CrumblesDeviceAdminReceiver}.
@@ -389,6 +395,31 @@ public final class CrumblesDeviceAdminReceiverTest {
     verify(mockDpm, never()).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
   }
 
+  private static void assertDeferredLogsNotificationPosted(Context context) {
+    NotificationManager nm =
+        (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+    NotificationChannel channel =
+        nm.getNotificationChannel(CrumblesConstants.NOTIFICATION_CHANNEL_ID);
+    assertThat(channel).isNotNull();
+    assertThat(channel.getDescription())
+        .isEqualTo("Status notifications for Crumbles encryption and log retrieval.");
+    StatusBarNotification postedNotification =
+        Arrays.stream(nm.getActiveNotifications())
+            .filter(n -> n.getId() == CrumblesDeviceAdminReceiver.DEFERRED_LOGS_NOTIFICATION_ID)
+            .findFirst()
+            .orElse(null);
+    assertThat(postedNotification).isNotNull();
+    Notification notification = postedNotification.getNotification();
+    assertThat(notification.flags & Notification.FLAG_AUTO_CANCEL)
+        .isEqualTo(Notification.FLAG_AUTO_CANCEL);
+    Intent contentIntent = Shadows.shadowOf(notification.contentIntent).getSavedIntent();
+    assertThat(contentIntent.getComponent().getClassName()).isEqualTo(CrumblesMain.class.getName());
+    assertThat(
+            contentIntent.getFlags()
+                & (Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP))
+        .isEqualTo(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+  }
+
   private static Context createContextWrapper(Context realContext, DevicePolicyManager mockDpm) {
     return new ContextWrapper(realContext) {
       @Override
@@ -417,6 +448,7 @@ public final class CrumblesDeviceAdminReceiverTest {
             CrumblesAppAuditLogger.getInstance(context).getMemoryCachedEvents().stream()
                 .anyMatch(e -> e.getEventType().equals("LOG_RETRIEVAL_DEFERRED")))
         .isTrue();
+    assertDeferredLogsNotificationPosted(context);
   }
 
   @Test
@@ -500,6 +532,7 @@ public final class CrumblesDeviceAdminReceiverTest {
             CrumblesAppAuditLogger.getInstance(context).getMemoryCachedEvents().stream()
                 .anyMatch(e -> e.getEventType().equals("LOG_RETRIEVAL_DEFERRED")))
         .isTrue();
+    assertDeferredLogsNotificationPosted(context);
   }
 
   @Test
