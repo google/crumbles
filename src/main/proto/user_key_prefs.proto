@@ -12,6 +12,13 @@ message EncryptedPayload {
   bytes wrapped_encryption_key = 3;
 }
 
+// Remote storage destination types supported by Crumbles.
+enum StorageType {
+  STORAGE_TYPE_UNSPECIFIED = 0;
+  STORAGE_TYPE_GOOGLE_DRIVE = 1;
+  STORAGE_TYPE_WEBDAV = 2;
+}
+
 // User key preferences stored in Jetpack DataStore.
 message UserKeyPreferences {
   // Map of Key ID -> Encrypted Public Key payload.
@@ -22,4 +29,11 @@ message UserKeyPreferences {
 
   // Map of Key ID -> Encrypted Re-encryption Key payload.
   map<string, EncryptedPayload> re_encrypt_public_keys = 3;
+
+  // Remote storage configuration.
+  StorageType storage_type = 4;
+  string upload_destination_uri = 5;
+  string webdav_server_url = 6;
+  string webdav_username = 7;
+  EncryptedPayload webdav_password_encrypted = 8;
 }
