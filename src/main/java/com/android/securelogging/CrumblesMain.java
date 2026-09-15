@@ -17,6 +17,7 @@
 package com.android.securelogging;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.KeyguardManager;
 import android.app.admin.DevicePolicyManager;
@@ -76,9 +77,15 @@ public class CrumblesMain extends FragmentActivity {
 
   private List<Uri> pendingFileUrisForDecryption;
 
+  // Suppress "StaticFieldLeak" because CrumblesLogsEncryptor only holds the application context
+  // or a null context, so retaining it in a static field does not cause an Activity leak.
+  @SuppressLint("StaticFieldLeak")
   private static final CrumblesLogsEncryptor prodLogsEncryptorInstance =
       new CrumblesLogsEncryptor();
 
+  // Suppress "StaticFieldLeak" because CrumblesLogsEncryptor only holds the application context
+  // or a null context, so retaining it in a static field does not cause an Activity leak.
+  @SuppressLint("StaticFieldLeak")
   @SuppressWarnings("NonFinalStaticField")
   protected static CrumblesLogsEncryptor testLogsEncryptorInstance = null;
 
@@ -689,11 +696,11 @@ public class CrumblesMain extends FragmentActivity {
             .logEvent("DECRYPTION_SUCCESS", "Successfully decrypted file: " + fileName);
       } catch (RuntimeException | CrumblesKeysException e) {
         Log.e(TAG, "Unexpected error processing file: " + fileName, e);
-        showToast("Unexpected error with " + fileName + ": " + e.getMessage());
+        showToast("Failed to decrypt " + fileName + ".");
         CrumblesAppAuditLogger.getInstance(this)
             .logEvent(
                 "DECRYPTION_FAILURE",
-                "Failed to decrypt '" + fileName + "'. Reason: " + e.getMessage());
+                "Failed to decrypt '" + fileName + "'. Reason: Decryption failed.");
         allSuccessful = false;
       }
     }

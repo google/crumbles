@@ -45,6 +45,7 @@ import java.security.Provider;
 import java.security.PublicKey;
 import java.security.Security;
 import java.security.UnrecoverableKeyException;
+import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.RSAKeyGenParameterSpec;
 import java.security.spec.RSAPublicKeySpec;
 import java.time.Duration;
@@ -53,8 +54,11 @@ import java.util.Base64;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.crypto.AEADBadTagException;
 import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource.PSpecified;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -628,8 +632,6 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(logBatch.getMetadata().getDevice().getDeviceId()).isNotEmpty();
   }
 
-
-
   @Test
   public void assembleCipherText_withExplicitDeviceId_setsDeviceIdInMetadata() {
     byte[] encryptedLogs = "encryptedLogs".getBytes(UTF_8);
@@ -832,5 +834,33 @@ public final class CrumblesLogsEncryptorTest {
 
     assertThat(aad1).isNotEmpty();
     assertThat(aad1).isEqualTo(aad2);
+  }
+
+  @Test
+  public void decryptData_serializedPayload_supportsOaepAndLegacyPkcs1() throws Exception {
+    byte[] plaintext = "legacydatastore".getBytes(UTF_8);
+    encryptor.generateKeyPair(CrumblesLogsEncryptor.PREFERENCE_PRIMARY_KEY_ALIAS, false);
+    PublicKey primaryPubKey =
+        encryptor.getPublicKey(CrumblesLogsEncryptor.PREFERENCE_PRIMARY_KEY_ALIAS);
+    byte[] iv = new byte[12];
+    SecretKey symKey = KeyGenerator.getInstance("AES").generateKey();
+    Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+    aes.init(Cipher.ENCRYPT_MODE, symKey, new GCMParameterSpec(128, iv));
+    byte[] ct = aes.doFinal(plaintext);
+    String ivB64 = Base64.getEncoder().encodeToString(iv);
+    String ctB64 = Base64.getEncoder().encodeToString(ct);
+
+    Cipher rsaOaep = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+    rsaOaep.init(
+        Cipher.WRAP_MODE,
+        primaryPubKey,
+        new OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSpecified.DEFAULT));
+    String oaepKeyB64 = Base64.getEncoder().encodeToString(rsaOaep.wrap(symKey));
+    assertThat(encryptor.decryptData(ivB64 + ":" + oaepKeyB64 + ":" + ctB64)).isEqualTo(plaintext);
+
+    Cipher rsaPkcs1 = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+    rsaPkcs1.init(Cipher.WRAP_MODE, primaryPubKey);
+    String pkcs1KeyB64 = Base64.getEncoder().encodeToString(rsaPkcs1.wrap(symKey));
+    assertThat(encryptor.decryptData(ivB64 + ":" + pkcs1KeyB64 + ":" + ctB64)).isEqualTo(plaintext);
   }
 }

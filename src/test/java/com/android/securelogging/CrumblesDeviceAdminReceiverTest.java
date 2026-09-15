@@ -60,11 +60,14 @@ import java.nio.file.Files;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.Security;
+import java.security.spec.MGF1ParameterSpec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import javax.crypto.Cipher;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -232,10 +235,12 @@ public final class CrumblesDeviceAdminReceiverTest {
         LogBatch.parseFrom(
             Files.readAllBytes(out[0].toPath()), ExtensionRegistryLite.getEmptyRegistry());
     Cipher rsa = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
-    rsa.init(Cipher.UNWRAP_MODE, ngo.getPrivate());
+    OAEPParameterSpec oaepSpec =
+        new OAEPParameterSpec(
+            "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT);
+    rsa.init(Cipher.UNWRAP_MODE, ngo.getPrivate(), oaepSpec);
     rsa.unwrap(batch.getKey().getEncryptedSymmetricKey().toByteArray(), "AES", Cipher.SECRET_KEY);
   }
-
 
   /** Tests the private getSecurityEventType helper method directly using reflection. */
   @Test
@@ -296,7 +301,8 @@ public final class CrumblesDeviceAdminReceiverTest {
   }
 
   @Test
-  public void onProfileProvisioningComplete_whenDeviceOwnerAndFlagTrue_enablesSecurityAndNetworkLogging() {
+  public void
+      onProfileProvisioningComplete_whenDeviceOwnerAndFlagTrue_enablesSecurityAndNetworkLogging() {
     Context realContext = ApplicationProvider.getApplicationContext();
     DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
     when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);

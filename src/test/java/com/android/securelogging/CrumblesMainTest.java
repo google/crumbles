@@ -669,8 +669,7 @@ public class CrumblesMainTest {
     // Then: Toast shows decryption error.
     String latestToast = ShadowToast.getTextOfLatestToast();
     assertThat(latestToast).isNotNull();
-    assertThat(latestToast)
-        .contains("Unexpected error with undecryptable.bin: " + decryptionErrorMessage);
+    assertThat(latestToast).isEqualTo("Failed to decrypt undecryptable.bin.");
     // And: No new activity started.
     scenario.onActivity(
         activity -> assertThat(shadowOf(activity).getNextStartedActivity()).isNull());
