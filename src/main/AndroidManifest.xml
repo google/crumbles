@@ -97,9 +97,12 @@
                 <action android:name="android.app.action.NETWORK_LOGS_AVAILABLE" />
             </intent-filter>
         </receiver>
+    <!-- Not exported. The chooser result is delivered through a
+         PendingIntent created by this app, so the receiver never needs
+         to be reachable by other applications. -->
     <receiver
         android:name=".CrumblesShareResultReceiver"
-        android:exported="true" />
+        android:exported="false" />
   </application>
     <queries>
         <intent>

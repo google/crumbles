@@ -22,6 +22,8 @@ import static org.junit.Assert.assertTrue;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
@@ -171,5 +173,20 @@ public class CrumblesShareResultReceiverTest {
     List<CrumblesAuditEvent> events =
         CrumblesAppAuditLogger.getInstance(context).getAllPersistedEventsForDisplay();
     assertThat(events).isEmpty();
+  }
+
+  @Test
+  public void receiver_isNotExportedToOtherApplications()
+      throws PackageManager.NameNotFoundException {
+    // Given: the receiver as declared in the application manifest.
+    ComponentName component = new ComponentName(context, CrumblesShareResultReceiver.class);
+
+    // When: its declaration is read back from the package manager.
+    ActivityInfo receiverInfo =
+        context.getPackageManager().getReceiverInfo(component, /* flags= */ 0);
+
+    // Then: it is not reachable by other applications, so no other app can mark
+    // log files as sent and cause them to be deleted before they are uploaded.
+    assertThat(receiverInfo.exported).isFalse();
   }
 }
