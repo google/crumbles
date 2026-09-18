@@ -236,14 +236,15 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     NotificationChannel channel =
         nm.getNotificationChannel(CrumblesConstants.NOTIFICATION_CHANNEL_ID);
     assertThat(channel).isNotNull();
-    assertThat(channel.getDescription())
-        .isEqualTo("Status notifications for encrypted log uploads.");
+    assertThat(channel.getDescription()).isEqualTo("Status updates for background sync tasks.");
+    assertThat(channel.getLockscreenVisibility()).isEqualTo(Notification.VISIBILITY_SECRET);
 
     Notification notification =
         snm.getNotification(CrumblesSendAndMarkProcessingWorker.UPLOAD_NOTIFICATION_ID);
     assertThat(notification).isNotNull();
     assertThat(notification.flags & Notification.FLAG_AUTO_CANCEL)
         .isEqualTo(Notification.FLAG_AUTO_CANCEL);
+    assertThat(notification.visibility).isEqualTo(Notification.VISIBILITY_SECRET);
 
     assertThat(notification.contentIntent).isNotNull();
     Intent savedIntent = Shadows.shadowOf(notification.contentIntent).getSavedIntent();

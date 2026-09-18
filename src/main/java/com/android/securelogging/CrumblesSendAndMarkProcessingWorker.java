@@ -16,6 +16,7 @@
 
 package com.android.securelogging;
 
+import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -311,9 +312,12 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     NotificationChannel channel =
         new NotificationChannel(
             CrumblesConstants.NOTIFICATION_CHANNEL_ID,
-            "Log Upload Notifications",
+            "Background sync",
             NotificationManager.IMPORTANCE_DEFAULT);
-    channel.setDescription("Status notifications for encrypted log uploads.");
+    channel.setDescription("Status updates for background sync tasks.");
+    // Keep the content off the lock screen: revealing that the device collects and exports
+    // security logs endangers at-risk users.
+    channel.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
 
     NotificationManagerCompat.from(context).createNotificationChannel(channel);
   }
@@ -341,6 +345,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
             .setContentText(content)
             .setPriority(
                 isError ? NotificationCompat.PRIORITY_HIGH : NotificationCompat.PRIORITY_DEFAULT)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true);
 
