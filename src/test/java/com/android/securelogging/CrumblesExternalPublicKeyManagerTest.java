@@ -195,4 +195,67 @@ public final class CrumblesExternalPublicKeyManagerTest {
       Security.insertProviderAt(fakeProviderInstance, 1);
     }
   }
+  @Test
+  public void getActiveExternalPublicKey_whenPayloadCopiedToAnotherEntry_returnsNull()
+      throws Exception {
+    // Given: a legitimately saved active key.
+    publicKeyManager.saveActiveExternalPublicKey(testPublicKey);
+    UserKeyPreferences prefs = testDataStore.getDataAsync().get();
+    EncryptedPayload savedPayload =
+        prefs.getExternalPublicKeysOrThrow(prefs.getActiveKeyId());
+
+    // When: someone with file access copies that payload under a different entry and repoints the
+    // active key at it.
+    testDataStore
+        .updateDataAsync(
+            p ->
+                p.toBuilder()
+                    .putExternalPublicKeys("substituted-entry", savedPayload)
+                    .setActiveKeyId("substituted-entry")
+                    .build())
+        .get();
+
+    // Then: the payload no longer matches the entry it was read from, so it is rejected.
+    assertThat(publicKeyManager.getActiveExternalPublicKey()).isNull();
+  }
+
+  @Test
+  public void getExternalReEncryptPublicKeys_whenPayloadCameFromTheOtherMap_skipsIt()
+      throws Exception {
+    // Given: a key saved as the active external key.
+    publicKeyManager.saveActiveExternalPublicKey(testPublicKey);
+    UserKeyPreferences prefs = testDataStore.getDataAsync().get();
+    String keyId = prefs.getActiveKeyId();
+    EncryptedPayload savedPayload = prefs.getExternalPublicKeysOrThrow(keyId);
+
+    // When: its payload is copied into the re-encryption key map under the same key id.
+    testDataStore
+        .updateDataAsync(p -> p.toBuilder().putReEncryptPublicKeys(keyId, savedPayload).build())
+        .get();
+
+    // Then: the binding distinguishes the two maps, so the moved entry is not accepted.
+    assertThat(publicKeyManager.getExternalReEncryptPublicKeys()).isEmpty();
+  }
+
+  @Test
+  public void getActiveExternalPublicKey_whenEntryPredatesBinding_isStillReadable()
+      throws Exception {
+    // Given: an entry sealed the way older releases sealed it, with no binding to its entry id.
+    EncryptedPayload legacyPayload =
+        cryptoManager.encryptDataStoreEntry(testPublicKey.getEncoded());
+    String keyId = CrumblesLogsEncryptor.getPublicKeyHash(testPublicKey);
+    testDataStore
+        .updateDataAsync(
+            p ->
+                p.toBuilder()
+                    .putExternalPublicKeys(keyId, legacyPayload)
+                    .setActiveKeyId(keyId)
+                    .build())
+        .get();
+
+    // Then: an existing installation keeps working after the upgrade.
+    PublicKey retrievedKey = publicKeyManager.getActiveExternalPublicKey();
+    assertThat(retrievedKey).isNotNull();
+    assertThat(retrievedKey.getEncoded()).isEqualTo(testPublicKey.getEncoded());
+  }
 }

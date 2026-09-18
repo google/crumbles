@@ -28,10 +28,16 @@ import java.security.PublicKey;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /** Manages the storage and retrieval of external public keys using encrypted GuavaDataStore. */
 public class CrumblesExternalPublicKeyManager {
   private static final String TAG = "CrumblesExternalPubKeyManager";
+
+  // Prefixes that bind a stored payload to the map it belongs to as well as to its key, so that an
+  // entry cannot be moved between the two maps or between keys within one map.
+  private static final String EXTERNAL_KEY_ENTRY_PREFIX = "external_public_keys/";
+  private static final String RE_ENCRYPT_KEY_ENTRY_PREFIX = "re_encrypt_public_keys/";
 
   private final GuavaDataStore<UserKeyPreferences> dataStore;
   private final CrumblesLogsEncryptor cryptoManager;
@@ -89,7 +95,9 @@ public class CrumblesExternalPublicKeyManager {
     }
     try {
       String keyId = CrumblesLogsEncryptor.getPublicKeyHash(publicKey);
-      EncryptedPayload payload = cryptoManager.encryptDataStoreEntry(publicKey.getEncoded());
+      EncryptedPayload payload =
+          cryptoManager.encryptDataStoreEntry(
+              publicKey.getEncoded(), EXTERNAL_KEY_ENTRY_PREFIX + keyId);
 
       Futures.getChecked(
           dataStore.updateDataAsync(
@@ -127,7 +135,8 @@ public class CrumblesExternalPublicKeyManager {
         return null;
       }
 
-      byte[] decryptedBytes = cryptoManager.decryptData(payload);
+      byte[] decryptedBytes =
+          cryptoManager.decryptDataStoreEntry(payload, EXTERNAL_KEY_ENTRY_PREFIX + activeKeyId);
       KeyFactory kf = KeyFactory.getInstance("RSA");
       return kf.generatePublic(new X509EncodedKeySpec(decryptedBytes));
     } catch (Exception e) {
@@ -144,7 +153,9 @@ public class CrumblesExternalPublicKeyManager {
   public void saveReEncryptPublicKey(PublicKey publicKey) throws CrumblesKeysException {
     try {
       String keyId = CrumblesLogsEncryptor.getPublicKeyHash(publicKey);
-      EncryptedPayload payload = cryptoManager.encryptDataStoreEntry(publicKey.getEncoded());
+      EncryptedPayload payload =
+          cryptoManager.encryptDataStoreEntry(
+              publicKey.getEncoded(), RE_ENCRYPT_KEY_ENTRY_PREFIX + keyId);
 
       Futures.getChecked(
           dataStore.updateDataAsync(
@@ -167,9 +178,12 @@ public class CrumblesExternalPublicKeyManager {
     try {
       UserKeyPreferences prefs =
           Futures.getChecked(dataStore.getDataAsync(), CrumblesKeysException.class);
-      for (EncryptedPayload payload : prefs.getReEncryptPublicKeysMap().values()) {
+      for (Map.Entry<String, EncryptedPayload> entry :
+          prefs.getReEncryptPublicKeysMap().entrySet()) {
         try {
-          byte[] decryptedBytes = cryptoManager.decryptData(payload);
+          byte[] decryptedBytes =
+              cryptoManager.decryptDataStoreEntry(
+                  entry.getValue(), RE_ENCRYPT_KEY_ENTRY_PREFIX + entry.getKey());
           KeyFactory kf = KeyFactory.getInstance("RSA");
           keys.add(kf.generatePublic(new X509EncodedKeySpec(decryptedBytes)));
         } catch (Exception e) {

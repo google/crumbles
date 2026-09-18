@@ -18,6 +18,7 @@ package com.android.securelogging;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static java.lang.Math.min;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import android.content.Context;
 import android.security.keystore.KeyGenParameterSpec;
@@ -779,11 +780,30 @@ public class CrumblesLogsEncryptor {
    * @throws CrumblesKeysException If encryption fails.
    */
   public EncryptedPayload encryptDataStoreEntry(byte[] plaintext) throws CrumblesKeysException {
+    return encryptDataStoreEntry(plaintext, /* entryId= */ null);
+  }
+
+  /**
+   * Encrypts a data store entry and binds it to the entry it is stored under.
+   *
+   * <p>The entry identifier is supplied as AES-GCM associated data. Without it, sealed entries are
+   * interchangeable: anyone able to write the preferences file could move the payload of one entry
+   * into another and the app would accept it, which would let an attacker substitute the key that
+   * future log batches are encrypted to.
+   *
+   * @param plaintext the plaintext byte array to encrypt
+   * @param entryId identifier of the entry this payload belongs to, or {@code null} to seal without
+   *     binding
+   * @return the encrypted payload
+   * @throws CrumblesKeysException if encryption fails
+   */
+  public EncryptedPayload encryptDataStoreEntry(byte[] plaintext, @Nullable String entryId)
+      throws CrumblesKeysException {
     PublicKey publicKey = getPublicKey(PREFERENCE_PRIMARY_KEY_ALIAS);
     if (publicKey == null) {
       publicKey = generateKeyPair(PREFERENCE_PRIMARY_KEY_ALIAS, false).getPublic();
     }
-    EncryptedData encData = encryptData(plaintext, publicKey);
+    EncryptedData encData = encryptData(plaintext, entryIdAsAssociatedData(entryId), publicKey);
     return EncryptedPayload.newBuilder()
         .setCiphertext(ByteString.copyFrom(encData.ciphertext))
         .setWrappedEncryptionKey(ByteString.copyFrom(encData.encryptedSymmetricKey))
@@ -800,6 +820,40 @@ public class CrumblesLogsEncryptor {
    * @throws CrumblesKeysException If decryption fails due to key errors or data tampering.
    */
   public byte[] decryptData(EncryptedPayload payload) throws CrumblesKeysException {
+    return decryptDataStoreEntryWithAad(payload, /* aad= */ null);
+  }
+
+  /**
+   * Decrypts a data store entry that was sealed for {@code entryId}.
+   *
+   * <p>Entries written before entry binding was introduced carry no associated data. Those are
+   * still accepted so that existing installations keep working, but they offer no guarantee that
+   * the payload belongs to the entry it was read from.
+   *
+   * @param payload the encrypted payload to decrypt
+   * @param entryId identifier of the entry the payload was read from
+   * @return the original plaintext data
+   * @throws CrumblesKeysException if decryption fails with and without the binding
+   */
+  public byte[] decryptDataStoreEntry(EncryptedPayload payload, String entryId)
+      throws CrumblesKeysException {
+    try {
+      return decryptDataStoreEntryWithAad(payload, entryIdAsAssociatedData(entryId));
+    } catch (CrumblesKeysException e) {
+      Log.w(
+          TAG,
+          "Entry is not bound to its identifier; assuming it predates entry binding.");
+      return decryptDataStoreEntryWithAad(payload, /* aad= */ null);
+    }
+  }
+
+  @Nullable
+  private static byte[] entryIdAsAssociatedData(@Nullable String entryId) {
+    return entryId == null ? null : entryId.getBytes(UTF_8);
+  }
+
+  private byte[] decryptDataStoreEntryWithAad(EncryptedPayload payload, @Nullable byte[] aad)
+      throws CrumblesKeysException {
     try {
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
@@ -816,7 +870,7 @@ public class CrumblesLogsEncryptor {
       byte[] ciphertext = payload.getCiphertext().toByteArray();
       IvParameterSpec iv = new IvParameterSpec(payload.getInitializationVector().toByteArray());
 
-      return decryptUsingAes256Gcm(aesKeySpec, iv, /* aad= */ null, ciphertext);
+      return decryptUsingAes256Gcm(aesKeySpec, iv, aad, ciphertext);
     } catch (Exception e) {
       throw new CrumblesKeysException("Failed to perform AES-GCM decryption.", e);
     }
