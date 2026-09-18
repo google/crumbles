@@ -48,6 +48,12 @@ public final class CrumblesConstants {
   public static final String PREFS_NAME = "CrumblesPrefs";
   public static final String PREF_UPLOAD_DESTINATION_URI = "uploadDestinationUri";
 
+  /** Whether this device fell back from RSA-OAEP padding to PKCS#1 v1.5 padding. */
+  public static final String PREF_OAEP_PADDING_DISABLED = "oaepPaddingDisabled";
+
+  /** Whether the one-time hardware RSA-OAEP capability probe has already run. */
+  public static final String PREF_OAEP_PROBED = "oaepProbed";
+
   public static final String ZXING_PACKAGE_NAME = "com.google.zxing.client.android";
 
   public static final int CAMERA_PERMISSION_REQUEST_CODE = 103;

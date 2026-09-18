@@ -187,10 +187,15 @@ public class CrumblesMainTest {
   public void onCreate_initializesUIElements() {
     // When: The activity is launched.
     try (ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true)) {
-      // Then: Verify essential UI elements are present.
+      // Then: Verify essential UI elements are present, indicating successful initialization.
       scenario.onActivity(
           activity -> {
             // A NullPointerException would occur if a view is not found, failing the test.
+            assertThat(
+                    activity
+                        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+                        .getBoolean(CrumblesConstants.PREF_OAEP_PROBED, false))
+                .isTrue();
             assertThat((Object) activity.findViewById(R.id.material_switch)).isNotNull();
             assertThat((Object) activity.findViewById(R.id.encryption_key_status_textview))
                 .isNotNull();

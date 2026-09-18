@@ -21,12 +21,17 @@ import static java.lang.Math.min;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.os.Handler;
+import android.os.Looper;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.security.keystore.UserNotAuthenticatedException;
 import android.util.Log;
+import android.widget.Toast;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
@@ -49,6 +54,7 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -64,6 +70,7 @@ import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.RSAKeyGenParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Objects;
 import javax.crypto.Cipher;
@@ -102,6 +109,135 @@ public class CrumblesLogsEncryptor {
       new OAEPParameterSpec(
           "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT);
   private static final String CIPHER_MODE_ASYM_PKCS1 = "RSA/ECB/PKCS1Padding";
+
+  private static final String PROBE_KEY_ALIAS = "_oaep_probe_key_";
+  private static final String OAEP_UNSUPPORTED_MESSAGE =
+      "OAEP padding is not supported on this device. Defaulting to standard PKCS#1 padding.";
+  private static volatile boolean isOaepPaddingDisabledInMemory = false;
+  private static volatile Context applicationContext = null;
+
+  /** Caches the application {@link Context}, or clears it when {@code context} is {@code null}. */
+  public static void setApplicationContext(@Nullable Context context) {
+    applicationContext = context != null ? context.getApplicationContext() : null;
+  }
+
+  @Nullable
+  private static Context cacheAndResolveContext(@Nullable Context context) {
+    if (context != null) {
+      setApplicationContext(context);
+    }
+    return applicationContext;
+  }
+
+  private static boolean probeOaepSupport() {
+    try {
+      KeyPairGenerator keyPairGenerator =
+          KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, ANDROID_KEYSTORE_PROVIDER);
+      keyPairGenerator.initialize(
+          new KeyGenParameterSpec.Builder(
+                  PROBE_KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+              .setKeySize(ASYM_BITS)
+              .setDigests(KeyProperties.DIGEST_SHA256)
+              .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
+              .build());
+      KeyPair probeKeyPair = keyPairGenerator.generateKeyPair();
+      SecretKey probeKey = generateSecretKey();
+      byte[] wrapped = wrapAesKey(probeKeyPair.getPublic(), probeKey, /* oaepDisabled= */ false);
+      SecretKey unwrapped = unwrapAesKey(probeKeyPair.getPrivate(), wrapped);
+      return Arrays.equals(probeKey.getEncoded(), unwrapped.getEncoded());
+    } catch (GeneralSecurityException | CrumblesKeysException | RuntimeException e) {
+      Log.w(TAG, "OAEP probe failed on this device.", e);
+      return false;
+    } finally {
+      deleteExistingKeyPair(PROBE_KEY_ALIAS);
+    }
+  }
+
+  private static void communicateOaepUnsupported(@Nullable Context context) {
+    if (context == null) {
+      return;
+    }
+    CrumblesAppAuditLogger.getInstance(context)
+        .logEvent("OAEP_UNSUPPORTED", "OAEP unsupported on this device; defaulted to PKCS#1.");
+    new Handler(Looper.getMainLooper())
+        .post(() -> Toast.makeText(context, OAEP_UNSUPPORTED_MESSAGE, Toast.LENGTH_LONG).show());
+  }
+
+  /**
+   * Returns whether RSA-OAEP padding is disabled on the current device.
+   *
+   * <p>"Unsupported" means the Keystore lacks functional OAEP unwrapping, verified once via {@link
+   * #probeOaepSupport()}. When unsupported, or when decryption fails, OAEP becomes "disabled" in
+   * {@link SharedPreferences}, permanently falling back to {@code RSA/ECB/PKCS1Padding}.
+   *
+   * @param context the Android context to access preferences, or {@code null} for cached context
+   * @return {@code true} if OAEP padding is disabled on this device; {@code false} if enabled
+   */
+  @CanIgnoreReturnValue
+  public static boolean isOaepPaddingDisabled(@Nullable Context context) {
+    Context resolvedContext = cacheAndResolveContext(context);
+    if (resolvedContext == null) {
+      return isOaepPaddingDisabledInMemory;
+    }
+    SharedPreferences preferences =
+        resolvedContext.getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE);
+    if (!preferences.getBoolean(CrumblesConstants.PREF_OAEP_PROBED, false)) {
+      probeAndEnableOaepPadding(resolvedContext);
+      return isOaepPaddingDisabledInMemory;
+    }
+    isOaepPaddingDisabledInMemory =
+        preferences.getBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, false);
+    return isOaepPaddingDisabledInMemory;
+  }
+
+  private static KeyEncryptionType getKeyEncryptionType(@Nullable Context context) {
+    return isOaepPaddingDisabled(context)
+        ? KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC
+        : KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256;
+  }
+
+  /**
+   * Enables RSA-OAEP padding if this device supports it, notifying the user via a toast and an
+   * audit log entry otherwise, and persists the outcome.
+   *
+   * @param context the Android context to persist preferences, or {@code null} for cached context
+   */
+  public static void probeAndEnableOaepPadding(@Nullable Context context) {
+    Context resolvedContext = cacheAndResolveContext(context);
+    boolean supported = probeOaepSupport();
+    if (!supported) {
+      communicateOaepUnsupported(resolvedContext);
+    }
+    persistOaepPaddingDisabled(resolvedContext, !supported);
+  }
+
+  /** Disables RSA-OAEP padding on this device, permanently falling back to PKCS#1 v1.5 padding. */
+  public static void disableOaepPadding(@Nullable Context context) {
+    persistOaepPaddingDisabled(cacheAndResolveContext(context), /* disabled= */ true);
+  }
+
+  private static void persistOaepPaddingDisabled(@Nullable Context context, boolean disabled) {
+    isOaepPaddingDisabledInMemory = disabled;
+    if (context == null) {
+      return;
+    }
+    context
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean(CrumblesConstants.PREF_OAEP_PROBED, true)
+        .putBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, disabled)
+        .apply();
+  }
+
+  private void fallBackToPkcs1PaddingOnDevice() {
+    Log.w(TAG, "OAEP decryption failed; falling back to PKCS#1 v1.5 padding on device.");
+    disableOaepPadding(this.context);
+    try {
+      generateKeyPair(KEY_ALIAS, /* requireUserAuthentication= */ true);
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to re-generate Keystore key pair with PKCS#1 padding.", e);
+    }
+  }
 
   private static final String ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore";
 
@@ -234,11 +370,15 @@ public class CrumblesLogsEncryptor {
       Log.d(TAG, "Generating new RSA key pair into Android Keystore with alias: " + keyAlias);
       KeyPairGenerator keyPairGenerator =
           KeyPairGenerator.getInstance(ASYM_ALGORITHM, ANDROID_KEYSTORE_PROVIDER);
+      boolean oaepDisabled = keyAlias.equals(KEY_ALIAS) && isOaepPaddingDisabled(this.context);
       KeyGenParameterSpec.Builder specBuilder =
           new KeyGenParameterSpec.Builder(
                   keyAlias, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
               .setKeySize(ASYM_BITS)
-              .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
+              .setEncryptionPaddings(
+                  oaepDisabled
+                      ? KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1
+                      : KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
               .setDigests(KeyProperties.DIGEST_SHA256)
               .setUserAuthenticationRequired(requireUserAuthentication)
               .setUserAuthenticationValidityDurationSeconds((int) authValidityDuration.toSeconds());
@@ -256,7 +396,7 @@ public class CrumblesLogsEncryptor {
     deleteExistingKeyPair(KEY_ALIAS);
   }
 
-  private void deleteExistingKeyPair(String keyAlias) {
+  private static void deleteExistingKeyPair(String keyAlias) {
     try {
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
@@ -397,7 +537,7 @@ public class CrumblesLogsEncryptor {
     SecretKey symKey = generateSecretKey();
     IvParameterSpec generatedIv = generateAesGcmInitializationVector();
     byte[] encryptedBytes = encryptDataWithSymKey(symKey, generatedIv, aad, data);
-    byte[] encSymKey = wrapAesKey(encryptionKey, symKey);
+    byte[] encSymKey = wrapAesKey(encryptionKey, symKey, isOaepPaddingDisabled(this.context));
     return new EncryptedData(encryptedBytes, encSymKey, generatedIv.getIV());
   }
 
@@ -444,8 +584,8 @@ public class CrumblesLogsEncryptor {
 
       LogMetadata logMetadata =
           assembleMetadata(plainLogsBytes.length + GCM_TAG_LEN_BYTES, deviceId);
-      byte[] aad =
-          computeAssociatedData(logMetadata, KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+      KeyEncryptionType keyEncryptionType = getKeyEncryptionType(context);
+      byte[] aad = computeAssociatedData(logMetadata, keyEncryptionType);
 
       if (publicKey != null) {
         encryptedData = encryptData(plainLogsBytes, aad, publicKey);
@@ -460,7 +600,8 @@ public class CrumblesLogsEncryptor {
           encryptedData.ciphertext,
           encryptedData.encryptedSymmetricKey,
           encryptedData.initializationVector,
-          logMetadata);
+          logMetadata,
+          keyEncryptionType);
     } catch (CrumblesKeysException | RuntimeException e) {
       Log.e(TAG, "Unexpected runtime error during encryption process.", e);
       throw new CrumblesLogsEncryptionException(
@@ -478,6 +619,27 @@ public class CrumblesLogsEncryptor {
    */
   @CanIgnoreReturnValue
   public byte[] decryptLogs(LogBatch logBatch)
+      throws CrumblesKeysException, UserNotAuthenticatedException {
+    return decryptLogsBytes(logBatch);
+  }
+
+  /**
+   * Decrypts an encrypted {@link LogBatch}, disabling OAEP on this device if unwrapping fails.
+   *
+   * @param context the Android context used to persist fallback state and notify the user
+   * @param logBatch the encrypted log batch to decrypt
+   * @return the decrypted plaintext log bytes
+   * @throws CrumblesKeysException if the Keystore key cannot be loaded or decryption fails
+   * @throws UserNotAuthenticatedException if the user must first authenticate
+   */
+  @CanIgnoreReturnValue
+  public byte[] decryptLogs(Context context, LogBatch logBatch)
+      throws CrumblesKeysException, UserNotAuthenticatedException {
+    setApplicationContext(context);
+    return decryptLogsBytes(logBatch);
+  }
+
+  private byte[] decryptLogsBytes(LogBatch logBatch)
       throws CrumblesKeysException, UserNotAuthenticatedException {
     if (!doesPrivateKeyExist()) {
       throw new CrumblesKeysException(
@@ -525,6 +687,10 @@ public class CrumblesLogsEncryptor {
       if (e.getCause() instanceof UserNotAuthenticatedException) {
         throw (UserNotAuthenticatedException) e.getCause();
       }
+      if (logBatch.getKey().getKeyEncryptionType()
+          == KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256) {
+        fallBackToPkcs1PaddingOnDevice();
+      }
       throw new CrumblesLogsDecryptionException(
           "A cryptographic error occurred during log decryption.", e);
     } catch (RuntimeException e) {
@@ -570,11 +736,18 @@ public class CrumblesLogsEncryptor {
     }
   }
 
-  private static byte[] wrapAesKey(PublicKey publicKey, SecretKey symmetricKey)
+  private static byte[] wrapAesKey(
+      PublicKey publicKey, SecretKey symmetricKey, boolean oaepDisabled)
       throws CrumblesKeysException {
     try {
-      Cipher cipher = Cipher.getInstance(CIPHER_MODE_ASYM);
-      cipher.init(Cipher.WRAP_MODE, publicKey, OAEP_SPEC);
+      Cipher cipher;
+      if (oaepDisabled) {
+        cipher = Cipher.getInstance(CIPHER_MODE_ASYM_PKCS1);
+        cipher.init(Cipher.WRAP_MODE, publicKey);
+      } else {
+        cipher = Cipher.getInstance(CIPHER_MODE_ASYM);
+        cipher.init(Cipher.WRAP_MODE, publicKey, OAEP_SPEC);
+      }
       return cipher.wrap(symmetricKey);
     } catch (Exception e) {
       throw new CrumblesKeysException("Failed to wrap AES key with public key.", e);
@@ -707,7 +880,7 @@ public class CrumblesLogsEncryptor {
         cipherSymKeyBytes,
         cipherIvBytes,
         logMetadata,
-        KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+        getKeyEncryptionType(/* context= */ null));
   }
 
   /**
@@ -749,7 +922,8 @@ public class CrumblesLogsEncryptor {
         encryptedLogsBytes,
         cipherSymKeyBytes,
         cipherIvBytes,
-        CrumblesDeviceIdManager.getDeviceId(context));
+        assembleMetadata(encryptedLogsBytes.length, CrumblesDeviceIdManager.getDeviceId(context)),
+        getKeyEncryptionType(context));
   }
 
   /**

@@ -131,6 +131,8 @@ public class CrumblesMain extends FragmentActivity {
   public void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
     setContentView(R.layout.crumbles_main);
+    // Probe OAEP padding capability on first launch and initialize application context.
+    CrumblesLogsEncryptor.isOaepPaddingDisabled(this);
     initDpm();
 
     // Field initialization is now handled by the lazy getter.
