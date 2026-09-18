@@ -175,7 +175,8 @@ public class CrumblesQrScannerActivity extends AppCompatActivity {
 
     String rawValue = barcode.getRawValue();
     if (rawValue != null) {
-      Log.d(TAG, "QR Code detected: " + rawValue);
+      // Never log the scanned payload: the same scanner is used to import private keys.
+      Log.d(TAG, "QR Code detected, payload length: " + rawValue.length());
       Intent resultIntent = new Intent();
       resultIntent.putExtra(CrumblesConstants.SCAN_RESULT_EXTRA, rawValue);
       setResult(Activity.RESULT_OK, resultIntent);

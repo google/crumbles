@@ -37,6 +37,7 @@ import org.junit.runner.RunWith;
 import org.mockito.MockitoAnnotations;
 import org.robolectric.annotation.Config;
 import org.robolectric.shadows.ShadowActivity;
+import org.robolectric.shadows.ShadowLog;
 import org.robolectric.shadows.ShadowLooper;
 
 /** Unit tests for {@link CrumblesQrScannerActivity}. */
@@ -144,6 +145,33 @@ public class CrumblesQrScannerActivityTest {
           Intent resultIntent = shadowActivity.getResultIntent();
           assertThat(resultIntent.getStringExtra(CrumblesConstants.SCAN_RESULT_EXTRA))
               .isEqualTo(expectedQrValue);
+        });
+  }
+
+  @Test
+  public void handleBarcodeFound_withValidBarcode_doesNotLogScannedPayload() {
+    // Given: The camera permission is granted and the activity is launched.
+    shadowOf(appContext).grantPermissions(Manifest.permission.CAMERA);
+    launchActivity();
+
+    // And: A mock Barcode carries sensitive key material, as in the re-encryption flow.
+    Barcode mockBarcode = mock(Barcode.class);
+    String secretMarker = "MIIBOgIBAAJBAKj";
+    when(mockBarcode.getRawValue())
+        .thenReturn("-----BEGIN PRIVATE KEY-----" + secretMarker + "-----END PRIVATE KEY-----");
+
+    scenario.onActivity(
+        activity -> {
+          // When: The activity's handler method is called directly with the mock barcode.
+          activity.handleBarcodeFound(mockBarcode);
+          ShadowLooper.idleMainLooper();
+
+          // Then: None of the emitted log messages leaks the scanned payload.
+          StringBuilder loggedMessages = new StringBuilder();
+          for (ShadowLog.LogItem logItem : ShadowLog.getLogs()) {
+            loggedMessages.append(logItem.msg).append('\n');
+          }
+          assertThat(loggedMessages.toString()).doesNotContain(secretMarker);
         });
   }
 }
