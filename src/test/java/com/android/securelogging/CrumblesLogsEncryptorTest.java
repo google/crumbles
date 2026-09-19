@@ -532,6 +532,55 @@ public final class CrumblesLogsEncryptorTest {
   }
 
   @Test
+  public void getPublicKeyFingerprint_coversWholeDigestInLinesOfEightBytes() throws Exception {
+    PublicKey publicKey = generateTestExternalRsaKeyPair().getPublic();
+    byte[] digest = MessageDigest.getInstance("SHA-256").digest(publicKey.getEncoded());
+
+    String fingerprint = CrumblesLogsEncryptor.getPublicKeyFingerprint(publicKey);
+
+    // Every digest byte appears exactly once, in order, as two uppercase hex characters: a
+    // fingerprint that drops or reorders bytes would let a different key read as a match.
+    String hex = fingerprint.replace(":", "").replace("\n", "");
+    assertThat(hex).matches("[0-9A-F]+");
+    assertThat(hex).hasLength(digest.length * 2);
+    for (int i = 0; i < digest.length; i++) {
+      assertThat(Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16)).isEqualTo(digest[i] & 0xFF);
+    }
+    // ... laid out as lines of eight colon-separated bytes, so that the user can compare it
+    // against the value the recipient gave them out of band.
+    String[] lines = fingerprint.split("\n", -1);
+    assertThat(lines).hasLength(digest.length / 8);
+    for (String line : lines) {
+      assertThat(line.split(":", -1)).hasLength(8);
+    }
+  }
+
+  @Test
+  public void getPublicKeyFingerprint_whenKeyCannotBeEncoded_throws() {
+    PublicKey unencodableKey =
+        new PublicKey() {
+          @Override
+          public String getAlgorithm() {
+            return "RSA";
+          }
+
+          @Override
+          public String getFormat() {
+            return null;
+          }
+
+          @Override
+          public byte[] getEncoded() {
+            return null;
+          }
+        };
+
+    assertThrows(
+        CrumblesKeysException.class,
+        () -> CrumblesLogsEncryptor.getPublicKeyFingerprint(unencodableKey));
+  }
+
+  @Test
   public void publicKeyFromBase64_whenNull_returnsNull() throws Exception {
     PublicKey key = CrumblesLogsEncryptor.publicKeyFromBase64(null);
 

@@ -72,6 +72,7 @@ import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Locale;
 import java.util.Objects;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -103,6 +104,7 @@ public class CrumblesLogsEncryptor {
   private static final String CIPHER_MODE_ASYM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
   private static final int ASYM_BITS = 2048;
   private static final int MIN_RSA_MODULUS_BITS = 2048;
+  private static final int FINGERPRINT_BYTES_PER_LINE = 8;
   private static final int MAX_RSA_MODULUS_BITS = 4096;
   private static final BigInteger EXPECTED_RSA_PUBLIC_EXPONENT = RSAKeyGenParameterSpec.F4;
   private static final OAEPParameterSpec OAEP_SPEC =
@@ -1113,6 +1115,37 @@ public class CrumblesLogsEncryptor {
       Log.w(TAG, "Could not generate preview for external key", e);
     }
     return keyHash;
+  }
+
+  /**
+   * Returns the complete SHA-256 fingerprint of a public key, formatted for a person to compare
+   * against a value they obtained out of band.
+   *
+   * <p>{@link #getPublicKeyHash} truncates its digest and is only suitable as a short label or map
+   * key. Use this method instead wherever the user is being asked to decide whether to trust a key.
+   *
+   * @param key the public key to fingerprint
+   * @return colon-separated uppercase hex in lines of {@value #FINGERPRINT_BYTES_PER_LINE} bytes
+   * @throws CrumblesKeysException if the key cannot be encoded and digested
+   */
+  public static String getPublicKeyFingerprint(PublicKey key) throws CrumblesKeysException {
+    byte[] hashBytes;
+    try {
+      hashBytes = MessageDigest.getInstance("SHA-256").digest(key.getEncoded());
+    } catch (NoSuchAlgorithmException | RuntimeException e) {
+      throw new CrumblesKeysException("Could not compute the fingerprint of a public key.", e);
+    }
+    // The digest is wrapped into short colon-separated groups because the user is expected to read
+    // it against a value the recipient gave them out of band, digit by digit: an unbroken run of 64
+    // hex characters is impractical to compare that way, which is how a wrong key gets accepted.
+    StringBuilder fingerprint = new StringBuilder();
+    for (int i = 0; i < hashBytes.length; i++) {
+      if (i > 0) {
+        fingerprint.append(i % FINGERPRINT_BYTES_PER_LINE == 0 ? '\n' : ':');
+      }
+      fingerprint.append(String.format(Locale.ROOT, "%02X", hashBytes[i]));
+    }
+    return fingerprint.toString();
   }
 
   @Nullable

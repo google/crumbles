@@ -135,25 +135,69 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
           "Failed to decode public key from QR data; result was unexpectedly null.", null);
     }
 
-    confirmAndPerformKeyChange(
-        () -> {
-          try {
-            publicKeyManager.saveActiveExternalPublicKey(importedPublicKey);
-            CrumblesMain.getLogsEncryptorInstance()
-                .setExternalEncryptionPublicKey(importedPublicKey);
-            CrumblesAppAuditLogger.getInstance(this)
-                .logEvent("EXTERNAL_KEY_IMPORTED", "External public key imported via QR scan.");
-            Toast.makeText(
-                    this,
-                    getString(R.string.toast_external_key_imported_successfully),
-                    Toast.LENGTH_LONG)
-                .show();
-            finish();
-          } catch (CrumblesKeysException e) {
-            Log.e(TAG, "Failed to save imported key.", e);
-            showToast("Error importing key: " + e.getMessage());
-          }
-        });
+    confirmScannedKeyFingerprint(
+        importedPublicKey,
+        () -> confirmAndPerformKeyChange(() -> adoptScannedKey(importedPublicKey)));
+  }
+
+  /**
+   * Asks the user to compare the fingerprint of a scanned key against a value they obtained out of
+   * band, and runs {@code onVerified} only if they confirm the match.
+   *
+   * <p>A QR code is not an authenticated channel. Without this step, anyone who gets a single code
+   * in front of the user silently becomes the recipient of every log batch the device produces from
+   * then on.
+   *
+   * @param scannedPublicKey the key that was just scanned
+   * @param onVerified the action to run once the user confirms the fingerprint
+   */
+  private void confirmScannedKeyFingerprint(PublicKey scannedPublicKey, Runnable onVerified) {
+    String fingerprint;
+    try {
+      fingerprint = CrumblesLogsEncryptor.getPublicKeyFingerprint(scannedPublicKey);
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Could not compute the fingerprint of a scanned key.", e);
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              "EXTERNAL_KEY_IMPORT_REJECTED",
+              "Scanned key rejected because its fingerprint could not be computed.");
+      showToast(getString(R.string.toast_key_fingerprint_unavailable));
+      return;
+    }
+
+    new AlertDialog.Builder(this)
+        .setTitle(R.string.dialog_verify_key_fingerprint_title)
+        .setMessage(getString(R.string.dialog_verify_key_fingerprint_message, fingerprint))
+        .setCancelable(false)
+        .setPositiveButton(
+            R.string.dialog_verify_key_fingerprint_confirm, (dialog, which) -> onVerified.run())
+        .setNegativeButton(
+            R.string.dialog_verify_key_fingerprint_cancel,
+            (dialog, which) ->
+                CrumblesAppAuditLogger.getInstance(this)
+                    .logEvent(
+                        "EXTERNAL_KEY_IMPORT_REJECTED",
+                        "User did not confirm the fingerprint of a scanned key."))
+        .show();
+  }
+
+  /** Stores a scanned key as the active recipient key and makes it effective immediately. */
+  private void adoptScannedKey(PublicKey importedPublicKey) {
+    try {
+      publicKeyManager.saveActiveExternalPublicKey(importedPublicKey);
+      CrumblesMain.getLogsEncryptorInstance().setExternalEncryptionPublicKey(importedPublicKey);
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              "EXTERNAL_KEY_IMPORTED",
+              "External public key imported via QR scan after fingerprint confirmation.");
+      Toast.makeText(
+              this, getString(R.string.toast_external_key_imported_successfully), Toast.LENGTH_LONG)
+          .show();
+      finish();
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to save imported key.", e);
+      showToast("Error importing key: " + e.getMessage());
+    }
   }
 
   @Override

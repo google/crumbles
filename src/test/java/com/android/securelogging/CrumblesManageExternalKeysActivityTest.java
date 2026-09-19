@@ -32,6 +32,7 @@ import android.app.Application;
 import android.app.Dialog;
 import android.app.KeyguardManager;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.net.Uri;
 import android.security.keystore.UserNotAuthenticatedException;
@@ -84,6 +85,7 @@ public class CrumblesManageExternalKeysActivityTest {
   @Mock private CrumblesUriGenerator mockUriGenerator;
 
   private KeyPair testExternalKeyPair;
+  private PublicKey testPublicKey;
   private ActivityScenario<CrumblesManageExternalKeysActivity> scenario;
   private Context appContext;
 
@@ -119,6 +121,7 @@ public class CrumblesManageExternalKeysActivityTest {
     appContext.setTheme(R.style.Theme_AppCompat);
 
     testExternalKeyPair = generateTestRsaKeyPair();
+    testPublicKey = testExternalKeyPair.getPublic();
     // And: The static accessor for CrumblesLogsEncryptor in CrumblesMain is made to return our
     // mock.
     CrumblesMain.setLogsEncryptorInstanceForTest(mockLogsEncryptor);
@@ -851,5 +854,79 @@ public class CrumblesManageExternalKeysActivityTest {
     validFile.delete();
     txtFile.delete();
     sentFile.delete();
+  }
+
+  @Test
+  public void processScannedPublicKey_promptsForFingerprintAndDoesNotAdoptKeyYet()
+      throws Exception {
+    // Given: the activity is launched and a public key has been scanned.
+    launchActivity();
+    String scannedKeyBase64 = CrumblesLogsEncryptor.publicKeyToBase64(testPublicKey);
+
+    // When: the scan result is processed.
+    processScannedKey(scannedKeyBase64);
+
+    // Then: the user is asked to verify the fingerprint before anything is adopted.
+    AlertDialog dialog = getLatestAppCompatAlertDialog();
+    assertThat(dialog).isNotNull();
+    assertThat(dialog.isShowing()).isTrue();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any(PublicKey.class));
+    verify(mockLogsEncryptor, never()).setExternalEncryptionPublicKey(any(PublicKey.class));
+  }
+
+  @Test
+  public void processScannedPublicKey_whenFingerprintConfirmed_adoptsScannedKey() throws Exception {
+    // Given: a scanned key is awaiting fingerprint verification.
+    launchActivity();
+    processScannedKey(CrumblesLogsEncryptor.publicKeyToBase64(testPublicKey));
+
+    // When: the user confirms that the fingerprint matches the one they were given.
+    getLatestAppCompatAlertDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    // Then: the scanned key becomes the active recipient key, the adoption is recorded, and the
+    // screen reports the outcome and closes.
+    verify(mockPublicKeyManager).saveActiveExternalPublicKey(any(PublicKey.class));
+    verify(mockLogsEncryptor).setExternalEncryptionPublicKey(any(PublicKey.class));
+    verify(mockAuditLogger)
+        .logEvent(
+            "EXTERNAL_KEY_IMPORTED",
+            "External public key imported via QR scan after fingerprint confirmation.");
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(appContext.getString(R.string.toast_external_key_imported_successfully));
+    scenario.onActivity(activity -> assertThat(activity.isFinishing()).isTrue());
+  }
+
+  @Test
+  public void processScannedPublicKey_whenFingerprintRejected_leavesActiveKeyUnchanged()
+      throws Exception {
+    // Given: a scanned key is awaiting fingerprint verification.
+    launchActivity();
+    processScannedKey(CrumblesLogsEncryptor.publicKeyToBase64(testPublicKey));
+
+    // When: the user cannot match the fingerprint and cancels.
+    getLatestAppCompatAlertDialog().getButton(DialogInterface.BUTTON_NEGATIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    // Then: the key is discarded and the rejection is recorded.
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any(PublicKey.class));
+    verify(mockLogsEncryptor, never()).setExternalEncryptionPublicKey(any(PublicKey.class));
+    verify(mockAuditLogger)
+        .logEvent(
+            "EXTERNAL_KEY_IMPORT_REJECTED",
+            "User did not confirm the fingerprint of a scanned key.");
+  }
+
+  /** Feeds a Base64 public key through the QR scan result handler. */
+  private void processScannedKey(String scannedKeyBase64) {
+    scenario.onActivity(
+        activity -> {
+          try {
+            activity.processScannedPublicKeyInternal(scannedKeyBase64);
+          } catch (CrumblesKeysException e) {
+            throw new AssertionError("Processing a valid scanned key should not fail.", e);
+          }
+        });
+    ShadowLooper.idleMainLooper();
   }
 }
