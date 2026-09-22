@@ -62,7 +62,7 @@ import java.util.TimeZone;
  */
 public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   private static final String TAG = "[CrumblesDeviceAdminReceiver]";
-  @VisibleForTesting static final int DEFERRED_LOGS_NOTIFICATION_ID = 2001;
+  @VisibleForTesting static final int DEFERRED_LOGS_NOTIFICATION_ID = 2002;
   private DevicePolicyManager dpm;
   private ComponentName adminComponentName;
 
@@ -158,13 +158,17 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   // Suppress "MissingPermission" and "PendingIntentMutability" because notification permissions are
   // checked at runtime and PendingIntent.FLAG_IMMUTABLE is explicitly supplied.
   @SuppressWarnings({"MissingPermission", "PendingIntentMutability"})
-  private static void notifyLogRetrievalDeferred(Context context, String logType) {
+  private static void notifyLogRetrievalDeferred(Context context) {
     NotificationChannel channel =
         new NotificationChannel(
-            CrumblesConstants.NOTIFICATION_CHANNEL_ID,
-            "Crumbles Status Notifications",
+            CrumblesConstants.ACTION_NEEDED_NOTIFICATION_CHANNEL_ID,
+            context.getString(R.string.notification_channel_name_action_needed),
             NotificationManager.IMPORTANCE_HIGH);
-    channel.setDescription("Status notifications for Crumbles encryption and log retrieval.");
+    channel.setDescription(
+        context.getString(R.string.notification_channel_description_action_needed));
+    // Keep the content off the lock screen: revealing that the device collects security logs
+    // endangers at-risk users.
+    channel.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
     NotificationManagerCompat.from(context).createNotificationChannel(channel);
 
     Intent openIntent = new Intent(context, CrumblesMain.class);
@@ -177,15 +181,17 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
     Notification notification =
-        new NotificationCompat.Builder(context, CrumblesConstants.NOTIFICATION_CHANNEL_ID)
+        new NotificationCompat.Builder(
+                context, CrumblesConstants.ACTION_NEEDED_NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_error)
-            .setContentTitle("Crumbles Log Retrieval Deferred")
-            .setContentText(
-                logType
-                    + " logs available, but no active encryption key is configured. Tap to set up.")
+            .setContentTitle(context.getString(R.string.notification_title_action_needed))
+            .setContentText(context.getString(R.string.notification_text_action_needed))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
+            // Stay up until retrieval succeeds: a dismissed alert would leave the user believing
+            // logs are still being collected.
+            .setOngoing(true)
             .build();
 
     try {
@@ -208,9 +214,10 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
           .logEvent(
               "LOG_RETRIEVAL_DEFERRED",
               logType + " log retrieval deferred: no encryption key or storage ready.");
-      notifyLogRetrievalDeferred(context, logType);
+      notifyLogRetrievalDeferred(context);
       return Optional.empty();
     }
+    NotificationManagerCompat.from(context).cancel(DEFERRED_LOGS_NOTIFICATION_ID);
     return activeKey;
   }
 

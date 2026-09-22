@@ -26,6 +26,7 @@ public final class CrumblesConstants {
   public static final String ENCRYPTED_LOG_FILE_NAME = "crumbles_logs_encrypted_";
   public static final String PROCESSING_SUFFIX = "_processing.bin";
   public static final String NOTIFICATION_CHANNEL_ID = "email_log_channel";
+  public static final String ACTION_NEEDED_NOTIFICATION_CHANNEL_ID = "action_needed_channel";
   public static final String EXTRA_FILES = "files";
   public static final Duration MAX_PROCESSING_FILE_AGE = Duration.ofDays(7);
 

@@ -401,23 +401,30 @@ public final class CrumblesDeviceAdminReceiverTest {
     verify(mockDpm, never()).setNetworkLoggingEnabled(any(ComponentName.class), eq(true));
   }
 
+  private static StatusBarNotification findDeferredLogsNotification(Context context) {
+    NotificationManager nm =
+        (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+    return Arrays.stream(nm.getActiveNotifications())
+        .filter(n -> n.getId() == CrumblesDeviceAdminReceiver.DEFERRED_LOGS_NOTIFICATION_ID)
+        .findFirst()
+        .orElse(null);
+  }
+
   private static void assertDeferredLogsNotificationPosted(Context context) {
     NotificationManager nm =
         (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
     NotificationChannel channel =
-        nm.getNotificationChannel(CrumblesConstants.NOTIFICATION_CHANNEL_ID);
+        nm.getNotificationChannel(CrumblesConstants.ACTION_NEEDED_NOTIFICATION_CHANNEL_ID);
     assertThat(channel).isNotNull();
     assertThat(channel.getDescription())
-        .isEqualTo("Status notifications for Crumbles encryption and log retrieval.");
-    StatusBarNotification postedNotification =
-        Arrays.stream(nm.getActiveNotifications())
-            .filter(n -> n.getId() == CrumblesDeviceAdminReceiver.DEFERRED_LOGS_NOTIFICATION_ID)
-            .findFirst()
-            .orElse(null);
+        .isEqualTo(context.getString(R.string.notification_channel_description_action_needed));
+    assertThat(channel.getLockscreenVisibility()).isEqualTo(Notification.VISIBILITY_SECRET);
+    StatusBarNotification postedNotification = findDeferredLogsNotification(context);
     assertThat(postedNotification).isNotNull();
     Notification notification = postedNotification.getNotification();
-    assertThat(notification.flags & Notification.FLAG_AUTO_CANCEL)
-        .isEqualTo(Notification.FLAG_AUTO_CANCEL);
+    assertThat(notification.visibility).isEqualTo(Notification.VISIBILITY_SECRET);
+    assertThat(notification.flags & Notification.FLAG_ONGOING_EVENT)
+        .isEqualTo(Notification.FLAG_ONGOING_EVENT);
     Intent contentIntent = Shadows.shadowOf(notification.contentIntent).getSavedIntent();
     assertThat(contentIntent.getComponent().getClassName()).isEqualTo(CrumblesMain.class.getName());
     assertThat(
@@ -455,6 +462,29 @@ public final class CrumblesDeviceAdminReceiverTest {
                 .anyMatch(e -> e.getEventType().equals("LOG_RETRIEVAL_DEFERRED")))
         .isTrue();
     assertDeferredLogsNotificationPosted(context);
+  }
+
+  @Test
+  public void onSecurityLogsAvailable_whenRetrievalSucceeds_cancelsDeferredNotification()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenReturn(new ArrayList<>());
+    Context contextWrapper = createContextWrapper(context, mockDpm);
+    CrumblesExternalPublicKeyManager.getInstance(context).saveActiveExternalPublicKey(null);
+    CrumblesMain.getLogsEncryptorInstance().setExternalEncryptionPublicKey(null);
+    receiver.onSecurityLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE));
+    assertDeferredLogsNotificationPosted(context);
+
+    KeyPair externalKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(externalKeyPair.getPublic());
+    receiver.onSecurityLogsAvailable(
+        contextWrapper, new Intent(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE));
+
+    verify(mockDpm).retrieveSecurityLogs(any(ComponentName.class));
+    assertThat(findDeferredLogsNotification(context)).isNull();
   }
 
   @Test
