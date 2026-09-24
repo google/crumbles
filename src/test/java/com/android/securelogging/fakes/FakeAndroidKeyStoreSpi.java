@@ -17,17 +17,21 @@
 package com.android.securelogging.fakes;
 
 import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.StrongBoxUnavailableException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.security.InvalidAlgorithmParameterException;
 import java.security.Key;
 import java.security.KeyStoreException;
 import java.security.KeyStoreSpi;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
+import java.security.SecureRandom;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
+import java.security.spec.AlgorithmParameterSpec;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.Date;
@@ -35,6 +39,9 @@ import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.Map;
 import javax.annotation.Nullable;
+import javax.crypto.KeyGeneratorSpi;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Basic fake implementation of AndroidKeyStore for testing.
@@ -78,16 +85,63 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
   @SuppressWarnings("NonFinalStaticField")
   private static boolean isUserAuthenticated = false;
 
+  @SuppressWarnings("NonFinalStaticField")
+  public static boolean isStrongBoxSupported = true;
+
   // --- Entry classes to hold key material and metadata ---
 
   /** Marker interface for entries in the keystore. */
-  public interface Entry {}
+  public interface Entry {
+    @Nullable
+    Key getKey();
+  }
+
+  /** Fake AndroidKeyStore HMAC-SHA256 KeyGeneratorSpi. */
+  public static final class HmacKeyGeneratorSpi extends KeyGeneratorSpi {
+    private static final SecureRandom RANDOM = new SecureRandom();
+    @Nullable private KeyGenParameterSpec spec;
+
+    @Override
+    protected void engineInit(SecureRandom random) {}
+
+    @Override
+    protected void engineInit(int keysize, SecureRandom random) {}
+
+    @Override
+    protected void engineInit(AlgorithmParameterSpec params, SecureRandom random)
+        throws InvalidAlgorithmParameterException {
+      if (!(params instanceof KeyGenParameterSpec keySpec)) {
+        throw new InvalidAlgorithmParameterException("Expected KeyGenParameterSpec");
+      }
+      if (keySpec.isStrongBoxBacked() && !isStrongBoxSupported) {
+        throw new StrongBoxUnavailableException("StrongBox unavailable");
+      }
+      this.spec = keySpec;
+      setLatestKeyGenParameterSpec(keySpec);
+    }
+
+    @Override
+    protected SecretKey engineGenerateKey() {
+      byte[] keyBytes = new byte[32];
+      RANDOM.nextBytes(keyBytes);
+      SecretKey key = new SecretKeySpec(keyBytes, "HmacSHA256");
+      if (spec != null) {
+        keystoreEntries.put(spec.getKeystoreAlias(), () -> key);
+      }
+      return key;
+    }
+  }
 
   /** An entry representing a private key, its certificate chain, and its generation specs. */
   public static class PrivateKeyEntry implements Entry {
     private final PrivateKey privateKey;
     private final Certificate[] certificateChain;
     @Nullable private final KeyGenParameterSpec spec;
+
+    @Override
+    public Key getKey() {
+      return privateKey;
+    }
 
     public PrivateKey getPrivateKey() {
       return privateKey;
@@ -179,7 +233,7 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
       }
       return entry.getPrivateKey();
     }
-    return null;
+    return keystoreEntries.containsKey(alias) ? keystoreEntries.get(alias).getKey() : null;
   }
 
   @Override

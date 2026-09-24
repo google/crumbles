@@ -20,7 +20,11 @@ import static java.lang.Math.min;
 import static java.util.Comparator.comparing;
 
 import android.content.Context;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.security.keystore.StrongBoxUnavailableException;
 import android.util.Log;
+import androidx.annotation.Nullable;
 import com.android.securelogging.CrumblesConstants;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -28,17 +32,24 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.security.GeneralSecurityException;
+import java.security.Key;
+import java.security.KeyStore;
 import java.time.Instant;
 import java.time.InstantSource;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
 import org.json.JSONException;
 
 /** CrumblesAppAuditLogger is a singleton class that logs app audit events to a file. */
 public class CrumblesAppAuditLogger {
   private static final String TAG = "CrumblesAppAuditLogger";
+  private static final String ANDROID_KEYSTORE = "AndroidKeyStore";
+  static final String CHAIN_KEY_ALIAS = "crumbles_audit_chain_hmac_key";
 
   @SuppressWarnings("NonFinalStaticField")
   private static CrumblesAppAuditLogger instance;
@@ -48,6 +59,7 @@ public class CrumblesAppAuditLogger {
   private final File oldLogFile;
   private final ArrayDeque<CrumblesAuditEvent> memoryCache;
   protected final Object fileLock = new Object();
+  @Nullable private String lastTag;
 
   private CrumblesAppAuditLogger(Context context) {
     this.appContext = context.getApplicationContext();
@@ -56,6 +68,9 @@ public class CrumblesAppAuditLogger {
     this.oldLogFile = new File(logDir, CrumblesConstants.OLD_LOG_FILE_NAME);
     this.memoryCache = new ArrayDeque<>();
     loadInitialCacheFromFiles();
+    synchronized (fileLock) {
+      this.lastTag = loadLastTag();
+    }
   }
 
   public static synchronized CrumblesAppAuditLogger getInstance(Context context) {
@@ -81,6 +96,12 @@ public class CrumblesAppAuditLogger {
 
     // 2. Append to file and handle rotation.
     synchronized (fileLock) {
+      String baseTag = lastTag != null ? lastTag : CrumblesAuditEvent.GENESIS_TAG;
+      String nextTag = signEvent(event, baseTag, /* createKeyIfMissing= */ true);
+      event = event.withTag(nextTag);
+      if (nextTag != null) {
+        lastTag = nextTag;
+      }
       try {
         if (currentLogFile.exists()
             && currentLogFile.length() > CrumblesConstants.MAX_LOG_FILE_SIZE_BYTES) {
@@ -200,5 +221,129 @@ public class CrumblesAppAuditLogger {
 
   public static synchronized void setInstanceForTest(CrumblesAppAuditLogger testInstance) {
     instance = testInstance;
+  }
+
+  @Nullable
+  private String loadLastTag() {
+    List<CrumblesAuditEvent> events = new ArrayList<>();
+    readFileContentsToList(oldLogFile, events);
+    readFileContentsToList(currentLogFile, events);
+    for (int i = events.size() - 1; i >= 0; i--) {
+      if (events.get(i).getTag() != null) {
+        return events.get(i).getTag();
+      }
+    }
+    return null;
+  }
+
+  public CrumblesChainVerification verifyChain() {
+    List<CrumblesAuditEvent> events = new ArrayList<>();
+    synchronized (fileLock) {
+      readFileContentsToList(oldLogFile, events);
+      readFileContentsToList(currentLogFile, events);
+    }
+    String previousTag = null;
+    int verified = 0;
+    int unverifiable = 0;
+    for (int i = 0; i < events.size(); i++) {
+      CrumblesAuditEvent event = events.get(i);
+      String tag = event.getTag();
+      String genesisTag = signEvent(event, CrumblesAuditEvent.GENESIS_TAG, false);
+      if (tag == null || genesisTag == null) {
+        unverifiable++;
+        previousTag = tag;
+        continue;
+      }
+      if (previousTag == null) {
+        if (tag.equals(genesisTag)) {
+          verified++;
+        } else {
+          unverifiable++;
+        }
+        previousTag = tag;
+        continue;
+      }
+      if (!tag.equals(signEvent(event, previousTag, false))) {
+        return new CrumblesChainVerification(events.size(), verified, unverifiable, i);
+      }
+      verified++;
+      previousTag = tag;
+    }
+    return new CrumblesChainVerification(events.size(), verified, unverifiable, -1);
+  }
+
+  @Nullable
+  private static String signEvent(
+      CrumblesAuditEvent event, String previousTag, boolean createKeyIfMissing) {
+    try {
+      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
+      keyStore.load(null);
+      Key key = keyStore.getKey(CHAIN_KEY_ALIAS, null);
+      if (!(key instanceof SecretKey) && createKeyIfMissing) {
+        key = generateChainKey();
+      }
+      return key instanceof SecretKey secretKey ? event.computeTag(secretKey, previousTag) : null;
+    } catch (GeneralSecurityException | IOException e) {
+      Log.e(TAG, "Unable to compute audit chain HMAC tag", e);
+      return null;
+    }
+  }
+
+  private static SecretKey generateChainKey() throws GeneralSecurityException {
+    try {
+      return generateChainKey(/* strongBoxBacked= */ true);
+    } catch (StrongBoxUnavailableException e) {
+      return generateChainKey(/* strongBoxBacked= */ false);
+    }
+  }
+
+  private static SecretKey generateChainKey(boolean strongBoxBacked)
+      throws GeneralSecurityException {
+    KeyGenerator keyGenerator =
+        KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, ANDROID_KEYSTORE);
+    keyGenerator.init(
+        new KeyGenParameterSpec.Builder(
+                CHAIN_KEY_ALIAS, KeyProperties.PURPOSE_SIGN | KeyProperties.PURPOSE_VERIFY)
+            .setDigests(KeyProperties.DIGEST_SHA256)
+            .setUserAuthenticationRequired(false)
+            .setIsStrongBoxBacked(strongBoxBacked)
+            .build());
+    return keyGenerator.generateKey();
+  }
+
+  /** Result of verifying the on-disk audit log HMAC chain. */
+  public static final class CrumblesChainVerification {
+    private final int totalRecords;
+    private final int verifiedRecords;
+    private final int unverifiableRecords;
+    private final int firstBrokenIndex;
+
+    public CrumblesChainVerification(
+        int totalRecords, int verifiedRecords, int unverifiableRecords, int firstBrokenIndex) {
+      this.totalRecords = totalRecords;
+      this.verifiedRecords = verifiedRecords;
+      this.unverifiableRecords = unverifiableRecords;
+      this.firstBrokenIndex = firstBrokenIndex;
+    }
+
+    public boolean isIntact() {
+      return firstBrokenIndex < 0;
+    }
+
+    public int getTotalRecords() {
+      return totalRecords;
+    }
+
+    public int getVerifiedRecords() {
+      return verifiedRecords;
+    }
+
+    public int getUnverifiableRecords() {
+      return unverifiableRecords;
+    }
+
+    public int getFirstBrokenIndex() {
+      return firstBrokenIndex;
+    }
   }
 }

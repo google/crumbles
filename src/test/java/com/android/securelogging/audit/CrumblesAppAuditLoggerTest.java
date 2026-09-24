@@ -20,16 +20,24 @@ import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import android.content.Context;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.CrumblesConstants;
+import com.android.securelogging.audit.CrumblesAppAuditLogger.CrumblesChainVerification;
+import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
+import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
+import com.google.common.collect.ImmutableList;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.Writer;
 import java.nio.file.Files;
+import java.security.Security;
 import java.time.Instant;
 import java.time.InstantSource;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.After;
 import org.junit.Before;
@@ -49,6 +57,10 @@ public class CrumblesAppAuditLoggerTest {
 
   @Before
   public void setUp() {
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    Security.addProvider(new FakeAndroidKeyStoreProvider());
+    FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+    FakeAndroidKeyStoreSpi.isStrongBoxSupported = true;
     appContext = ApplicationProvider.getApplicationContext();
     File logDir = appContext.getNoBackupFilesDir();
     currentLogFile = new File(logDir, CrumblesConstants.CURRENT_LOG_FILE_NAME);
@@ -76,6 +88,8 @@ public class CrumblesAppAuditLoggerTest {
       auditLogger.clearAllLogs();
     }
     CrumblesAppAuditLogger.setInstanceForTest(null);
+    FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
   }
 
   private long countLinesInFile(File file) throws IOException {
@@ -261,5 +275,75 @@ public class CrumblesAppAuditLoggerTest {
     assertThat(expected.exists()).isTrue();
     assertThat(new File(appContext.getFilesDir(), CrumblesConstants.CURRENT_LOG_FILE_NAME).exists())
         .isFalse();
+  }
+
+  @Test
+  public void verifyChain_whenLogsUntampered_reportsIntactChainAndKeystoreSpec() {
+    auditLogger.logEvent("EVENT_1", "First message.");
+    auditLogger.logEvent("EVENT_2", "Second message.");
+    CrumblesAppAuditLogger.setInstanceForTest(null);
+    auditLogger = CrumblesAppAuditLogger.getInstance(appContext);
+    auditLogger.logEvent("EVENT_3", "Third message after restart.");
+
+    KeyGenParameterSpec spec = FakeAndroidKeyStoreSpi.getLatestKeyGenParameterSpec();
+    assertThat(spec.getPurposes())
+        .isEqualTo(KeyProperties.PURPOSE_SIGN | KeyProperties.PURPOSE_VERIFY);
+    assertThat(spec.isUserAuthenticationRequired()).isFalse();
+    assertThat(spec.isStrongBoxBacked()).isTrue();
+
+    CrumblesChainVerification verification = auditLogger.verifyChain();
+    assertThat(verification.isIntact()).isTrue();
+    assertThat(verification.getTotalRecords()).isEqualTo(3);
+    assertThat(verification.getVerifiedRecords()).isEqualTo(3);
+    assertThat(verification.getUnverifiableRecords()).isEqualTo(0);
+    assertThat(verification.getFirstBrokenIndex()).isEqualTo(-1);
+  }
+
+  @Test
+  public void logEvent_whenStrongBoxUnavailable_fallsBackToTeeKey() {
+    FakeAndroidKeyStoreSpi.isStrongBoxSupported = false;
+    auditLogger.logEvent("EVENT_1", "Logged with TEE key.");
+    assertThat(FakeAndroidKeyStoreSpi.getLatestKeyGenParameterSpec().isStrongBoxBacked()).isFalse();
+    assertThat(auditLogger.verifyChain().isIntact()).isTrue();
+  }
+
+  @Test
+  public void verifyChain_whenRecordMessageEditedOrDeleted_detectsTampering() throws Exception {
+    auditLogger.logEvent("EVENT_1", "Original message 1.");
+    auditLogger.logEvent("EVENT_2", "Original message 2.");
+    auditLogger.logEvent("EVENT_3", "Original message 3.");
+    List<String> original = Files.readAllLines(currentLogFile.toPath(), UTF_8);
+    List<String> edited = new ArrayList<>(original);
+    edited.set(1, edited.get(1).replace("Original message 2.", "Tampered message 2."));
+    Files.write(currentLogFile.toPath(), edited, UTF_8);
+    assertThat(auditLogger.verifyChain().getFirstBrokenIndex()).isEqualTo(1);
+    Files.write(currentLogFile.toPath(), ImmutableList.of(original.get(0), original.get(2)), UTF_8);
+    assertThat(auditLogger.verifyChain().getFirstBrokenIndex()).isEqualTo(1);
+  }
+
+  @Test
+  public void verifyChain_whenKeyClearedOrUnavailable_countsRecordsAsUnverifiable() {
+    auditLogger.logEvent("EVENT_1", "First message.");
+    FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+    assertThat(auditLogger.verifyChain().getUnverifiableRecords()).isEqualTo(1);
+
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    auditLogger.logEvent("EVENT_2", "Logged without keystore.");
+    CrumblesAppAuditLogger.setInstanceForTest(null);
+    auditLogger = CrumblesAppAuditLogger.getInstance(appContext);
+    assertThat(auditLogger.verifyChain().getUnverifiableRecords()).isEqualTo(2);
+  }
+
+  @Test
+  public void verifyChain_whenPredecessorRotatedOut_countsFirstRecordAsUnverifiable() {
+    auditLogger.logEvent("DISCARDED_EVENT", "Predecessor removed before verification.");
+    auditLogger.clearAllLogs();
+    auditLogger.logEvent("ORPHANED_HEAD", "Chains onto discarded tag.");
+    auditLogger.logEvent("FOLLOWING_EVENT", "Chains onto ORPHANED_HEAD.");
+
+    CrumblesChainVerification verification = auditLogger.verifyChain();
+    assertThat(verification.isIntact()).isTrue();
+    assertThat(verification.getVerifiedRecords()).isEqualTo(1);
+    assertThat(verification.getUnverifiableRecords()).isEqualTo(1);
   }
 }
