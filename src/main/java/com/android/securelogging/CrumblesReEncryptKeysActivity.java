@@ -28,6 +28,7 @@ import android.view.LayoutInflater;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.ListView;
@@ -89,6 +90,7 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     super.onCreate(savedInstanceState);
     setContentView(R.layout.activity_re_encrypt_keys);
     if (getSupportActionBar() != null) {

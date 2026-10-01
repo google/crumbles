@@ -100,6 +100,27 @@ public final class CrumblesExternalPublicKeyManagerTest {
   }
 
   @Test
+  public void isExternalKeySelected_whenNoActiveKey_returnsFalse() {
+    assertThat(publicKeyManager.isExternalKeySelected()).isFalse();
+  }
+
+  @Test
+  public void isExternalKeySelected_whenActiveKeySaved_returnsTrue() throws Exception {
+    publicKeyManager.saveActiveExternalPublicKey(testPublicKey);
+
+    assertThat(publicKeyManager.isExternalKeySelected()).isTrue();
+  }
+
+  @Test
+  public void isExternalKeySelected_whenActiveKeyUnreadable_returnsTrue() throws Exception {
+    testDataStore
+        .updateDataAsync(prefs -> prefs.toBuilder().setActiveKeyId("unknown-key-id").build())
+        .get();
+
+    assertThat(publicKeyManager.isExternalKeySelected()).isTrue();
+  }
+
+  @Test
   public void clearActiveExternalPublicKey_clearsActiveKey() throws Exception {
     publicKeyManager.saveActiveExternalPublicKey(testPublicKey);
     assertThat(publicKeyManager.getActiveExternalPublicKey()).isNotNull();

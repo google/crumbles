@@ -25,8 +25,16 @@ public final class CrumblesConstants {
   public static final String SENT_SUFFIX = "_sent.bin";
   public static final String ENCRYPTED_LOG_FILE_NAME = "crumbles_logs_encrypted_";
   public static final String PROCESSING_SUFFIX = "_processing.bin";
+
+  /**
+   * Suffix of a batch file that is still being written. Such files never end in {@code .bin}, so
+   * log file listings skip them until they are atomically renamed to their final name.
+   */
+  public static final String TEMP_FILE_SUFFIX = ".tmp";
+
   public static final String NOTIFICATION_CHANNEL_ID = "email_log_channel";
   public static final String ACTION_NEEDED_NOTIFICATION_CHANNEL_ID = "action_needed_channel";
+  public static final String DATA_INTEGRITY_NOTIFICATION_CHANNEL_ID = "data_integrity_channel";
   public static final String EXTRA_FILES = "files";
   public static final Duration MAX_PROCESSING_FILE_AGE = Duration.ofDays(7);
 
@@ -39,6 +47,12 @@ public final class CrumblesConstants {
 
   public static final String SEND_WORK_TAG = "send_processing_log_files_work";
   public static final long SEND_REPEAT_INTERVAL_HOURS = 8;
+
+  public static final long MAX_LOGS_DIRECTORY_BYTES = 256L * 1024 * 1024;
+  public static final long LOGS_DIRECTORY_WARN_PERCENT = 80;
+  public static final long LOGS_DIRECTORY_RESERVED_PERCENT = 25;
+  public static final long LOGS_DIRECTORY_SPIKE_PERCENT = 25;
+  public static final Duration LOGS_DIRECTORY_SPIKE_WINDOW = Duration.ofHours(1);
 
   public static final String ENCRYPTED_LOGS_SUBDIRECTORY = "CrumblesEncryptedFiles";
   public static final String EXTRA_DECRYPTED_SESSION_ID = "extra_decrypted_session_id";

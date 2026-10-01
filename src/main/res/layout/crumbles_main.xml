@@ -31,6 +31,21 @@
         android:text="@string/material_switch_msg"
         android:textSize="18sp" />
 
+    <com.google.android.material.switchmaterial.SwitchMaterial
+        android:id="@+id/network_collection_switch"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/network_collection_switch_on_msg"
+        android:textSize="16sp" />
+
+    <TextView
+        android:id="@+id/network_collection_scope_textview"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/network_collection_scope_explanation"
+        android:textSize="12sp" />
+
     <TextView
         android:id="@+id/encryption_key_status_textview"
         android:layout_width="match_parent"

@@ -19,10 +19,12 @@ package com.android.securelogging;
 import static com.google.common.truth.Truth.assertThat;
 
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.SharedPreferences;
 import android.provider.Settings;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -42,61 +44,138 @@ public final class CrumblesDeviceIdManagerTest {
     preferences.edit().clear().commit();
   }
 
-  @Test
-  public void getDeviceId_withHardwareSerial_prioritizesSerial() {
-    ShadowBuild.setSerial("hardware_serial_12345");
-    try {
-      Settings.Secure.putString(
-          context.getContentResolver(), Settings.Secure.ANDROID_ID, "android_id_feedbeef12345678");
-      assertThat(CrumblesDeviceIdManager.getDeviceId(context)).isEqualTo("hardware_serial_12345");
-      assertThat(CrumblesDeviceIdManager.getDeviceId(null)).isEqualTo("hardware_serial_12345");
-    } finally {
-      ShadowBuild.reset();
-    }
+  @After
+  public void tearDown() {
+    ShadowBuild.reset();
   }
 
   @Test
-  public void getDeviceId_withContext_resolvesAndroidIdOrPersistedUuid() {
+  public void getDeviceId_byDefault_ignoresHardwareIdsAndPersistsRandomUuid() {
+    ShadowBuild.setSerial("hardware_serial_12345");
     Settings.Secure.putString(
         context.getContentResolver(), Settings.Secure.ANDROID_ID, "android_id_feedbeef12345678");
-    assertThat(CrumblesDeviceIdManager.getDeviceId(context))
-        .isEqualTo("android_id_feedbeef12345678");
 
-    // Falls back to generating and persisting a UUID when Android ID is empty.
-    Settings.Secure.putString(context.getContentResolver(), Settings.Secure.ANDROID_ID, "");
-    String generatedId = CrumblesDeviceIdManager.getDeviceId(context);
-    assertThat(generatedId).isNotEmpty();
-    assertThat(generatedId).isNotEqualTo(CrumblesDeviceIdManager.FALLBACK_DEVICE_ID);
+    String deviceId = CrumblesDeviceIdManager.getDeviceId(context);
+
+    assertThat(deviceId).isNotEqualTo("hardware_serial_12345");
+    assertThat(deviceId).isNotEqualTo("android_id_feedbeef12345678");
+    assertThat(deviceId).isNotEqualTo(CrumblesDeviceIdManager.FALLBACK_DEVICE_ID);
     assertThat(preferences.getString(CrumblesDeviceIdManager.PREF_DEVICE_ID, null))
-        .isEqualTo(generatedId);
-    assertThat(CrumblesDeviceIdManager.getDeviceId(context)).isEqualTo(generatedId);
+        .isEqualTo(deviceId);
   }
 
   @Test
-  public void getDeviceId_withoutContext_returnsNonEmptyIdentifier() {
-    assertThat(CrumblesDeviceIdManager.getDeviceId(null)).isNotEmpty();
+  public void getDeviceId_calledRepeatedly_returnsStablePersistedUuid() {
+    String firstId = CrumblesDeviceIdManager.getDeviceId(context);
+
+    String secondId = CrumblesDeviceIdManager.getDeviceId(context);
+
+    assertThat(secondId).isEqualTo(firstId);
   }
 
   @Test
-  public void getDeviceId_differentAndroidIds_attributesSeparately() {
-    Settings.Secure.putString(
-        context.getContentResolver(), Settings.Secure.ANDROID_ID, "device_alpha_1111");
+  public void getDeviceId_withPersistedUuid_reusesStoredValue() {
+    preferences.edit().putString(CrumblesDeviceIdManager.PREF_DEVICE_ID, "persisted_uuid").commit();
+
+    String deviceId = CrumblesDeviceIdManager.getDeviceId(context);
+
+    assertThat(deviceId).isEqualTo("persisted_uuid");
+  }
+
+  @Test
+  public void getDeviceId_onSeparateInstallations_attributesSeparately() {
     String deviceOne = CrumblesDeviceIdManager.getDeviceId(context);
+    preferences.edit().clear().commit();
 
-    Settings.Secure.putString(
-        context.getContentResolver(), Settings.Secure.ANDROID_ID, "device_beta_2222");
     String deviceTwo = CrumblesDeviceIdManager.getDeviceId(context);
 
-    assertThat(deviceOne).isEqualTo("device_alpha_1111");
-    assertThat(deviceTwo).isEqualTo("device_beta_2222");
-    assertThat(deviceOne).isNotEqualTo(deviceTwo);
+    assertThat(deviceTwo).isNotEqualTo(deviceOne);
+  }
+
+  @Test
+  public void isHardwareAttributionEnabled_byDefault_returnsFalse() {
+    assertThat(CrumblesDeviceIdManager.isHardwareAttributionEnabled(context)).isFalse();
+  }
+
+  @Test
+  public void getDeviceId_whenHardwareAttributionEnabled_prioritizesSerial() {
+    ShadowBuild.setSerial("hardware_serial_12345");
+    Settings.Secure.putString(
+        context.getContentResolver(), Settings.Secure.ANDROID_ID, "android_id_feedbeef12345678");
+    CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
+
+    String deviceId = CrumblesDeviceIdManager.getDeviceId(context);
+
+    assertThat(deviceId).isEqualTo("hardware_serial_12345");
+  }
+
+  @Test
+  public void getDeviceId_whenHardwareAttributionEnabledWithoutSerial_usesAndroidId() {
+    Settings.Secure.putString(
+        context.getContentResolver(), Settings.Secure.ANDROID_ID, "android_id_feedbeef12345678");
+    CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
+
+    String deviceId = CrumblesDeviceIdManager.getDeviceId(context);
+
+    assertThat(deviceId).isEqualTo("android_id_feedbeef12345678");
+  }
+
+  @Test
+  public void getDeviceId_whenHardwareAttributionDisabledAgain_returnsPersistedUuid() {
+    ShadowBuild.setSerial("hardware_serial_12345");
+    CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
+
+    CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ false);
+
+    assertThat(CrumblesDeviceIdManager.getDeviceId(context)).isNotEqualTo("hardware_serial_12345");
+  }
+
+  @Test
+  public void getDeviceId_withoutContext_returnsFallbackIdentifier() {
+    ShadowBuild.setSerial("hardware_serial_12345");
+
+    String deviceId = CrumblesDeviceIdManager.getDeviceId(null);
+
+    assertThat(deviceId).isEqualTo(CrumblesDeviceIdManager.FALLBACK_DEVICE_ID);
   }
 
   @Test
   public void constructor_instantiatesWithValidContext() {
-    Settings.Secure.putString(
-        context.getContentResolver(), Settings.Secure.ANDROID_ID, "constructor_test_id");
-    assertThat(new CrumblesDeviceIdManager(context).getDeviceId())
-        .isEqualTo("constructor_test_id");
+    String deviceId = new CrumblesDeviceIdManager(context).getDeviceId();
+
+    assertThat(deviceId)
+        .isEqualTo(preferences.getString(CrumblesDeviceIdManager.PREF_DEVICE_ID, null));
+  }
+
+  @Test
+  public void getDeviceId_whenSharedPreferencesUnavailable_returnsFallbackIdentifier() {
+    ShadowBuild.setSerial("hardware_serial_12345");
+    Context brokenPrefsContext =
+        new ContextWrapper(context) {
+          @Override
+          public Context getApplicationContext() {
+            return this;
+          }
+
+          @Override
+          public SharedPreferences getSharedPreferences(String name, int mode) {
+            throw new RuntimeException("SharedPreferences unavailable");
+          }
+        };
+
+    assertThat(CrumblesDeviceIdManager.isHardwareAttributionEnabled(brokenPrefsContext)).isFalse();
+    assertThat(CrumblesDeviceIdManager.getDeviceId(brokenPrefsContext))
+        .isEqualTo(CrumblesDeviceIdManager.FALLBACK_DEVICE_ID);
+  }
+
+  @Test
+  public void getDeviceId_whenHardwareAttributionEnabledAndHardwareIdsMissing_fallsBackToUuid() {
+    Settings.Secure.putString(context.getContentResolver(), Settings.Secure.ANDROID_ID, "");
+    CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
+
+    String deviceId = CrumblesDeviceIdManager.getDeviceId(context);
+
+    assertThat(deviceId)
+        .isEqualTo(preferences.getString(CrumblesDeviceIdManager.PREF_DEVICE_ID, null));
   }
 }

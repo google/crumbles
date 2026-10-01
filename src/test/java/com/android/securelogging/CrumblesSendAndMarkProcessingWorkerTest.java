@@ -515,4 +515,23 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     Result result = runWorker();
     assertEquals(Result.success(), result);
   }
+
+  @Test
+  public void doWork_whenOnlyTempFileExists_doesNotUploadIt()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+    File tempFile =
+        createFile(
+            "log_",
+            InstantSource.system().instant().toEpochMilli(),
+            ".bin.partial" + CrumblesConstants.TEMP_FILE_SUFFIX,
+            "partially written batch");
+
+    Result result = runWorker();
+
+    assertEquals(Result.success(), result);
+    assertTrue("Temp file must be left for its writer", tempFile.exists());
+    verify(mockAuditLogger, never()).logEvent(eq("LOGS_UPLOAD_SUCCESS"), anyString());
+  }
 }

@@ -45,6 +45,7 @@ import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.security.keystore.UserNotAuthenticatedException;
 import android.util.Log;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.TextView;
 import androidx.lifecycle.Lifecycle;
@@ -206,6 +207,18 @@ public class CrumblesMainTest {
     }
   }
 
+  @Test
+  public void onCreate_setsFlagSecure() {
+    try (ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true)) {
+      scenario.onActivity(
+          activity ->
+              assertThat(
+                      activity.getWindow().getAttributes().flags
+                          & WindowManager.LayoutParams.FLAG_SECURE)
+                  .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE));
+    }
+  }
+
   // --- UI State Tests ---
 
   @Test
@@ -321,6 +334,84 @@ public class CrumblesMainTest {
           assertThat(toggle.isChecked()).isFalse();
           assertThat(ShadowToast.getTextOfLatestToast()).isEqualTo("Logging disabled");
         });
+  }
+
+  @Test
+  public void networkCollectionToggle_byDefault_isCheckedAndEnablesNetworkLogging() {
+    setUpDeviceOwner();
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity -> {
+          SwitchMaterial networkToggle = activity.findViewById(R.id.network_collection_switch);
+          SwitchMaterial loggingToggle = activity.findViewById(R.id.material_switch);
+
+          loggingToggle.performClick();
+          shadowOf(activity.getMainLooper()).idle();
+
+          assertThat(networkToggle.isChecked()).isTrue();
+          assertThat(CrumblesCollectionScope.isNetworkCollectionEnabled(activity)).isTrue();
+          assertThat(loggingToggle.isChecked()).isTrue();
+          assertThat(ShadowToast.getTextOfLatestToast()).isEqualTo("Logging enabled");
+        });
+  }
+
+  @Test
+  public void networkCollectionToggle_whenTurnedOff_stopsNetworkLoggingOnly() {
+    setUpDeviceOwner();
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity -> {
+          SwitchMaterial loggingToggle = activity.findViewById(R.id.material_switch);
+          SwitchMaterial networkToggle = activity.findViewById(R.id.network_collection_switch);
+          loggingToggle.performClick();
+          shadowOf(activity.getMainLooper()).idle();
+
+          networkToggle.performClick();
+          shadowOf(activity.getMainLooper()).idle();
+
+          assertThat(loggingToggle.isChecked()).isTrue();
+          assertThat(networkToggle.isChecked()).isFalse();
+          assertThat(CrumblesCollectionScope.isNetworkCollectionEnabled(context)).isFalse();
+          assertThat(ShadowToast.getTextOfLatestToast())
+              .isEqualTo(activity.getString(R.string.toast_network_collection_disabled));
+        });
+  }
+
+  @Test
+  public void setLoggingToggle_whenNetworkCollectionOff_enablesSecurityLoggingOnly() {
+    setUpDeviceOwner();
+    CrumblesCollectionScope.setNetworkCollectionEnabled(context, /* enabled= */ false);
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity -> {
+          SwitchMaterial networkToggle = activity.findViewById(R.id.network_collection_switch);
+          SwitchMaterial loggingToggle = activity.findViewById(R.id.material_switch);
+
+          loggingToggle.performClick();
+          shadowOf(activity.getMainLooper()).idle();
+
+          assertThat(networkToggle.isChecked()).isFalse();
+          assertThat(loggingToggle.isChecked()).isTrue();
+          assertThat(ShadowToast.getTextOfLatestToast()).isEqualTo("Logging enabled");
+          assertThat(CrumblesCollectionScope.isNetworkCollectionEnabled(context)).isFalse();
+        });
+  }
+
+  private static ComponentName getAdminComponentName() {
+    return new ComponentName(
+        ApplicationProvider.getApplicationContext(), CrumblesDeviceAdminReceiver.class);
+  }
+
+  private static void setUpDeviceOwner() {
+    Application application = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager dpm =
+        (DevicePolicyManager) application.getSystemService(Context.DEVICE_POLICY_SERVICE);
+    ShadowDevicePolicyManager shadowDpm = shadowOf(dpm);
+    shadowDpm.setDeviceOwner(getAdminComponentName());
+    shadowDpm.setActiveAdmin(getAdminComponentName());
   }
 
   @Test

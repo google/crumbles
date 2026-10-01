@@ -25,6 +25,7 @@ import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyInfo;
 import android.security.keystore.KeyProperties;
 import android.security.keystore.UserNotAuthenticatedException;
 import android.util.Log;
@@ -52,9 +53,15 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
+import java.security.Key;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -74,6 +81,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.UUID;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -169,8 +177,8 @@ public class CrumblesLogsEncryptor {
    * Returns whether RSA-OAEP padding is disabled on the current device.
    *
    * <p>"Unsupported" means the Keystore lacks functional OAEP unwrapping, verified once via {@link
-   * #probeOaepSupport()}. When unsupported, or when decryption fails, OAEP becomes "disabled" in
-   * {@link SharedPreferences}, permanently falling back to {@code RSA/ECB/PKCS1Padding}.
+   * #probeOaepSupport()}. When unsupported, OAEP becomes "disabled" in {@link SharedPreferences},
+   * permanently falling back to {@code RSA/ECB/PKCS1Padding}.
    *
    * @param context the Android context to access preferences, or {@code null} for cached context
    * @return {@code true} if OAEP padding is disabled on this device; {@code false} if enabled
@@ -229,16 +237,6 @@ public class CrumblesLogsEncryptor {
         .putBoolean(CrumblesConstants.PREF_OAEP_PROBED, true)
         .putBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, disabled)
         .apply();
-  }
-
-  private void fallBackToPkcs1PaddingOnDevice() {
-    Log.w(TAG, "OAEP decryption failed; falling back to PKCS#1 v1.5 padding on device.");
-    disableOaepPadding(this.context);
-    try {
-      generateKeyPair(KEY_ALIAS, /* requireUserAuthentication= */ true);
-    } catch (CrumblesKeysException e) {
-      Log.e(TAG, "Failed to re-generate Keystore key pair with PKCS#1 padding.", e);
-    }
   }
 
   private static final String ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore";
@@ -527,6 +525,9 @@ public class CrumblesLogsEncryptor {
   /**
    * Encrypts data using a hybrid encryption scheme with Additional Authenticated Data (AAD).
    *
+   * <p>The symmetric key is wrapped with RSA-OAEP, unless {@code encryptionKey} is the device
+   * Keystore key and that key is only authorized for PKCS#1 v1.5 padding.
+   *
    * @param data the plaintext data to encrypt
    * @param aad the additional authenticated data to authenticate with AES-GCM, or null if none
    * @param encryptionKey the RSA public key to use for encrypting the symmetric key
@@ -536,11 +537,58 @@ public class CrumblesLogsEncryptor {
    */
   public EncryptedData encryptData(byte[] data, @Nullable byte[] aad, PublicKey encryptionKey)
       throws CrumblesKeysException {
+    return encryptData(data, aad, encryptionKey, wrapsWithPkcs1(encryptionKey));
+  }
+
+  private EncryptedData encryptData(
+      byte[] data, @Nullable byte[] aad, PublicKey encryptionKey, boolean oaepDisabled)
+      throws CrumblesKeysException {
     SecretKey symKey = generateSecretKey();
     IvParameterSpec generatedIv = generateAesGcmInitializationVector();
     byte[] encryptedBytes = encryptDataWithSymKey(symKey, generatedIv, aad, data);
-    byte[] encSymKey = wrapAesKey(encryptionKey, symKey, isOaepPaddingDisabled(this.context));
+    byte[] encSymKey = wrapAesKey(encryptionKey, symKey, oaepDisabled);
     return new EncryptedData(encryptedBytes, encSymKey, generatedIv.getIV());
+  }
+
+  /**
+   * Returns whether symmetric keys wrapped for {@code recipient} must use PKCS#1 v1.5 padding.
+   *
+   * <p>Only the device Keystore key may lack OAEP support, so it is wrapped with the padding its own
+   * authorizations allow. Every other recipient is always wrapped with RSA-OAEP.
+   */
+  private boolean wrapsWithPkcs1(PublicKey recipient) {
+    PublicKey deviceKey = getPublicKey();
+    return deviceKey != null
+        && Arrays.equals(recipient.getEncoded(), deviceKey.getEncoded())
+        && !keystoreKeySupportsOaep(KEY_ALIAS);
+  }
+
+  /**
+   * Returns whether the Keystore key under {@code alias} is authorized for RSA-OAEP padding, or the
+   * persisted OAEP verdict if its authorizations cannot be read.
+   */
+  private boolean keystoreKeySupportsOaep(String alias) {
+    KeyInfo keyInfo = null;
+    try {
+      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
+      keyStore.load(null);
+      Key key = keyStore.getKey(alias, null);
+      if (key != null) {
+        keyInfo =
+            KeyFactory.getInstance(ASYM_ALGORITHM, ANDROID_KEYSTORE_PROVIDER)
+                .getKeySpec(key, KeyInfo.class);
+      }
+    } catch (GeneralSecurityException | IOException | RuntimeException e) {
+      // Keystore implementations on some OEM builds throw unchecked exceptions (such as
+      // ProviderException) when reading key characteristics.
+      Log.w(TAG, "Failed to read the paddings authorized for a Keystore key.", e);
+    }
+    if (keyInfo == null) {
+      Log.w(TAG, "Keystore key paddings unavailable; using the persisted OAEP verdict.");
+      return !isOaepPaddingDisabled(this.context);
+    }
+    return Arrays.asList(keyInfo.getEncryptionPaddings())
+        .contains(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP);
   }
 
   /**
@@ -576,27 +624,30 @@ public class CrumblesLogsEncryptor {
   private LogBatch encryptLogsInternal(
       byte[] plainLogsBytes, @Nullable PublicKey publicKey, String deviceId) {
     try {
-      String keySourceMessage;
-      EncryptedData encryptedData;
-
-      if (publicKey == null && !doesPrivateKeyExist()) {
+      PublicKey recipient = publicKey != null ? publicKey : getPublicKey();
+      if (recipient == null) {
         Log.e(TAG, "Encryption failed: No encryption key available.");
         return null;
       }
+      Log.d(
+          TAG,
+          publicKey != null
+              ? "Using provided public key for encryption."
+              : "Using Keystore public key for encryption.");
 
       LogMetadata logMetadata =
           assembleMetadata(plainLogsBytes.length + GCM_TAG_LEN_BYTES, deviceId);
-      KeyEncryptionType keyEncryptionType = getKeyEncryptionType(context);
+      KeyEncryptionType keyEncryptionType =
+          wrapsWithPkcs1(recipient)
+              ? KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC
+              : KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256;
       byte[] aad = computeAssociatedData(logMetadata, keyEncryptionType);
-
-      if (publicKey != null) {
-        encryptedData = encryptData(plainLogsBytes, aad, publicKey);
-        keySourceMessage = "Using provided public key for encryption.";
-      } else {
-        encryptedData = encryptData(plainLogsBytes, aad, getPublicKey());
-        keySourceMessage = "Using Keystore public key for encryption.";
-      }
-      Log.d(TAG, keySourceMessage);
+      EncryptedData encryptedData =
+          encryptData(
+              plainLogsBytes,
+              aad,
+              recipient,
+              keyEncryptionType == KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
 
       return assembleCipherText(
           encryptedData.ciphertext,
@@ -614,6 +665,9 @@ public class CrumblesLogsEncryptor {
   /**
    * Decrypts a {@link LogBatch} protobuf message using the Keystore private key and validates AAD.
    *
+   * <p>A batch that cannot be unwrapped (wrong key or corrupt file) fails with a decryption error
+   * and never changes the Keystore key or the padding chosen for this device.
+   *
    * @param logBatch the {@link LogBatch} containing ciphertext, wrapped symmetric key, and metadata
    * @return the decrypted log bytes
    * @throws CrumblesKeysException if the private key cannot be accessed or loaded
@@ -621,27 +675,6 @@ public class CrumblesLogsEncryptor {
    */
   @CanIgnoreReturnValue
   public byte[] decryptLogs(LogBatch logBatch)
-      throws CrumblesKeysException, UserNotAuthenticatedException {
-    return decryptLogsBytes(logBatch);
-  }
-
-  /**
-   * Decrypts an encrypted {@link LogBatch}, disabling OAEP on this device if unwrapping fails.
-   *
-   * @param context the Android context used to persist fallback state and notify the user
-   * @param logBatch the encrypted log batch to decrypt
-   * @return the decrypted plaintext log bytes
-   * @throws CrumblesKeysException if the Keystore key cannot be loaded or decryption fails
-   * @throws UserNotAuthenticatedException if the user must first authenticate
-   */
-  @CanIgnoreReturnValue
-  public byte[] decryptLogs(Context context, LogBatch logBatch)
-      throws CrumblesKeysException, UserNotAuthenticatedException {
-    setApplicationContext(context);
-    return decryptLogsBytes(logBatch);
-  }
-
-  private byte[] decryptLogsBytes(LogBatch logBatch)
       throws CrumblesKeysException, UserNotAuthenticatedException {
     if (!doesPrivateKeyExist()) {
       throw new CrumblesKeysException(
@@ -688,10 +721,6 @@ public class CrumblesLogsEncryptor {
       // If the cause is UserNotAuthenticatedException, rethrow it so the OS can handle it.
       if (e.getCause() instanceof UserNotAuthenticatedException) {
         throw (UserNotAuthenticatedException) e.getCause();
-      }
-      if (logBatch.getKey().getKeyEncryptionType()
-          == KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256) {
-        fallBackToPkcs1PaddingOnDevice();
       }
       throw new CrumblesLogsDecryptionException(
           "A cryptographic error occurred during log decryption.", e);
@@ -794,7 +823,12 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Serializes a {@link LogBatch} protocol buffer to a file in the specified directory.
+   * Atomically serializes a {@link LogBatch} protocol buffer to a file in the specified directory.
+   *
+   * <p>The batch is written and synced to a uniquely named {@link
+   * CrumblesConstants#TEMP_FILE_SUFFIX} sibling, which is then atomically moved to {@code
+   * fileName}. Readers therefore never observe a partially written batch, and an existing file of
+   * that name is only replaced once the new content is durable.
    *
    * @param toSerialize the {@link LogBatch} to write
    * @param baseDir the destination directory
@@ -802,14 +836,44 @@ public class CrumblesLogsEncryptor {
    * @return the {@link Path} to the written file
    */
   public Path serializeBytes(LogBatch toSerialize, File baseDir, String fileName) {
+    Path filePath = Path.of(baseDir.getAbsolutePath(), fileName);
+    Path tempFilePath =
+        filePath.resolveSibling(
+            fileName + "." + UUID.randomUUID() + CrumblesConstants.TEMP_FILE_SUFFIX);
     try {
-      byte[] serializedBytes = toSerialize.toByteArray();
-      Path filePath = Path.of(baseDir.getAbsolutePath(), fileName);
-      Files.write(filePath, serializedBytes);
-      Log.d(TAG, "Bytes serialized to file: " + filePath);
-      return filePath;
+      writeAndSync(toSerialize, tempFilePath);
+      moveAtomically(tempFilePath, filePath);
     } catch (IOException e) {
       throw new CrumblesLogsEncryptionException("Failed to serialize bytes to file.", e);
+    } finally {
+      deleteTempFileIfPresent(tempFilePath);
+    }
+    Log.d(TAG, "Bytes serialized to file: " + filePath);
+    return filePath;
+  }
+
+  private static void writeAndSync(LogBatch toSerialize, Path tempFilePath) throws IOException {
+    try (FileChannel channel =
+        FileChannel.open(tempFilePath, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+      toSerialize.writeTo(Channels.newOutputStream(channel));
+      channel.force(/* metaData= */ true);
+    }
+  }
+
+  private static void moveAtomically(Path source, Path target) throws IOException {
+    try {
+      Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+    } catch (AtomicMoveNotSupportedException e) {
+      Log.w(TAG, "Atomic move unsupported; replacing " + target + " non-atomically.", e);
+      Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+    }
+  }
+
+  private static void deleteTempFileIfPresent(Path tempFilePath) {
+    try {
+      Files.deleteIfExists(tempFilePath);
+    } catch (IOException e) {
+      Log.e(TAG, "Failed to delete temporary file: " + tempFilePath, e);
     }
   }
 
@@ -1188,11 +1252,13 @@ public class CrumblesLogsEncryptor {
     LogMetadata logMetadata = assembleMetadata(plainLogsBytes.length + GCM_TAG_LEN_BYTES);
     byte[] aad =
         computeAssociatedData(logMetadata, KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
-    EncryptedData encryptedData = encryptData(plainLogsBytes, aad, reEncryptionKey);
+    EncryptedData encryptedData =
+        encryptData(plainLogsBytes, aad, reEncryptionKey, /* oaepDisabled= */ false);
     return assembleCipherText(
         encryptedData.ciphertext,
         encryptedData.encryptedSymmetricKey,
         encryptedData.initializationVector,
-        logMetadata);
+        logMetadata,
+        KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
   }
 }

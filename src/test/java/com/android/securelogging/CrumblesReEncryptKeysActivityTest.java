@@ -26,6 +26,7 @@ import android.content.Intent;
 import android.os.Looper;
 import android.support.v7.app.ActionBar;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.ListView;
 import android.widget.TextView;
 import androidx.test.core.app.ActivityScenario;
@@ -89,6 +90,18 @@ public class CrumblesReEncryptKeysActivityTest {
           int displayOptions = actionBar.getDisplayOptions();
           assertThat((displayOptions & ActionBar.DISPLAY_HOME_AS_UP)).isNotEqualTo(0);
         });
+  }
+
+  @Test
+  public void onCreate_setsFlagSecure() {
+    launchActivity();
+
+    scenario.onActivity(
+        activity ->
+            assertThat(
+                    activity.getWindow().getAttributes().flags
+                        & WindowManager.LayoutParams.FLAG_SECURE)
+                .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE));
   }
 
   @Test

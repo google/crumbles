@@ -16,8 +16,7 @@
 -->
 
 <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-policies>
-        <force-lock />
-        <encrypted-storage />
-    </uses-policies>
+    <!-- The Device Owner APIs used by Crumbles (security and network logging)
+         do not require any legacy device-admin policy. -->
+    <uses-policies />
 </device-admin>

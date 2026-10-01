@@ -25,6 +25,7 @@ import android.media.Image;
 import android.os.Bundle;
 import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
+import android.view.WindowManager;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.annotation.VisibleForTesting;
@@ -59,6 +60,7 @@ public class CrumblesQrScannerActivity extends AppCompatActivity {
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     super.onCreate(savedInstanceState);
     setContentView(R.layout.activity_qr_scanner);
 

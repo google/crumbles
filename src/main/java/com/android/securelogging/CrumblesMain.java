@@ -36,6 +36,7 @@ import android.provider.DocumentsContract;
 import android.security.keystore.UserNotAuthenticatedException;
 import android.support.v4.app.FragmentActivity;
 import android.util.Log;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -129,6 +130,7 @@ public class CrumblesMain extends FragmentActivity {
 
   @Override
   public void onCreate(Bundle savedInstanceState) {
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     super.onCreate(savedInstanceState);
     setContentView(R.layout.crumbles_main);
     // Probe OAEP padding capability on first launch and initialize application context.
@@ -184,6 +186,7 @@ public class CrumblesMain extends FragmentActivity {
     // visible.
     loadAndApplyExternalPublicKey();
     setLoggingToggle();
+    setNetworkCollectionToggle();
     setDecryptLogsButton();
     updateUiBasedOnKeyState();
     updateUploadDestinationStatusUi();
@@ -300,7 +303,8 @@ public class CrumblesMain extends FragmentActivity {
             enableLoggingSwitch.setText(R.string.enable_logging_switch_msg);
             if (dpm.isDeviceOwnerApp(getPackageName())) {
               dpm.setSecurityLoggingEnabled(adminComponentName, true);
-              dpm.setNetworkLoggingEnabled(adminComponentName, true);
+              dpm.setNetworkLoggingEnabled(
+                  adminComponentName, CrumblesCollectionScope.isNetworkCollectionEnabled(this));
               showToast("Logging enabled");
             } else {
               showToast("Not device owner, cannot enable logging.");
@@ -318,6 +322,48 @@ public class CrumblesMain extends FragmentActivity {
             enableLoggingSwitch.setText(R.string.material_switch_msg);
           }
         });
+  }
+
+  private void setNetworkCollectionToggle() {
+    SwitchMaterial networkCollectionSwitch = findViewById(R.id.network_collection_switch);
+    boolean isNetworkCollectionEnabled = CrumblesCollectionScope.isNetworkCollectionEnabled(this);
+    networkCollectionSwitch.setOnCheckedChangeListener(null);
+    networkCollectionSwitch.setChecked(isNetworkCollectionEnabled);
+    networkCollectionSwitch.setText(getNetworkCollectionLabel(isNetworkCollectionEnabled));
+    networkCollectionSwitch.setOnCheckedChangeListener(
+        (buttonView, isChecked) -> onNetworkCollectionToggled(networkCollectionSwitch, isChecked));
+  }
+
+  private void onNetworkCollectionToggled(
+      SwitchMaterial networkCollectionSwitch, boolean isChecked) {
+    CrumblesCollectionScope.setNetworkCollectionEnabled(this, isChecked);
+    networkCollectionSwitch.setText(getNetworkCollectionLabel(isChecked));
+    CrumblesAppAuditLogger.getInstance(this)
+        .logEvent(
+            "NETWORK_COLLECTION_SCOPE_CHANGED",
+            isChecked
+                ? "Network collection turned on: DNS and connection events are captured"
+                    + " device-wide."
+                : "Network collection turned off: DNS and connection events are no longer"
+                    + " captured.");
+    boolean isSecurityLoggingActive =
+        dpm != null
+            && dpm.isDeviceOwnerApp(getPackageName())
+            && dpm.isSecurityLoggingEnabled(adminComponentName);
+    if (isSecurityLoggingActive) {
+      dpm.setNetworkLoggingEnabled(adminComponentName, isChecked);
+    }
+    showToast(
+        getString(
+            isChecked
+                ? R.string.toast_network_collection_enabled
+                : R.string.toast_network_collection_disabled));
+  }
+
+  private static int getNetworkCollectionLabel(boolean isEnabled) {
+    return isEnabled
+        ? R.string.network_collection_switch_on_msg
+        : R.string.network_collection_switch_off_msg;
   }
 
   private void setDecryptLogsButton() {

@@ -25,6 +25,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.Application;
 import android.content.Intent;
+import android.view.WindowManager;
 import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.core.app.ApplicationProvider;
@@ -74,6 +75,20 @@ public class CrumblesQrScannerActivityTest {
     // Move the activity to a resumed state to ensure onCreate and onResume are called.
     scenario.moveToState(Lifecycle.State.RESUMED);
     ShadowLooper.idleMainLooper();
+  }
+
+  @Test
+  public void onCreate_setsFlagSecure() {
+    shadowOf(appContext).grantPermissions(Manifest.permission.CAMERA);
+
+    launchActivity();
+
+    scenario.onActivity(
+        activity ->
+            assertThat(
+                    activity.getWindow().getAttributes().flags
+                        & WindowManager.LayoutParams.FLAG_SECURE)
+                .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE));
   }
 
   // --- Tests for permission handling ---

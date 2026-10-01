@@ -216,6 +216,23 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
     return null;
   }
 
+  /**
+   * Helper for fake key factories to retrieve the entry holding a private key.
+   *
+   * @param key The private key to look up.
+   * @return The {@link PrivateKeyEntry} holding {@code key}, or null if not found.
+   */
+  @Nullable
+  public static PrivateKeyEntry findPrivateKeyEntry(Key key) {
+    for (Entry entry : keystoreEntries.values()) {
+      if (entry instanceof PrivateKeyEntry privateKeyEntry
+          && privateKeyEntry.getPrivateKey().equals(key)) {
+        return privateKeyEntry;
+      }
+    }
+    return null;
+  }
+
   // --- Overridden KeyStoreSpi Methods ---
 
   @Override

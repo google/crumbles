@@ -29,6 +29,7 @@ import android.security.keystore.KeyProperties;
 import androidx.test.core.app.ApplicationProvider;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
+import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.protobuf.Timestamp;
@@ -42,10 +43,12 @@ import java.io.File;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.Key;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
+import java.security.PrivateKey;
 import java.security.Provider;
 import java.security.PublicKey;
 import java.security.Security;
@@ -88,6 +91,37 @@ public final class CrumblesLogsEncryptorTest {
     KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
     kpg.initialize(new RSAKeyGenParameterSpec(2048, RSAKeyGenParameterSpec.F4));
     return kpg.generateKeyPair();
+  }
+
+  private static void persistOaepVerdict(Context context, boolean disabled) {
+    context
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean(CrumblesConstants.PREF_OAEP_PROBED, true)
+        .putBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, disabled)
+        .commit();
+  }
+
+  // Decrypts a batch the way an external reader holding an RSA-OAEP private key does.
+  private static byte[] decryptWithOaepPrivateKey(PrivateKey privateKey, LogBatch logBatch)
+      throws Exception {
+    Cipher rsaCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+    rsaCipher.init(
+        Cipher.UNWRAP_MODE,
+        privateKey,
+        new OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSpecified.DEFAULT));
+    Key aesKey =
+        rsaCipher.unwrap(
+            logBatch.getKey().getEncryptedSymmetricKey().toByteArray(), "AES", Cipher.SECRET_KEY);
+    Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
+    aesCipher.init(
+        Cipher.DECRYPT_MODE,
+        aesKey,
+        new GCMParameterSpec(128, logBatch.getKey().getIv().toByteArray()));
+    aesCipher.updateAAD(
+        CrumblesLogsEncryptor.computeAssociatedData(
+            logBatch.getMetadata(), logBatch.getKey().getKeyEncryptionType()));
+    return aesCipher.doFinal(logBatch.getData().getLogBlob().toByteArray());
   }
 
   @BeforeClass
@@ -403,6 +437,86 @@ public final class CrumblesLogsEncryptorTest {
     GCMParameterSpec spec96 = new GCMParameterSpec(96, encrypted.initializationVector);
     aesCipher.init(Cipher.DECRYPT_MODE, aesKey, spec96);
     assertThrows(AEADBadTagException.class, () -> aesCipher.doFinal(encrypted.ciphertext));
+  }
+
+  @Test
+  @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
+  public void encryptLogs_toExternalKeyWhenOaepDisabled_usesOaep() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    persistOaepVerdict(context, /* disabled= */ true);
+    KeyPair externalKeyPair = generateTestExternalRsaKeyPair();
+    byte[] plainLogs = "logs for an external key".getBytes(UTF_8);
+
+    LogBatch logBatch =
+        new CrumblesLogsEncryptor(context).encryptLogs(plainLogs, externalKeyPair.getPublic());
+
+    assertThat(logBatch.getKey().getKeyEncryptionType())
+        .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+    assertThat(decryptWithOaepPrivateKey(externalKeyPair.getPrivate(), logBatch))
+        .isEqualTo(plainLogs);
+  }
+
+  @Test
+  @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
+  public void encryptLogs_toPkcs1OnlyDeviceKeyWhenVerdictReset_usesPkcs1() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesLogsEncryptor contextEncryptor = new CrumblesLogsEncryptor(context);
+    persistOaepVerdict(context, /* disabled= */ true);
+    contextEncryptor.generateKeyPair();
+    persistOaepVerdict(context, /* disabled= */ false);
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+    byte[] plainLogs = "logs for a PKCS#1 device key".getBytes(UTF_8);
+
+    LogBatch logBatch = contextEncryptor.encryptLogs(plainLogs, /* publicKey= */ null);
+
+    assertThat(logBatch.getKey().getKeyEncryptionType())
+        .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
+    assertThat(contextEncryptor.decryptLogs(logBatch)).isEqualTo(plainLogs);
+  }
+
+  @Test
+  @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
+  public void encryptLogs_toOaepDeviceKeyWhenVerdictDisabled_usesOaep() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesLogsEncryptor contextEncryptor = new CrumblesLogsEncryptor(context);
+    persistOaepVerdict(context, /* disabled= */ false);
+    contextEncryptor.generateKeyPair();
+    persistOaepVerdict(context, /* disabled= */ true);
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+    byte[] plainLogs = "logs for an OAEP device key".getBytes(UTF_8);
+
+    LogBatch logBatch = contextEncryptor.encryptLogs(plainLogs, /* publicKey= */ null);
+
+    assertThat(logBatch.getKey().getKeyEncryptionType())
+        .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+    assertThat(contextEncryptor.decryptLogs(logBatch)).isEqualTo(plainLogs);
+  }
+
+  @Test
+  public void encryptDataStoreEntry_whenOaepIsDisabled_canStillBeDecrypted() throws Exception {
+    byte[] plaintext = "datastoreentry".getBytes(UTF_8);
+    CrumblesLogsEncryptor.disableOaepPadding(null);
+
+    EncryptedPayload payload = encryptor.encryptDataStoreEntry(plaintext, "entry_id");
+
+    assertThat(encryptor.decryptDataStoreEntry(payload, "entry_id")).isEqualTo(plaintext);
+  }
+
+  @Test
+  @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
+  public void reEncryptLogBatch_whenOaepIsDisabled_usesOaepTag() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    persistOaepVerdict(context, /* disabled= */ true);
+    KeyPair externalKeyPair = generateTestExternalRsaKeyPair();
+    byte[] plainLogs = "logs to re-encrypt".getBytes(UTF_8);
+
+    LogBatch logBatch =
+        new CrumblesLogsEncryptor(context).reEncryptLogBatch(plainLogs, externalKeyPair.getPublic());
+
+    assertThat(logBatch.getKey().getKeyEncryptionType())
+        .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+    assertThat(decryptWithOaepPrivateKey(externalKeyPair.getPrivate(), logBatch))
+        .isEqualTo(plainLogs);
   }
 
   @Test
@@ -766,6 +880,37 @@ public final class CrumblesLogsEncryptorTest {
     Files.delete(tempDir);
   }
 
+  @Test
+  public void serializeBytes_whenTargetExists_replacesItAndLeavesNoTempFile() throws Exception {
+    Path baseDir = Files.createTempDirectory("crumbles_test_");
+    Path existingFile = Files.writeString(baseDir.resolve("batch.bin"), "stale batch");
+    LogBatch logBatch =
+        CrumblesLogsEncryptor.assembleCipherText(
+            new byte[] {1, 2, 3}, new byte[] {4, 5, 6}, new byte[12], "device-123");
+
+    Path filePath = encryptor.serializeBytes(logBatch, baseDir.toFile(), "batch.bin");
+
+    assertThat(filePath).isEqualTo(existingFile);
+    assertThat(Files.readAllBytes(filePath)).isEqualTo(logBatch.toByteArray());
+    assertThat(baseDir.toFile().list()).asList().containsExactly("batch.bin");
+  }
+
+  @Test
+  public void serializeBytes_whenMoveFails_throwsAndDeletesTempFile() throws Exception {
+    Path baseDir = Files.createTempDirectory("crumbles_test_");
+    Path blockingDirectory = Files.createDirectory(baseDir.resolve("batch.bin"));
+    Files.writeString(blockingDirectory.resolve("child"), "keeps the directory non-empty");
+    LogBatch logBatch =
+        CrumblesLogsEncryptor.assembleCipherText(
+            new byte[] {1, 2, 3}, new byte[] {4, 5, 6}, new byte[12], "device-123");
+
+    assertThrows(
+        CrumblesLogsEncryptionException.class,
+        () -> encryptor.serializeBytes(logBatch, baseDir.toFile(), "batch.bin"));
+
+    assertThat(baseDir.toFile().list()).asList().containsExactly("batch.bin");
+  }
+
   // --- AAD Metadata and Key Integrity Tampering Tests ---
 
   /** Test cases representing single-field tampering in AAD (metadata or key encryption type). */
@@ -947,35 +1092,49 @@ public final class CrumblesLogsEncryptorTest {
 
   @Test
   @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
-  public void decryptLogs_whenOaepUnwrappingFails_disablesOaepAndRekeysWithPkcs1()
-      throws Exception {
+  public void decryptLogs_whenOaepUnwrappingFails_keepsKeyAndOaepPreference() throws Exception {
     Context context = ApplicationProvider.getApplicationContext();
+    SharedPreferences preferences =
+        context.getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE);
     CrumblesLogsEncryptor localEncryptor = new CrumblesLogsEncryptor(context);
     localEncryptor.generateKeyPair();
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+    PublicKey keyBeforeFailure = localEncryptor.getPublicKey();
+    LogBatch validBatch = localEncryptor.encryptLogs(context, "secret".getBytes(UTF_8), null);
     LogBatch corrupted =
         CrumblesLogsEncryptor.assembleCipherText(
             new byte[] {1, 2, 3}, new byte[] {9, 9, 9}, new byte[12], "device-123");
-    LogBatch authBatch = localEncryptor.encryptLogs(context, "secret".getBytes(UTF_8), null);
 
-    assertThrows(CrumblesKeysException.class, () -> localEncryptor.decryptLogs(context, authBatch));
-    boolean disabledWhenKeystoreLocked = CrumblesLogsEncryptor.isOaepPaddingDisabled(context);
-    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
     assertThrows(
         CrumblesLogsDecryptionException.class, () -> localEncryptor.decryptLogs(corrupted));
-    assertThrows(
-        CrumblesLogsDecryptionException.class,
-        () -> localEncryptor.decryptLogs(context, corrupted));
-    Shadows.shadowOf(Looper.getMainLooper()).idle();
-    boolean disabledAfterUnwrapFailure = CrumblesLogsEncryptor.isOaepPaddingDisabled(context);
-    LogBatch fallback = localEncryptor.encryptLogs(context, "fallback".getBytes(UTF_8), null);
-    byte[] fallbackPlaintext = localEncryptor.decryptLogs(context, fallback);
-    localEncryptor.generateKeyPair("custom_alias", /* requireUserAuthentication= */ false);
+    byte[] decryptedAfterFailure = localEncryptor.decryptLogs(validBatch);
 
-    assertThat(disabledWhenKeystoreLocked).isFalse();
-    assertThat(disabledAfterUnwrapFailure).isTrue();
-    assertThat(fallback.getKey().getKeyEncryptionType())
+    assertThat(corrupted.getKey().getKeyEncryptionType())
+        .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+    assertThat(localEncryptor.getPublicKey()).isEqualTo(keyBeforeFailure);
+    assertThat(preferences.getBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, true))
+        .isFalse();
+    assertThat(CrumblesLogsEncryptor.isOaepPaddingDisabled(context)).isFalse();
+    assertThat(decryptedAfterFailure).isEqualTo("secret".getBytes(UTF_8));
+  }
+
+  @Test
+  @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
+  public void generateKeyPair_whenOaepDisabled_usesPkcs1PaddingForPrimaryKeyOnly()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesLogsEncryptor localEncryptor = new CrumblesLogsEncryptor(context);
+    CrumblesLogsEncryptor.disableOaepPadding(context);
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+
+    localEncryptor.generateKeyPair();
+    localEncryptor.generateKeyPair("custom_alias", /* requireUserAuthentication= */ false);
+    LogBatch pkcs1Batch = localEncryptor.encryptLogs(context, "fallback".getBytes(UTF_8), null);
+    byte[] pkcs1Plaintext = localEncryptor.decryptLogs(pkcs1Batch);
+
+    assertThat(pkcs1Batch.getKey().getKeyEncryptionType())
         .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
-    assertThat(fallbackPlaintext).isEqualTo("fallback".getBytes(UTF_8));
+    assertThat(pkcs1Plaintext).isEqualTo("fallback".getBytes(UTF_8));
     KeyGenParameterSpec primarySpec =
         FakeAndroidKeyStoreSpi.getPrivateKeyEntry(CrumblesLogsEncryptor.KEY_ALIAS).getSpec();
     KeyGenParameterSpec customSpec =
@@ -1023,26 +1182,5 @@ public final class CrumblesLogsEncryptorTest {
 
     assertThat(afterDisabling).isTrue();
     assertThat(CrumblesLogsEncryptor.isOaepPaddingDisabled(null)).isFalse();
-  }
-
-  @Test
-  @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
-  public void decryptLogs_withExplicitContext_cachesItToPersistTheFallback() throws Exception {
-    Context context = ApplicationProvider.getApplicationContext();
-    SharedPreferences preferences =
-        context.getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE);
-    LogBatch corrupted =
-        CrumblesLogsEncryptor.assembleCipherText(
-            new byte[] {1, 2, 3}, new byte[] {9, 9, 9}, new byte[12], "device-123");
-    encryptor.generateKeyPair();
-    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
-    CrumblesLogsEncryptor.setApplicationContext(null);
-    preferences.edit().clear().commit();
-
-    assertThrows(
-        CrumblesLogsDecryptionException.class, () -> encryptor.decryptLogs(context, corrupted));
-
-    assertThat(preferences.getBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, false))
-        .isTrue();
   }
 }

@@ -115,6 +115,24 @@ public class CrumblesExternalPublicKeyManager {
   }
 
   /**
+   * Returns whether the user has selected an external public key as the encryption key, regardless
+   * of whether that key can currently be read.
+   *
+   * <p>If the preferences themselves cannot be read, the selection is unknown and this returns
+   * true, so that callers fail closed instead of encrypting to a key the user did not choose.
+   */
+  public boolean isExternalKeySelected() {
+    try {
+      return !Futures.getChecked(dataStore.getDataAsync(), CrumblesKeysException.class)
+          .getActiveKeyId()
+          .isEmpty();
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to read the external key selection; assuming one is selected.", e);
+      return true;
+    }
+  }
+
+  /**
    * Retrieves and decrypts the active external public key from the DataStore.
    *
    * @return the deserialized PublicKey, or null if not found or invalid

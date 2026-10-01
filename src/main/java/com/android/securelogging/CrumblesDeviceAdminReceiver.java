@@ -54,6 +54,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.TimeZone;
+import java.util.UUID;
 
 /**
  * Device admin receiver for Crumbles.
@@ -63,6 +64,11 @@ import java.util.TimeZone;
 public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   private static final String TAG = "[CrumblesDeviceAdminReceiver]";
   @VisibleForTesting static final int DEFERRED_LOGS_NOTIFICATION_ID = 2002;
+
+  /** Audit event type recorded when the selected external key cannot be read. */
+  @VisibleForTesting
+  static final String AUDIT_EVENT_EXTERNAL_KEY_UNAVAILABLE = "EXTERNAL_KEY_UNAVAILABLE";
+
   private DevicePolicyManager dpm;
   private ComponentName adminComponentName;
 
@@ -91,9 +97,7 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
     Log.i(TAG, "Provisioning admin extras enable_logging flag: " + enableLogging);
 
     if (!enableLogging) {
-      Log.i(
-          TAG,
-          "Logging not enabled during provisioning (enable_logging was false or missing).");
+      Log.i(TAG, "Logging not enabled during provisioning (enable_logging was false or missing).");
       return;
     }
 
@@ -104,11 +108,16 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
       Log.e(TAG, "Failed to enable security logging post-provisioning.", e);
     }
 
+    boolean enableNetworkLogging = CrumblesCollectionScope.isNetworkCollectionEnabled(context);
     try {
-      dpm.setNetworkLoggingEnabled(adminComponentName, /* enabled= */ true);
-      Log.i(TAG, "Network logging automatically enabled post-provisioning.");
+      dpm.setNetworkLoggingEnabled(adminComponentName, enableNetworkLogging);
+      Log.i(
+          TAG,
+          enableNetworkLogging
+              ? "Network logging automatically enabled post-provisioning."
+              : "Network collection turned off by the user; network logging disabled.");
     } catch (SecurityException e) {
-      Log.e(TAG, "Failed to enable network logging post-provisioning.", e);
+      Log.e(TAG, "Failed to set network logging post-provisioning.", e);
     }
 
     try {
@@ -131,10 +140,22 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   }
 
   private Optional<PublicKey> resolveActiveEncryptionKey(Context context) {
-    PublicKey externalKey =
-        CrumblesExternalPublicKeyManager.getInstance(context).getActiveExternalPublicKey();
+    CrumblesExternalPublicKeyManager keyManager =
+        CrumblesExternalPublicKeyManager.getInstance(context);
+    PublicKey externalKey = keyManager.getActiveExternalPublicKey();
     if (externalKey != null) {
       return Optional.of(externalKey);
+    }
+    if (keyManager.isExternalKeySelected()) {
+      // Fail closed: encrypting to any other key would make the logs readable by someone other than
+      // the recipient the user chose. The logs stay with the platform until retrieval is retried.
+      Log.e(TAG, "Selected external key is unreadable; not falling back to another key.");
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              AUDIT_EVENT_EXTERNAL_KEY_UNAVAILABLE,
+              "Selected external encryption key could not be read; logs were not encrypted to any"
+                  + " other key.");
+      return Optional.empty();
     }
     CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
     return encryptor.doesPrivateKeyExist()
@@ -244,6 +265,14 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
   @Override
   public void onNetworkLogsAvailable(
       @NonNull Context context, @NonNull Intent intent, long batchToken, int networkLogsCount) {
+    if (!CrumblesCollectionScope.isNetworkCollectionEnabled(context)) {
+      Log.i(TAG, "Network collection turned off by the user; skipping network log retrieval.");
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              "NETWORK_COLLECTION_OFF",
+              "Network log batch not retrieved: network collection is turned off by the user.");
+      return;
+    }
     Optional<PublicKey> activeKey = prepareLogRetrieval(context, "Network");
     if (activeKey.isEmpty()) {
       return;
@@ -442,12 +471,21 @@ public class CrumblesDeviceAdminReceiver extends DeviceAdminReceiver {
       if (!baseDir.exists()) {
         baseDir.mkdirs();
       }
+      if (!CrumblesLogStorageQuota.admitNewBatch(
+          context, baseDir, CrumblesConstants.MAX_LOGS_DIRECTORY_BYTES)) {
+        Log.w(TAG, "Storage cap reached; the batch was not written rather than evicting evidence.");
+        return;
+      }
+      // The random suffix keeps batches written within the same millisecond from sharing a name,
+      // since serializeBytes replaces an existing file of the same name.
       Path encryptedLogFilePath =
           logsEncryptor.serializeBytes(
               logBatch,
               baseDir,
               CrumblesConstants.ENCRYPTED_LOG_FILE_NAME
                   + InstantSource.system().instant().toEpochMilli()
+                  + "_"
+                  + UUID.randomUUID()
                   + ".bin");
       Log.i(TAG, "Logs encrypted and serialized to file: " + encryptedLogFilePath);
     } catch (CrumblesLogsEncryptionException e) {

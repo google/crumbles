@@ -33,5 +33,6 @@ public class FakeAndroidKeyStoreProvider extends Provider {
     // So, our provider (named "AndroidKeyStore") needs to offer an "RSA" KeyPairGenerator.
     put("KeyPairGenerator.RSA", FakeAndroidKeyPairGeneratorSpi.class.getName());
     put("KeyGenerator.HmacSHA256", FakeAndroidKeyStoreSpi.HmacKeyGeneratorSpi.class.getName());
+    put("KeyFactory.RSA", FakeAndroidKeyFactorySpi.class.getName());
   }
 }
