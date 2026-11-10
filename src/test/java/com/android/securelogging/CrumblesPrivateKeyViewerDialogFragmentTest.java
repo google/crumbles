@@ -22,6 +22,10 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
+import android.app.Dialog;
+import android.graphics.Bitmap;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.support.annotation.NonNull;
 import android.support.v4.app.Fragment;
@@ -29,12 +33,17 @@ import android.support.v4.app.FragmentFactory;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.EditText;
+import android.widget.ImageView;
+import android.widget.TextView;
 import androidx.fragment.app.testing.FragmentScenario;
 import androidx.lifecycle.Lifecycle;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.CrumblesPrivateKeyViewerDialogFragment.KeyCustodyConfirmationListener;
 import java.security.SecureRandom;
 import java.util.Arrays;
+import java.util.Base64;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.annotation.Config;
@@ -327,5 +336,134 @@ public class CrumblesPrivateKeyViewerDialogFragmentTest {
                       & WindowManager.LayoutParams.FLAG_SECURE)
               .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE);
         });
+  }
+
+  @Test
+  public void onCreateDialog_showsKeyInTextViewThatIsNotEditableSavedOrAutofilled() {
+    byte[] testKeyBytes = "a-test-private-key".getBytes(UTF_8);
+
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        launchFragment(testKeyBytes, /* showQrInitially= */ false);
+
+    scenario.onFragment(
+        fragment -> {
+          TextView keyTextView = fragment.requireDialog().findViewById(R.id.private_key_text_view);
+          assertThat(keyTextView).isNotInstanceOf(EditText.class);
+          assertThat(keyTextView.getText().toString())
+              .isEqualTo(Base64.getEncoder().encodeToString(testKeyBytes));
+          assertThat(keyTextView.isSaveEnabled()).isFalse();
+          assertThat(keyTextView.isTextSelectable()).isFalse();
+          assertThat(keyTextView.getImportantForAutofill())
+              .isEqualTo(View.IMPORTANT_FOR_AUTOFILL_NO);
+          assertThat(keyTextView.isAccessibilityDataSensitive()).isTrue();
+        });
+  }
+
+  @Test
+  public void onCreateDialog_hidesKeyFromAccessibilityServicesOtherThanTools() {
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        launchFragment("a-test-private-key".getBytes(UTF_8), /* showQrInitially= */ false);
+
+    scenario.onFragment(
+        fragment -> {
+          TextView keyTextView = fragment.requireDialog().findViewById(R.id.private_key_text_view);
+          assertThat(keyTextView.isAccessibilityDataSensitive()).isTrue();
+        });
+  }
+
+  @Test
+  public void onDismiss_clearsDisplayedKeyText() {
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        launchFragment("a-test-private-key".getBytes(UTF_8), /* showQrInitially= */ false);
+    AtomicReference<TextView> keyTextView = new AtomicReference<>();
+
+    scenario.onFragment(
+        fragment -> {
+          keyTextView.set(fragment.requireDialog().findViewById(R.id.private_key_text_view));
+          fragment.onDismiss(fragment.requireDialog());
+        });
+
+    assertThat(keyTextView.get().getText().toString()).isEmpty();
+  }
+
+  @Test
+  public void onDismiss_detachesAndRecyclesQrBitmap() {
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        launchFragment("a-test-private-key".getBytes(UTF_8), /* showQrInitially= */ true);
+    AtomicReference<ImageView> qrCodeImageView = new AtomicReference<>();
+    AtomicReference<Bitmap> qrBitmap = new AtomicReference<>();
+
+    scenario.onFragment(
+        fragment -> {
+          ImageView imageView =
+              fragment.requireDialog().findViewById(R.id.private_key_qr_code_imageview);
+          qrCodeImageView.set(imageView);
+          qrBitmap.set(((BitmapDrawable) imageView.getDrawable()).getBitmap());
+          fragment.onDismiss(fragment.requireDialog());
+        });
+
+    assertThat(qrCodeImageView.get().getDrawable()).isNull();
+    assertThat(qrBitmap.get().isRecycled()).isTrue();
+  }
+
+  @Test
+  public void onDismiss_dropsEncodedKeySoQrCodeCannotBeRegenerated() {
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        launchFragment("a-test-private-key".getBytes(UTF_8), /* showQrInitially= */ false);
+    AtomicReference<Drawable> qrDrawableAfterSwitch = new AtomicReference<>();
+
+    scenario.onFragment(
+        fragment -> {
+          Dialog dialog = fragment.requireDialog();
+          ImageView qrCodeImageView = dialog.findViewById(R.id.private_key_qr_code_imageview);
+          Button switchButton = dialog.findViewById(R.id.btn_switch_view);
+          fragment.onDismiss(dialog);
+          switchButton.performClick();
+          // Read it now: the fragment removal posted by onDismiss() clears the views later.
+          qrDrawableAfterSwitch.set(qrCodeImageView.getDrawable());
+        });
+
+    assertThat(qrDrawableAfterSwitch.get()).isNull();
+  }
+
+  @Test
+  public void whenDestroyed_clearsDisplayedKeyText() {
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        launchFragment("a-test-private-key".getBytes(UTF_8), /* showQrInitially= */ false);
+    AtomicReference<TextView> keyTextView = new AtomicReference<>();
+    scenario.onFragment(
+        fragment ->
+            keyTextView.set(fragment.requireDialog().findViewById(R.id.private_key_text_view)));
+
+    scenario.moveToState(Lifecycle.State.DESTROYED);
+
+    assertThat(keyTextView.get().getText().toString()).isEmpty();
+  }
+
+  @Test
+  public void whenDestroyed_clearsDisplayedKeyTextBeforeDialogWindowIsRemoved() {
+    FragmentScenario<CrumblesPrivateKeyViewerDialogFragment> scenario =
+        launchFragment("a-test-private-key".getBytes(UTF_8), /* showQrInitially= */ false);
+    AtomicReference<String> keyTextWhenWindowRemoved = new AtomicReference<>();
+    scenario.onFragment(
+        fragment -> {
+          TextView keyTextView = fragment.requireDialog().findViewById(R.id.private_key_text_view);
+          // DialogFragment calls onDismiss(), which also clears the key, right after it removes
+          // the dialog window, so read the text at removal time.
+          keyTextView.addOnAttachStateChangeListener(
+              new View.OnAttachStateChangeListener() {
+                @Override
+                public void onViewAttachedToWindow(View view) {}
+
+                @Override
+                public void onViewDetachedFromWindow(View view) {
+                  keyTextWhenWindowRemoved.set(keyTextView.getText().toString());
+                }
+              });
+        });
+
+    scenario.moveToState(Lifecycle.State.DESTROYED);
+
+    assertThat(keyTextWhenWindowRemoved.get()).isEmpty();
   }
 }

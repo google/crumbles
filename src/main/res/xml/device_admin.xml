@@ -17,6 +17,8 @@
 
 <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- The Device Owner APIs used by Crumbles (security and network logging)
-         do not require any legacy device-admin policy. -->
+         do not require any legacy device-admin policy. Neither does activating
+         this admin as a logging delegate, which only makes Android refuse to
+         clear, force stop or uninstall Crumbles. -->
     <uses-policies />
 </device-admin>

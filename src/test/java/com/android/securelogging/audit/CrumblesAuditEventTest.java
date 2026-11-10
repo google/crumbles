@@ -18,12 +18,16 @@ package com.android.securelogging.audit;
 
 import static com.google.common.truth.Truth.assertThat;
 
+import com.google.common.truth.Expect;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.InstantSource;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
@@ -33,6 +37,8 @@ import org.robolectric.annotation.Config;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34)
 public class CrumblesAuditEventTest {
+
+  @Rule public final Expect expect = Expect.create();
 
   @Test
   @SuppressWarnings("JavaUtilDate")
@@ -71,5 +77,35 @@ public class CrumblesAuditEventTest {
     assertThat(reconstructedEvent.getTimestamp()).isEqualTo(originalEvent.getTimestamp());
     assertThat(reconstructedEvent.getEventType()).isEqualTo(originalEvent.getEventType());
     assertThat(reconstructedEvent.getMessage()).isEqualTo(originalEvent.getMessage());
+  }
+
+  @Test
+  public void toJsonString_and_fromJsonString_keepSequenceNumberOnlyWhenSet() throws Exception {
+    CrumblesAuditEvent event = new CrumblesAuditEvent(Instant.ofEpochSecond(1), "TYPE", "Message.");
+
+    expect
+        .that(
+            CrumblesAuditEvent.fromJsonString(event.withSequenceNumber(42).toJsonString())
+                .getSequenceNumber())
+        .hasValue(42);
+    expect
+        .that(CrumblesAuditEvent.fromJsonString(event.toJsonString()).getSequenceNumber())
+        .isEmpty();
+  }
+
+  @Test
+  public void computeTag_keepsUnnumberedLayoutAndCoversSequenceNumber() throws Exception {
+    SecretKey key = new SecretKeySpec(new byte[32], "HmacSHA256");
+    CrumblesAuditEvent event = new CrumblesAuditEvent(Instant.ofEpochSecond(1), "TYPE", "Message.");
+
+    // HMAC-SHA256 under an all-zero key of GENESIS_TAG + "\n1000000000\n4:TYPE\n8:Message.", which
+    // is how records were tagged before they were numbered.
+    expect
+        .that(event.computeTag(key, CrumblesAuditEvent.GENESIS_TAG))
+        .isEqualTo("b299a4cac452bb65ff437090ad20aeef77c703b5b141c906eabdaed2375ca9f3");
+    // The same payload with "\n#1" after GENESIS_TAG.
+    expect
+        .that(event.withSequenceNumber(1).computeTag(key, CrumblesAuditEvent.GENESIS_TAG))
+        .isEqualTo("4c792ba24348eda5fc50ee5e4d9e4fd59667aee7435f6658347ef38480365ecf");
   }
 }

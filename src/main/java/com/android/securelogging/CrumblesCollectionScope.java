@@ -47,6 +47,7 @@ public final class CrumblesCollectionScope {
         .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
         .edit()
         .putBoolean(NETWORK_COLLECTION_ENABLED_KEY, enabled)
+        .remove(CrumblesConstants.PREF_LAST_OBSERVED_NETWORK_LOGGING_ENABLED)
         .apply();
   }
 

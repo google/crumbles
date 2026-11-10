@@ -24,6 +24,55 @@
     android:padding="16dp"
     tools:context=".CrumblesMain">
 
+    <LinearLayout
+        android:id="@+id/screen_lock_warning"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/screen_lock_warning_textview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/screen_lock_warning"
+            android:textColor="?attr/colorError"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/btn_set_screen_lock"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="8dp"
+            android:text="@string/btn_set_screen_lock_label" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/device_admin_offer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/device_admin_offer"
+            android:textColor="?attr/colorError"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/btn_activate_device_admin"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="8dp"
+            android:text="@string/btn_activate_device_admin_label" />
+    </LinearLayout>
+
     <com.google.android.material.switchmaterial.SwitchMaterial
         android:id="@+id/material_switch"
         android:layout_width="match_parent"
@@ -78,6 +127,13 @@
         android:text="@string/upload_dest_status_not_set"
         android:textSize="16sp" />
 
+    <TextView
+        android:id="@+id/upload_issue_textview"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="?attr/colorError"
+        android:visibility="gone" />
+
     <Button
         android:id="@+id/btn_select_upload_dest"
         android:layout_width="wrap_content"
@@ -86,6 +142,39 @@
         android:layout_marginTop="16dp"
         android:text="@string/btn_select_upload_dest_label" />
 
+    <TextView
+        android:id="@+id/upload_destination_hint_textview"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center_horizontal"
+        android:text="@string/upload_dest_picker_hint"
+        android:textSize="14sp" />
+
+    <Button
+        android:id="@+id/btn_upload_and_wipe"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="16dp"
+        android:text="@string/btn_upload_and_wipe_label" />
+
+    <Button
+        android:id="@+id/btn_wipe_anyway"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/text_saf_kept_copies"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="8dp"
+        android:textAlignment="center"
+        android:visibility="gone" />
+
     <Button
         android:id="@+id/btn_view_audit_log"
         android:layout_width="wrap_content"
@@ -93,5 +182,22 @@
         android:layout_gravity="center_horizontal"
         android:layout_marginTop="16dp"
         android:text="@string/btn_view_audit_log_label" />
+
+    <com.google.android.material.switchmaterial.SwitchMaterial
+        android:id="@+id/neutral_launcher_switch"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/neutral_launcher_switch_msg"
+        android:textSize="16sp" />
+
+    <TextView
+        android:id="@+id/app_signing_fingerprint_textview"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="@string/app_signing_fingerprint_unavailable"
+        android:textIsSelectable="true"
+        android:textSize="12sp" />
 
 </LinearLayout>

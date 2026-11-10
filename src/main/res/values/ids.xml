@@ -16,4 +16,9 @@
 
 <resources>
     <item type="id" name="private_key_text_view" />
+    <item type="id" name="webdav_server_url_input" />
+    <item type="id" name="webdav_username_input" />
+    <item type="id" name="webdav_password_input" />
+    <item type="id" name="webdav_status_text" />
+    <item type="id" name="webdav_test_connection_button" />
 </resources>

@@ -19,7 +19,41 @@ enum StorageType {
   STORAGE_TYPE_WEBDAV = 2;
 }
 
-// User key preferences stored in Jetpack DataStore.
+// Credentials for a WebDAV endpoint. Both components identify the
+// operator, so both are encrypted at rest rather than only the password.
+message WebDavCredentials {
+  EncryptedPayload username = 1;
+  EncryptedPayload password = 2;
+}
+
+// Destination that encrypted log batches are uploaded to.
+//
+// Every EncryptedPayload in here is sealed with the DataStore entry ID of its
+// field (see CrumblesConstants), so a payload sealed for one field, such as the
+// username, fails to decrypt when it is read as another, such as the password.
+message RemoteStorageConfig {
+  StorageType storage_type = 1;
+
+  // Storage Access Framework tree URI. Set only when storage_type is
+  // STORAGE_TYPE_GOOGLE_DRIVE.
+  string upload_destination_uri = 2;
+
+  // Base URL of the WebDAV collection, encrypted at rest because hosted
+  // services put the account name in it, as in /remote.php/dav/files/<user>/.
+  // Set only when storage_type is STORAGE_TYPE_WEBDAV.
+  EncryptedPayload webdav_server_url = 3;
+
+  // Set only when storage_type is STORAGE_TYPE_WEBDAV.
+  WebDavCredentials webdav_credentials = 4;
+
+  // SHA-256 digest of the DER-encoded SubjectPublicKeyInfo of the WebDAV
+  // server's own certificate, as the user confirmed it. Uploads then also
+  // require the server to present this key. Empty when no key is pinned. Set
+  // only when storage_type is STORAGE_TYPE_WEBDAV.
+  EncryptedPayload webdav_server_key_sha256 = 5;
+}
+
+// User preferences stored in Jetpack DataStore.
 message UserKeyPreferences {
   // Map of Key ID -> Encrypted Public Key payload.
   map<string, EncryptedPayload> external_public_keys = 1;
@@ -30,10 +64,24 @@ message UserKeyPreferences {
   // Map of Key ID -> Encrypted Re-encryption Key payload.
   map<string, EncryptedPayload> re_encrypt_public_keys = 3;
 
-  // Remote storage configuration.
-  StorageType storage_type = 4;
-  string upload_destination_uri = 5;
-  string webdav_server_url = 6;
-  string webdav_username = 7;
-  EncryptedPayload webdav_password_encrypted = 8;
+  // Flat remote storage fields, replaced by remote_storage_config.
+  reserved 4 to 8;
+  reserved "storage_type", "upload_destination_uri", "webdav_server_url",
+      "webdav_username", "webdav_password_encrypted";
+
+  // Where encrypted log batches are uploaded.
+  RemoteStorageConfig remote_storage_config = 9;
+
+  // HMAC-SHA256, under a Keystore key, of these preferences serialized without
+  // this field. Written and checked by CrumblesPreferencesSerializer, so that a
+  // store altered outside the app is refused.
+  bytes store_mac = 10;
+
+  // Fingerprint of the internal auth-bound key pair, used to detect when the
+  // user removes the screen lock and silently deletes the key pair (Android 12+).
+  string internal_key_fingerprint = 11;
+
+  // Epoch milliseconds at which each re-encryption key was imported, keyed by
+  // the same entry ID as re_encrypt_public_keys.
+  map<string, int64> re_encrypt_key_imported_at_millis = 12;
 }

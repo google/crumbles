@@ -19,19 +19,19 @@ package com.android.securelogging;
 import android.app.Dialog;
 import android.content.DialogInterface;
 import android.graphics.Bitmap;
+import android.graphics.drawable.BitmapDrawable;
 import android.os.Bundle;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.support.v4.app.DialogFragment;
 import android.support.v7.app.AlertDialog;
-import android.text.method.LinkMovementMethod;
 import android.util.Log;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
-import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 import com.google.zxing.BarcodeFormat;
 import java.util.Arrays;
@@ -59,6 +59,8 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
 
   // Hold the fragment's own secure copy.
   private byte[] privateKeyCopy;
+  // The encoded key, kept only while the dialog is on screen.
+  @Nullable private String privateKeyB64;
   private KeyCustodyConfirmationListener custodyConfirmationListener;
   private boolean isCustodyConfirmed = false;
 
@@ -113,7 +115,7 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
 
     dialog.setOnShowListener(
         d -> {
-          final EditText keyTextView = dialog.findViewById(R.id.private_key_text_view);
+          final TextView keyTextView = dialog.findViewById(R.id.private_key_text_view);
           final ScrollView textScrollView = dialog.findViewById(R.id.private_key_text_scrollview);
           final ImageView qrCodeImageView = dialog.findViewById(R.id.private_key_qr_code_imageview);
           final Button switchButton = dialog.findViewById(R.id.btn_switch_view);
@@ -128,9 +130,15 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
             return;
           }
 
-          final String privateKeyB64 = Base64.getEncoder().encodeToString(privateKeyCopy);
+          privateKeyB64 = Base64.getEncoder().encodeToString(privateKeyCopy);
+          // The key must never reach saved instance state, autofill services or the clipboard.
+          keyTextView.setSaveEnabled(false);
+          keyTextView.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+          keyTextView.setTextIsSelectable(false);
+          // Nor accessibility services other than tools such as screen readers, which FLAG_SECURE
+          // does not stop.
+          keyTextView.setAccessibilityDataSensitive(View.ACCESSIBILITY_DATA_SENSITIVE_YES);
           keyTextView.setText(privateKeyB64);
-          keyTextView.setMovementMethod(LinkMovementMethod.getInstance());
 
           boolean showQrInitially =
               getArguments() != null
@@ -200,7 +208,15 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
   }
 
   @Override
+  public void onStop() {
+    clearDisplayedKey();
+    super.onStop();
+    dismissAllowingStateLoss();
+  }
+
+  @Override
   public void onDismiss(@NonNull DialogInterface dialog) {
+    clearDisplayedKey();
     super.onDismiss(dialog);
     // Clear the fragment's internal copy when it's done.
     if (privateKeyCopy != null) {
@@ -212,5 +228,31 @@ public class CrumblesPrivateKeyViewerDialogFragment extends DialogFragment {
         custodyConfirmationListener.onKeyCustodyCancelled();
       }
     }
+  }
+
+  @Override
+  public void onDestroyView() {
+    clearDisplayedKey();
+    super.onDestroyView();
+  }
+
+  /** Wipes the views that rendered the key, recycles its QR bitmap and drops the encoded key. */
+  private void clearDisplayedKey() {
+    Dialog dialog = getDialog();
+    if (dialog != null) {
+      TextView keyTextView = dialog.findViewById(R.id.private_key_text_view);
+      if (keyTextView != null) {
+        keyTextView.setText("");
+      }
+      ImageView qrCodeImageView = dialog.findViewById(R.id.private_key_qr_code_imageview);
+      if (qrCodeImageView != null
+          && qrCodeImageView.getDrawable() instanceof BitmapDrawable qrDrawable) {
+        Bitmap qrBitmap = qrDrawable.getBitmap();
+        // Detach the bitmap before recycling it so the view never draws a recycled bitmap.
+        qrCodeImageView.setImageDrawable(null);
+        qrBitmap.recycle();
+      }
+    }
+    privateKeyB64 = null;
   }
 }

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Gradle dependency verification for Crumbles.
+
+  Gradle checks every plugin and dependency that a build resolves against the
+  SHA-256 checksums in <components>, and fails the build for any artifact whose
+  checksum is missing or differs. Generate the checksums on a machine with
+  network access and review them as RELEASING.md describes, whenever a plugin or
+  dependency changes and before building a release.
+
+  Sources and Javadoc need no checksum: IDEs download them, and they are never
+  built into the app.
+-->
+<verification-metadata
+    xmlns="https://schema.gradle.org/dependency-verification"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="https://schema.gradle.org/dependency-verification https://schema.gradle.org/dependency-verification/dependency-verification-1.3.xsd">
+  <configuration>
+    <verify-metadata>true</verify-metadata>
+    <verify-signatures>false</verify-signatures>
+    <trusted-artifacts>
+      <trust file=".*-javadoc[.]jar" regex="true"/>
+      <trust file=".*-sources[.]jar" regex="true"/>
+    </trusted-artifacts>
+  </configuration>
+  <components>
+  </components>
+</verification-metadata>

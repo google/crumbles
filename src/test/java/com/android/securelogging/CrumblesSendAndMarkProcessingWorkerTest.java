@@ -16,15 +16,22 @@
 
 package com.android.securelogging;
 
+import static com.android.securelogging.CrumblesSendAndMarkProcessingWorker.uploadSingleFile;
 import static com.google.common.truth.Truth.assertThat;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.robolectric.util.ReflectionHelpers.callInstanceMethod;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -40,20 +47,53 @@ import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import androidx.annotation.Nullable;
+import androidx.datastore.guava.GuavaDataStore;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.work.ListenableWorker.Result;
 import androidx.work.testing.TestListenableWorkerBuilder;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.android.securelogging.exceptions.CrumblesKeysException;
+import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
+import com.google.common.truth.Expect;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.protobuf.ByteString;
+import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsParameters;
+import com.sun.net.httpserver.HttpsServer;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
+import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.MessageDigest;
+import java.security.Provider;
+import java.security.PublicKey;
+import java.security.Security;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.InstantSource;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.ToIntFunction;
+import javax.net.ssl.ManagerFactoryParameters;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.TrustManagerFactorySpi;
+import okhttp3.tls.HandshakeCertificates;
+import okhttp3.tls.HeldCertificate;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
@@ -63,6 +103,7 @@ import org.robolectric.RobolectricTestRunner;
 import org.robolectric.Shadows;
 import org.robolectric.shadows.ShadowLog;
 import org.robolectric.shadows.ShadowNotificationManager;
+import org.robolectric.util.ReflectionHelpers.ClassParameter;
 
 /** Unit tests for {@link CrumblesSendAndMarkProcessingWorker}. */
 @RunWith(RobolectricTestRunner.class)
@@ -70,22 +111,54 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
   private static final String DRIVE_AUTHORITY = "com.google.android.apps.docs.storage";
   private static final Uri VALID_DRIVE_URI =
       Uri.parse("content://" + DRIVE_AUTHORITY + "/tree/valid_drive");
+  private static final EncryptedPayload ENCRYPTED_WEBDAV_SERVER_URL =
+      EncryptedPayload.newBuilder().setCiphertext(ByteString.copyFromUtf8("enc_url")).build();
+  private static final EncryptedPayload ENCRYPTED_WEBDAV_USERNAME =
+      EncryptedPayload.newBuilder().setCiphertext(ByteString.copyFromUtf8("enc_user")).build();
+  private static final EncryptedPayload ENCRYPTED_WEBDAV_PASSWORD =
+      EncryptedPayload.newBuilder().setCiphertext(ByteString.copyFromUtf8("enc_pass")).build();
+  private static final EncryptedPayload ENCRYPTED_WEBDAV_SERVER_KEY_SHA256 =
+      EncryptedPayload.newBuilder().setCiphertext(ByteString.copyFromUtf8("enc_key")).build();
+
+  private static final HeldCertificate testRootCertificate =
+      new HeldCertificate.Builder().certificateAuthority(/* maxIntermediateCas= */ 0).build();
+  private static final HeldCertificate serverCertificate =
+      new HeldCertificate.Builder()
+          .addSubjectAlternativeName("localhost")
+          .signedBy(testRootCertificate)
+          .build();
+
+  /** Authorization header for the "user" and "pass" credentials that the tests store. */
+  private static final String WEBDAV_AUTHORIZATION =
+      "Basic " + Base64.getEncoder().encodeToString("user:pass".getBytes(UTF_8));
+
+  @Rule public final Expect expect = Expect.create();
 
   private Context context;
+  private GuavaDataStore<UserKeyPreferences> testDataStore;
   private File testDirectory;
   private FakeGoogleDriveContentProvider fakeDriveProvider;
 
   @Mock private CrumblesLogsEncryptor mockLogsEncryptor;
   @Mock private CrumblesAppAuditLogger mockAuditLogger;
+  @Mock private PublicKey mockPublicKey;
+  @Mock private PublicKey mockReplacementKey;
 
   /** Fake ContentProvider simulating Google Drive storage via Storage Access Framework. */
   public static class FakeGoogleDriveContentProvider extends ContentProvider {
     private File tempDriveDir;
     private boolean shouldFailStreaming;
+    private boolean shouldCrashStreaming;
     private boolean isInvalidDirectory;
+    @Nullable Runnable onOpenFile;
 
     public void setShouldFailStreaming(boolean fail) {
       this.shouldFailStreaming = fail;
+    }
+
+    /** Makes opening a document throw an unchecked exception, like a provider with a bug. */
+    public void setShouldCrashStreaming(boolean crash) {
+      this.shouldCrashStreaming = crash;
     }
 
     public void setIsInvalidDirectory(boolean invalid) {
@@ -155,8 +228,14 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
 
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
+      if (onOpenFile != null) {
+        onOpenFile.run();
+      }
       if (shouldFailStreaming) {
         throw new FileNotFoundException("Simulated upload streaming failure");
+      }
+      if (shouldCrashStreaming) {
+        throw new IllegalStateException("Simulated provider crash");
       }
       return ParcelFileDescriptor.open(
           new File(tempDriveDir, uri.getLastPathSegment()), ParcelFileDescriptor.MODE_READ_WRITE);
@@ -207,7 +286,13 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
 
   @CanIgnoreReturnValue
   private Result runWorker() throws ExecutionException, InterruptedException {
+    return runWorkerOnAttempt(/* runAttemptCount= */ 0);
+  }
+
+  private Result runWorkerOnAttempt(int runAttemptCount)
+      throws ExecutionException, InterruptedException {
     return TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
+        .setRunAttemptCount(runAttemptCount)
         .build()
         .startWork()
         .get();
@@ -215,6 +300,12 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
 
   private void configureDestination(Uri uri, boolean grantPermission) {
     if (grantPermission) {
+      context.grantUriPermission(
+          context.getPackageName(),
+          uri,
+          Intent.FLAG_GRANT_READ_URI_PERMISSION
+              | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+              | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
       context
           .getContentResolver()
           .takePersistableUriPermission(
@@ -227,7 +318,182 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
         .commit();
   }
 
-  private void assertNotificationPosted(boolean isError) {
+  /**
+   * Stores a WebDAV destination whose server URL and username decrypt successfully. Each test
+   * decides how the password decrypts.
+   */
+  private void configureWebDav(String serverUrl)
+      throws CrumblesKeysException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_SERVER_URL, CrumblesConstants.WEBDAV_SERVER_URL_ENTRY_ID))
+        .thenReturn(serverUrl.getBytes(UTF_8));
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_USERNAME, CrumblesConstants.WEBDAV_USERNAME_ENTRY_ID))
+        .thenReturn("user".getBytes(UTF_8));
+    testDataStore
+        .updateDataAsync(
+            preferences ->
+                preferences.toBuilder()
+                    .setRemoteStorageConfig(
+                        RemoteStorageConfig.newBuilder()
+                            .setStorageType(StorageType.STORAGE_TYPE_WEBDAV)
+                            .setWebdavServerUrl(ENCRYPTED_WEBDAV_SERVER_URL)
+                            .setWebdavCredentials(
+                                WebDavCredentials.newBuilder()
+                                    .setUsername(ENCRYPTED_WEBDAV_USERNAME)
+                                    .setPassword(ENCRYPTED_WEBDAV_PASSWORD)))
+                    .build())
+        .get();
+  }
+
+  /**
+   * Starts a localhost WebDAV server that answers each request carrying the stored credentials with
+   * the status for its path, and any other request with 401.
+   */
+  private static HttpServer startWebDavServer(ToIntFunction<String> statusCodeForPath)
+      throws IOException {
+    HttpServer server =
+        HttpServer.create(new InetSocketAddress("localhost", /* port= */ 0), /* backlog= */ 0);
+    server.createContext(
+        "/webdav",
+        exchange -> {
+          boolean isAuthorized =
+              Objects.equals(
+                  exchange.getRequestHeaders().getFirst("Authorization"), WEBDAV_AUTHORIZATION);
+          exchange.sendResponseHeaders(
+              isAuthorized
+                  ? statusCodeForPath.applyAsInt(exchange.getRequestURI().getPath())
+                  : HttpURLConnection.HTTP_UNAUTHORIZED,
+              /* responseLength= */ -1);
+          exchange.close();
+        });
+    server.start();
+    return server;
+  }
+
+  /**
+   * Stores a WebDAV destination at {@code serverUrl} whose pinned server key decrypts to {@code
+   * pinnedKeySha256}, with credentials that decrypt successfully.
+   */
+  private void configurePinnedWebDav(String serverUrl, byte[] pinnedKeySha256) throws Exception {
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_SERVER_KEY_SHA256,
+            CrumblesConstants.WEBDAV_SERVER_KEY_SHA256_ENTRY_ID))
+        .thenReturn(pinnedKeySha256);
+    configureWebDav(serverUrl);
+    testDataStore
+        .updateDataAsync(
+            preferences ->
+                preferences.toBuilder()
+                    .setRemoteStorageConfig(
+                        preferences.getRemoteStorageConfig().toBuilder()
+                            .setWebdavServerKeySha256(ENCRYPTED_WEBDAV_SERVER_KEY_SHA256))
+                    .build())
+        .get();
+  }
+
+  private static byte[] sha256(PublicKey key) throws Exception {
+    return MessageDigest.getInstance("SHA-256").digest(key.getEncoded());
+  }
+
+  /**
+   * Starts a localhost WebDAV server over TLS that presents {@link #serverCertificate}, answers
+   * every request with 201 and records whether any request reached it in {@code requestReceived}.
+   */
+  private static HttpsServer startHttpsWebDavServer(AtomicBoolean requestReceived)
+      throws IOException {
+    return startHttpsWebDavServer(requestReceived, new AtomicInteger());
+  }
+
+  private static HttpsServer startHttpsWebDavServer(
+      AtomicBoolean requestReceived, AtomicInteger handshakesAttempted) throws IOException {
+    HttpsServer server =
+        HttpsServer.create(new InetSocketAddress("localhost", /* port= */ 0), /* backlog= */ 0);
+    server.setHttpsConfigurator(
+        new HttpsConfigurator(
+            new HandshakeCertificates.Builder()
+                .heldCertificate(serverCertificate)
+                .build()
+                .sslContext()) {
+          @Override
+          public void configure(HttpsParameters params) {
+            handshakesAttempted.incrementAndGet();
+          }
+        });
+    server.createContext(
+        "/webdav",
+        exchange -> {
+          requestReceived.set(true);
+          exchange.sendResponseHeaders(HttpURLConnection.HTTP_CREATED, /* responseLength= */ -1);
+          exchange.close();
+        });
+    server.start();
+    return server;
+  }
+
+  /**
+   * Security provider whose default {@link TrustManagerFactory} trusts {@link #testRootCertificate}
+   * alone, so that it stands in for the platform's CA store.
+   */
+  private static final class TestRootTrustProvider extends Provider {
+    static final String NAME = "CrumblesTestRootTrust";
+
+    TestRootTrustProvider() {
+      super(NAME, "1.0", "Trusts only the test root CA");
+      TrustManager testRootTrustManager =
+          new HandshakeCertificates.Builder()
+              .addTrustedCertificate(testRootCertificate.certificate())
+              .build()
+              .trustManager();
+      putService(
+          new Service(
+              this,
+              "TrustManagerFactory",
+              TrustManagerFactory.getDefaultAlgorithm(),
+              FixedTrustManagerFactorySpi.class.getName(),
+              /* aliases= */ null,
+              /* attributes= */ null) {
+            @Override
+            public Object newInstance(Object constructorParameter) {
+              return new FixedTrustManagerFactorySpi(testRootTrustManager);
+            }
+          });
+    }
+  }
+
+  private static final class FixedTrustManagerFactorySpi extends TrustManagerFactorySpi {
+    private final TrustManager trustManager;
+    private boolean initialized;
+
+    FixedTrustManagerFactorySpi(TrustManager trustManager) {
+      this.trustManager = trustManager;
+    }
+
+    @Override
+    protected void engineInit(KeyStore keyStore) {
+      initialized = true;
+    }
+
+    @Override
+    protected void engineInit(ManagerFactoryParameters parameters) {}
+
+    @Override
+    protected TrustManager[] engineGetTrustManagers() {
+      return initialized ? new TrustManager[] {trustManager} : new TrustManager[0];
+    }
+  }
+
+  /** Returns whether an upload time is recorded for {@code sentFile}, so that it expires by age. */
+  private boolean hasRecordedUploadTime(File sentFile) {
+    return context
+        .getSharedPreferences(CrumblesDeleteSentFilesWorker.RETENTION_PREFS, Context.MODE_PRIVATE)
+        .contains(sentFile.getName());
+  }
+
+  private void assertNotificationPosted() {
     NotificationManager nm =
         (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
     ShadowNotificationManager snm = Shadows.shadowOf(nm);
@@ -240,10 +506,12 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     assertThat(channel.getLockscreenVisibility()).isEqualTo(Notification.VISIBILITY_SECRET);
 
     Notification notification =
-        snm.getNotification(CrumblesSendAndMarkProcessingWorker.UPLOAD_NOTIFICATION_ID);
+        snm.getNotification(CrumblesConstants.UPLOAD_NOTIFICATION_ID);
     assertThat(notification).isNotNull();
-    assertThat(notification.flags & Notification.FLAG_AUTO_CANCEL)
-        .isEqualTo(Notification.FLAG_AUTO_CANCEL);
+    assertThat(notification.flags & Notification.FLAG_ONGOING_EVENT)
+        .isEqualTo(Notification.FLAG_ONGOING_EVENT);
+    assertThat(notification.flags & Notification.FLAG_ONLY_ALERT_ONCE)
+        .isEqualTo(Notification.FLAG_ONLY_ALERT_ONCE);
     assertThat(notification.visibility).isEqualTo(Notification.VISIBILITY_SECRET);
 
     assertThat(notification.contentIntent).isNotNull();
@@ -255,9 +523,7 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
         .isEqualTo(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
     assertThat(savedIntent.getComponent().getClassName()).isEqualTo(CrumblesMain.class.getName());
 
-    int expectedIcon =
-        isError ? android.R.drawable.stat_notify_error : android.R.drawable.stat_sys_upload_done;
-    assertThat(notification.icon).isEqualTo(expectedIcon);
+    assertThat(notification.icon).isEqualTo(android.R.drawable.stat_notify_error);
   }
 
   @Before
@@ -267,7 +533,13 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     ShadowLog.stream = System.out;
 
     CrumblesMain.setLogsEncryptorInstanceForTest(mockLogsEncryptor);
+    when(mockLogsEncryptor.getPublicKey()).thenReturn(mockPublicKey);
     CrumblesAppAuditLogger.setInstanceForTest(mockAuditLogger);
+    // The key preferences store is authenticated with a Keystore key.
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    Security.addProvider(new FakeAndroidKeyStoreProvider());
+    testDataStore = CrumblesDataStoreHolder.getInstance(context);
+    testDataStore.updateDataAsync(preferences -> UserKeyPreferences.getDefaultInstance()).get();
     fakeDriveProvider =
         Robolectric.setupContentProvider(FakeGoogleDriveContentProvider.class, DRIVE_AUTHORITY);
 
@@ -290,8 +562,10 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     if (testDirectory != null && testDirectory.exists()) {
       deleteRecursive(testDirectory);
     }
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
     CrumblesMain.setLogsEncryptorInstanceForTest(null);
     CrumblesAppAuditLogger.setInstanceForTest(null);
+    Security.removeProvider(TestRootTrustProvider.NAME);
   }
 
   @Test
@@ -312,7 +586,128 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
             eq(
                 "Upload deferred because active encryption key is unavailable; logs preserved on"
                     + " disk."));
-    assertNotificationPosted(/* isError= */ true);
+    assertNotificationPosted();
+    Notification notification =
+        Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+            .getNotification(CrumblesConstants.UPLOAD_NOTIFICATION_ID);
+    expect
+        .that(Shadows.shadowOf(notification).getContentTitle().toString())
+        .isEqualTo(context.getString(R.string.notification_title_action_needed));
+    expect
+        .that(Shadows.shadowOf(notification).getContentText().toString())
+        .isEqualTo(context.getString(R.string.notification_text_action_needed));
+  }
+
+  @Test
+  public void doWork_whenStillDeferredOnLastAttempt_waitsForNextPeriodAndKeepsLogs()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorkerOnAttempt(CrumblesSendAndMarkProcessingWorker.MAX_RUN_ATTEMPTS - 1);
+
+    expect.that(result).isEqualTo(Result.failure());
+    expect.that(fileToProcess.exists()).isTrue();
+  }
+
+  @Test
+  public void doWork_whenDeferredBeforeLastAttempt_retries()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorkerOnAttempt(CrumblesSendAndMarkProcessingWorker.MAX_RUN_ATTEMPTS - 2);
+
+    assertThat(result).isEqualTo(Result.retry());
+  }
+
+  @Test
+  public void doWork_whenUploadSucceedsOnLastAttempt_succeeds()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+    createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorkerOnAttempt(CrumblesSendAndMarkProcessingWorker.MAX_RUN_ATTEMPTS - 1);
+
+    assertThat(result).isEqualTo(Result.success());
+  }
+
+  @Test
+  public void doWork_whenSameDeferralRepeats_logsItOnceAndPostsItAgain()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+    runWorker();
+    NotificationManager notificationManager = context.getSystemService(NotificationManager.class);
+    notificationManager.cancelAll();
+
+    Result result = runWorker();
+
+    expect.that(result).isEqualTo(Result.retry());
+    expect.that(Shadows.shadowOf(notificationManager).getAllNotifications()).hasSize(1);
+    verify(mockAuditLogger).logEvent(eq("LOGS_UPLOAD_DEFERRED_NO_KEY"), anyString());
+  }
+
+  @Test
+  public void doWork_whenWebDavPasswordDecryptionKeepsFailing_logsItOnceAndPostsItAgain()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenThrow(new CrumblesKeysException("Simulated decryption failure"));
+    configureWebDav("https://webdav.example.com/");
+    createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+    runWorker();
+    NotificationManager notificationManager = context.getSystemService(NotificationManager.class);
+    notificationManager.cancelAll();
+
+    Result result = runWorker();
+
+    expect.that(result).isEqualTo(Result.retry());
+    expect.that(Shadows.shadowOf(notificationManager).getAllNotifications()).hasSize(1);
+    verify(mockAuditLogger).logEvent(eq("UPLOAD_CREDENTIALS_DECRYPTION_FAILED"), anyString());
+  }
+
+  @Test
+  public void doWork_whenDeferralReasonChanges_reportsNewReason()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+    runWorker();
+    context.getSystemService(NotificationManager.class).cancelAll();
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+
+    Result result = runWorker();
+
+    assertEquals(Result.retry(), result);
+    verify(mockAuditLogger)
+        .logEvent(
+            eq("UPLOAD_DESTINATION_NOT_CONFIGURED"),
+            eq("Upload deferred: destination folder is not configured."));
+    assertNotificationPosted();
+  }
+
+  @Test
+  public void doWork_whenDeferralRecursAfterSuccessfulUpload_reportsItAgain()
+      throws IOException, ExecutionException, InterruptedException {
+    long timestamp = InstantSource.system().instant().toEpochMilli();
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    createFile("log1_", timestamp, ".bin", "c1");
+    runWorker();
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+    assertEquals(Result.success(), runWorker());
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    createFile("log2_", timestamp + 10, ".bin", "c2");
+    context.getSystemService(NotificationManager.class).cancelAll();
+
+    Result result = runWorker();
+
+    assertEquals(Result.retry(), result);
+    verify(mockAuditLogger, times(2)).logEvent(eq("LOGS_UPLOAD_DEFERRED_NO_KEY"), anyString());
+    assertNotificationPosted();
   }
 
   @Test
@@ -353,7 +748,7 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     File file2 =
         createFile(
             "log2_",
-            InstantSource.system().instant().toEpochMilli() + 10,
+            InstantSource.system().instant().plusMillis(10).toEpochMilli(),
             CrumblesConstants.PROCESSING_SUFFIX,
             "c2");
 
@@ -401,8 +796,8 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     verify(mockAuditLogger)
         .logEvent(
             eq("UPLOAD_DESTINATION_NOT_CONFIGURED"),
-            eq("Upload deferred: Google Drive destination folder is not configured."));
-    assertNotificationPosted(/* isError= */ true);
+            eq("Upload deferred: destination folder is not configured."));
+    assertNotificationPosted();
   }
 
   @Test
@@ -422,7 +817,7 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
         .logEvent(
             eq("UPLOAD_DESTINATION_PERMISSION_REVOKED"),
             eq("Upload failed because persistable write permission was missing or revoked."));
-    assertNotificationPosted(/* isError= */ true);
+    assertNotificationPosted();
   }
 
   @Test
@@ -442,11 +837,11 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
         .logEvent(
             eq("UPLOAD_DESTINATION_INVALID"),
             eq("Upload deferred: destination folder is inaccessible or unwritable."));
-    assertNotificationPosted(/* isError= */ true);
+    assertNotificationPosted();
   }
 
   @Test
-  public void doWork_whenUploadSucceeds_streamsFileAndMarksSentAndNotifies()
+  public void doWork_whenUploadSucceeds_streamsFileAndMarksSentWithoutNotifying()
       throws IOException, ExecutionException, InterruptedException {
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
     configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
@@ -464,10 +859,52 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     verify(mockAuditLogger)
         .logEvent(
             eq("LOGS_UPLOAD_SUCCESS"),
-            eq(
-                "Successfully automatically uploaded 1 log file(s) to Google Drive"
-                    + " destination."));
-    assertNotificationPosted(/* isError= */ false);
+            eq("Successfully automatically uploaded 1 log file(s) to the upload folder."));
+    expect
+        .that(
+            Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+                .getAllNotifications())
+        .isEmpty();
+  }
+
+  @Test
+  public void doWork_whenUploadSucceedsAfterReportedIssue_withdrawsIssueNotification()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+    runWorker();
+    assertNotificationPosted();
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+
+    Result result = runWorker();
+
+    expect.that(result).isEqualTo(Result.success());
+    expect
+        .that(
+            Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+                .getAllNotifications())
+        .isEmpty();
+  }
+
+  @Test
+  public void doWork_whenUploadSucceeds_stampsSentBatchWithUploadTime()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+    Instant writtenAt = Instant.now().minus(Duration.ofDays(30));
+    assertTrue(fileToProcess.setLastModified(writtenAt.toEpochMilli()));
+
+    runWorker();
+
+    File sentFile =
+        new File(
+            testDirectory, fileToProcess.getName().replace(".bin", CrumblesConstants.SENT_SUFFIX));
+    assertThat(Instant.ofEpochMilli(sentFile.lastModified()))
+        .isGreaterThan(writtenAt.plus(Duration.ofDays(29)));
+    // SAF copies never expire by age, so their upload time is not recorded.
+    assertThat(hasRecordedUploadTime(sentFile)).isFalse();
   }
 
   @Test
@@ -487,7 +924,45 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
         .logEvent(
             eq("LOGS_UPLOAD_FAILED"),
             eq("One or more log files failed to upload; preserved safely on device for retry."));
-    assertNotificationPosted(/* isError= */ true);
+    assertNotificationPosted();
+  }
+
+  @Test
+  public void doWork_whenProviderThrowsUncheckedException_keepsBatchPendingAndReportsFailure()
+      throws IOException, ExecutionException, InterruptedException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    fakeDriveProvider.setShouldCrashStreaming(true);
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorker();
+
+    expect.that(result).isEqualTo(Result.retry());
+    expect.that(fileToProcess.exists()).isTrue();
+    verify(mockAuditLogger)
+        .logEvent(
+            eq("LOGS_UPLOAD_FAILED"),
+            eq("One or more log files failed to upload; preserved safely on device for retry."));
+    assertNotificationPosted();
+  }
+
+  @Test
+  public void uploadSingleFile_whenUploaderThrows_restoresBatchForRetry() throws Exception {
+    RemoteStorageUploader uploader = mock(RemoteStorageUploader.class);
+    when(uploader.uploadFile(any(), any(), any()))
+        .thenThrow(new IllegalStateException("Simulated uploader crash"));
+    File batch =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            CrumblesSendAndMarkProcessingWorker.uploadSingleFile(
+                context, uploader, batch, testDirectory));
+
+    // The batch is pending again under its own name, and is never marked as sent.
+    expect.that(testDirectory.list()).asList().containsExactly(batch.getName());
   }
 
   @Test
@@ -517,6 +992,55 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
   }
 
   @Test
+  public void doWork_whenStagedBatchRemainsAfterUpload_returnsRetry() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+    // Reading a directory fails as an I/O error would, so the drain keeps this staged batch.
+    assertTrue(
+        new File(context.getNoBackupFilesDir(), "staged_logs/0000000000000000001-S.sealed")
+            .mkdirs());
+
+    Result result = runWorker();
+
+    expect.that(result).isEqualTo(Result.retry());
+    expect.that(fileToProcess.exists()).isFalse();
+  }
+
+  @Test
+  public void doWork_whenKeyChangesDuringUpload_drainsStagedBatchToTheNewKey() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    AtomicReference<PublicKey> activeKey = new AtomicReference<>(mockPublicKey);
+    when(mockLogsEncryptor.getPublicKey()).thenAnswer(invocation -> activeKey.get());
+    CrumblesLogStaging staging = new CrumblesLogStaging(context);
+    assertTrue(staging.stage(/* isNetworkBatch= */ false, "staged".getBytes(UTF_8)));
+    // The user replaces the key while the pending batch uploads.
+    HttpServer server =
+        startWebDavServer(
+            path -> {
+              activeKey.set(mockReplacementKey);
+              return 201;
+            });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+      // The drain reads the activity log for the batch, which the mock logger cannot provide.
+      CrumblesAppAuditLogger.setInstanceForTest(null);
+
+      runWorker();
+
+      verify(mockLogsEncryptor).encryptLogs(any(), any(), eq(mockReplacementKey));
+      verify(mockLogsEncryptor, never()).encryptLogs(any(), any(), eq(mockPublicKey));
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
   public void doWork_whenOnlyTempFileExists_doesNotUploadIt()
       throws IOException, ExecutionException, InterruptedException {
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
@@ -533,5 +1057,484 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     assertEquals(Result.success(), result);
     assertTrue("Temp file must be left for its writer", tempFile.exists());
     verify(mockAuditLogger, never()).logEvent(eq("LOGS_UPLOAD_SUCCESS"), anyString());
+  }
+
+  @Test
+  public void doWork_whenWebDavConfigured_uploadsSuccessfullyAndMarksSent() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    HttpServer server = startWebDavServer(path -> 201);
+    try {
+      String serverUrl = "http://localhost:" + server.getAddress().getPort() + "/webdav";
+      configureWebDav(serverUrl);
+      File fileToProcess =
+          createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+      Result result = runWorker();
+
+      assertEquals(Result.success(), result);
+      assertFalse(fileToProcess.exists());
+      File sentFile =
+          new File(
+              testDirectory,
+              fileToProcess.getName().replace(".bin", CrumblesConstants.SENT_SUFFIX));
+      assertTrue("Uploaded file must be marked as sent", sentFile.exists());
+      expect.that(hasRecordedUploadTime(sentFile)).isTrue();
+      verify(mockAuditLogger)
+          .logEvent(
+              eq("LOGS_UPLOAD_SUCCESS"),
+              eq("Successfully automatically uploaded 1 log file(s) to WebDAV server."));
+      expect
+          .that(
+              Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+                  .getAllNotifications())
+          .isEmpty();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenWebDavCredentialsMissing_returnsRetryAndNotifiesUser() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    testDataStore
+        .updateDataAsync(
+            preferences ->
+                preferences.toBuilder()
+                    .setRemoteStorageConfig(
+                        RemoteStorageConfig.newBuilder()
+                            .setStorageType(StorageType.STORAGE_TYPE_WEBDAV)
+                            .setWebdavServerUrl(ENCRYPTED_WEBDAV_SERVER_URL))
+                    .build())
+        .get();
+
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorker();
+
+    assertEquals(Result.retry(), result);
+    assertTrue(fileToProcess.exists());
+    verify(mockAuditLogger)
+        .logEvent(
+            eq("UPLOAD_DESTINATION_NOT_CONFIGURED"),
+            eq("Upload deferred: WebDAV server URL or credentials not configured."));
+    assertNotificationPosted();
+  }
+
+  @Test
+  public void doWork_whenWebDavPasswordCannotBeDecrypted_returnsRetryAndNotifiesUser()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenThrow(new CrumblesKeysException("Simulated decryption failure"));
+    configureWebDav("https://webdav.example.com/");
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorker();
+
+    assertEquals(Result.retry(), result);
+    assertTrue(fileToProcess.exists());
+    verify(mockAuditLogger)
+        .logEvent(
+            eq("UPLOAD_CREDENTIALS_DECRYPTION_FAILED"),
+            eq("Upload deferred: the saved WebDAV credentials could not be decrypted."));
+    assertNotificationPosted();
+  }
+
+  @Test
+  public void doWork_whenWebDavServerUrlCannotBeDecrypted_returnsRetryAndNotifiesUser()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    configureWebDav("https://webdav.example.com/");
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_SERVER_URL, CrumblesConstants.WEBDAV_SERVER_URL_ENTRY_ID))
+        .thenThrow(new CrumblesKeysException("Simulated decryption failure"));
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorker();
+
+    assertEquals(Result.retry(), result);
+    assertTrue(fileToProcess.exists());
+    verify(mockAuditLogger)
+        .logEvent(
+            eq("UPLOAD_CREDENTIALS_DECRYPTION_FAILED"),
+            eq("Upload deferred: the saved WebDAV credentials could not be decrypted."));
+    assertNotificationPosted();
+  }
+
+  @Test
+  public void doWork_whenSomeWebDavUploadsFail_postsNeutralFailureNotification() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    long timestamp = InstantSource.system().instant().toEpochMilli();
+    createFile("log_", timestamp, ".bin", "uploaded");
+    File failingFile = createFile("log_", timestamp + 1, ".bin", "failing");
+    HttpServer server = startWebDavServer(path -> path.endsWith(failingFile.getName()) ? 500 : 201);
+    try {
+      String serverUrl = "http://localhost:" + server.getAddress().getPort() + "/webdav";
+      configureWebDav(serverUrl);
+
+      Result result = runWorker();
+
+      assertEquals(Result.retry(), result);
+      assertNotificationPosted();
+      Notification notification =
+          Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+              .getNotification(CrumblesConstants.UPLOAD_NOTIFICATION_ID);
+      expect
+          .that(Shadows.shadowOf(notification).getContentTitle().toString())
+          .isEqualTo(context.getString(R.string.notification_title_upload_interrupted));
+      expect
+          .that(Shadows.shadowOf(notification).getContentText().toString())
+          .isEqualTo(context.getString(R.string.notification_text_upload_failed));
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenWebDavUploadFails_triesItOnlyOnceInTheRun() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    List<String> uploadedPaths = new ArrayList<>();
+    HttpServer server =
+        startWebDavServer(
+            path -> {
+              uploadedPaths.add(path);
+              return HttpURLConnection.HTTP_INTERNAL_ERROR;
+            });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      File failingFile =
+          createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.retry());
+      // The failed batch waits for the backoff rather than being uploaded again in this run.
+      expect.that(uploadedPaths).hasSize(1);
+      expect.that(failingFile.exists()).isTrue();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenWebDavServerDropsTheConnection_stopsTheRunAfterTheFirstBatch()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    AtomicInteger requestCount = new AtomicInteger();
+    HttpServer server =
+        HttpServer.create(new InetSocketAddress("localhost", /* port= */ 0), /* backlog= */ 0);
+    server.createContext(
+        "/webdav",
+        exchange -> {
+          requestCount.incrementAndGet();
+          // Closing the exchange before any response closes the connection.
+          exchange.close();
+        });
+    server.start();
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      long timestamp = InstantSource.system().instant().toEpochMilli();
+      File firstFile = createFile("log_", timestamp, ".bin", "first");
+      File secondFile = createFile("log_", timestamp + 1, ".bin", "second");
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.retry());
+      expect.that(requestCount.get()).isEqualTo(1);
+      expect.that(firstFile.exists()).isTrue();
+      expect.that(secondFile.exists()).isTrue();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenWebDavServerHoldsPinnedKey_uploadsAndMarksSent() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    HttpsServer server = startHttpsWebDavServer(new AtomicBoolean());
+    Security.insertProviderAt(new TestRootTrustProvider(), 1);
+    try {
+      configurePinnedWebDav(
+          "https://localhost:" + server.getAddress().getPort() + "/webdav",
+          sha256(serverCertificate.keyPair().getPublic()));
+      File fileToProcess =
+          createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.success());
+      expect
+          .that(
+              new File(
+                      testDirectory,
+                      fileToProcess.getName().replace(".bin", CrumblesConstants.SENT_SUFFIX))
+                  .exists())
+          .isTrue();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenWebDavServerPresentsAnotherKey_keepsBatchAndReportsKeyChange()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    AtomicBoolean requestReceived = new AtomicBoolean();
+    AtomicInteger handshakesAttempted = new AtomicInteger();
+    HttpsServer server = startHttpsWebDavServer(requestReceived, handshakesAttempted);
+    Security.insertProviderAt(new TestRootTrustProvider(), 1);
+    try {
+      configurePinnedWebDav(
+          "https://localhost:" + server.getAddress().getPort() + "/webdav",
+          sha256(KeyPairGenerator.getInstance("EC").generateKeyPair().getPublic()));
+      long timestamp = InstantSource.system().instant().toEpochMilli();
+      File fileToProcess = createFile("log_", timestamp, ".bin", "content");
+      File secondFile = createFile("log_", timestamp + 1, ".bin", "content2");
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.retry());
+      expect.that(fileToProcess.exists()).isTrue();
+      expect.that(secondFile.exists()).isTrue();
+      // Stops after the first rejected handshake rather than reconnecting for remaining batches.
+      expect.that(handshakesAttempted.get()).isEqualTo(1);
+      // Requests carry the credentials, so none may reach a server that lacks the pinned key.
+      expect.that(requestReceived.get()).isFalse();
+      verify(mockAuditLogger)
+          .logEvent(
+              eq("UPLOAD_SERVER_KEY_REJECTED"),
+              eq(
+                  "Upload refused: the WebDAV server presented a public key other than the pinned"
+                      + " one; logs preserved on disk."));
+      Notification notification =
+          Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+              .getNotification(CrumblesConstants.UPLOAD_NOTIFICATION_ID);
+      expect
+          .that(Shadows.shadowOf(notification).getContentText().toString())
+          .isEqualTo(context.getString(R.string.notification_text_upload_server_key_changed));
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenPinnedWebDavServerKeyIsNotADigest_reportsUnreadableSettings()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    configurePinnedWebDav("https://webdav.example.com/", new byte[31]);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorker();
+
+    expect.that(result).isEqualTo(Result.retry());
+    expect.that(fileToProcess.exists()).isTrue();
+    verify(mockAuditLogger).logEvent(eq("UPLOAD_CREDENTIALS_DECRYPTION_FAILED"), anyString());
+  }
+
+  @Test
+  public void doWork_whenHttpsWebDavServerKeyWasNeverConfirmed_keepsBatchAndAsksToConfirmIt()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    // Like settings saved before servers were pinned, these hold no pinned key.
+    configureWebDav("https://webdav.example.com/");
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+    Result result = runWorker();
+
+    expect.that(result).isEqualTo(Result.retry());
+    expect.that(fileToProcess.exists()).isTrue();
+    verify(mockAuditLogger)
+        .logEvent(
+            eq("UPLOAD_SERVER_KEY_NOT_CONFIRMED"),
+            eq(
+                "Upload refused: no confirmed key for the HTTPS WebDAV server; logs preserved on"
+                    + " disk."));
+    Notification notification =
+        Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+            .getNotification(CrumblesConstants.UPLOAD_NOTIFICATION_ID);
+    expect
+        .that(Shadows.shadowOf(notification).getContentText().toString())
+        .isEqualTo(context.getString(R.string.notification_text_upload_server_key_not_confirmed));
+  }
+
+  @Test
+  public void resolveStorageUploader_whenWebDavConfigured_returnsWebDavUploader() throws Exception {
+    configurePinnedWebDav("https://webdav.example.com/", new byte[32]);
+
+    RemoteStorageUploader uploader =
+        CrumblesSendAndMarkProcessingWorker.resolveStorageUploader(context);
+
+    assertThat(uploader).isNotNull();
+    assertThat(uploader.getStorageType()).isEqualTo(StorageType.STORAGE_TYPE_WEBDAV);
+  }
+
+  @Test
+  public void doWork_whenWebDavConfigured_wipesDecryptedCredentialsAndStillAuthenticates()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    byte[] decryptedUsername = "user".getBytes(UTF_8);
+    byte[] decryptedPassword = "pass".getBytes(UTF_8);
+    HttpServer server = startWebDavServer(path -> 201);
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      when(mockLogsEncryptor.decryptDataStoreEntry(
+              ENCRYPTED_WEBDAV_USERNAME, CrumblesConstants.WEBDAV_USERNAME_ENTRY_ID))
+          .thenReturn(decryptedUsername);
+      when(mockLogsEncryptor.decryptDataStoreEntry(
+              ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+          .thenReturn(decryptedPassword);
+      createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.success());
+      expect.that(decryptedUsername).isEqualTo(new byte[decryptedUsername.length]);
+      expect.that(decryptedPassword).isEqualTo(new byte[decryptedPassword.length]);
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void resolveStorageUploader_whenPasswordCannotBeDecrypted_wipesDecryptedUsername()
+      throws Exception {
+    byte[] decryptedUsername = "user".getBytes(UTF_8);
+    configureWebDav("https://webdav.example.com/");
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_USERNAME, CrumblesConstants.WEBDAV_USERNAME_ENTRY_ID))
+        .thenReturn(decryptedUsername);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenThrow(new CrumblesKeysException("Simulated decryption failure"));
+
+    RemoteStorageUploader uploader =
+        CrumblesSendAndMarkProcessingWorker.resolveStorageUploader(context);
+
+    expect.that(uploader).isNull();
+    expect.that(decryptedUsername).isEqualTo(new byte[decryptedUsername.length]);
+  }
+
+  @Test
+  public void doWork_uploadsOldestFirst_whenNamesSortDifferently() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+
+    List<String> uploadedPaths = new ArrayList<>();
+    HttpServer server =
+        startWebDavServer(
+            path -> {
+              uploadedPaths.add(path);
+              return 201;
+            });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+
+      long now = InstantSource.system().instant().toEpochMilli();
+      // file C is oldest, file A is middle, file B is newest
+      File fileC = createFile("file_C_", now - 2000, ".bin", "c1");
+      fileC.setLastModified(now - 2000);
+      File fileA = createFile("file_A_", now - 1000, ".bin", "c2");
+      fileA.setLastModified(now - 1000);
+      File fileB = createFile("file_B_", now, ".bin", "c3");
+      fileB.setLastModified(now);
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.success());
+      expect.that(uploadedPaths).hasSize(3);
+      expect.that(uploadedPaths.get(0)).endsWith("file_C_" + (now - 2000) + ".bin");
+      expect.that(uploadedPaths.get(1)).endsWith("file_A_" + (now - 1000) + ".bin");
+      expect.that(uploadedPaths.get(2)).endsWith("file_B_" + now + ".bin");
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenDeferralRecursAfterQueueEmpties_reportsItAgain()
+      throws IOException, ExecutionException, InterruptedException {
+    long timestamp = InstantSource.system().instant().toEpochMilli();
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    File log1 = createFile("log1_", timestamp, ".bin", "c1");
+    runWorker();
+    assertTrue(log1.delete());
+    assertEquals(Result.success(), runWorker());
+    createFile("log2_", timestamp + 10, ".bin", "c2");
+    context.getSystemService(NotificationManager.class).cancelAll();
+
+    Result result = runWorker();
+
+    assertEquals(Result.retry(), result);
+    verify(mockAuditLogger, times(2))
+        .logEvent(eq("UPLOAD_DESTINATION_NOT_CONFIGURED"), anyString());
+    assertNotificationPosted();
+  }
+
+  @Test
+  public void uploadAndStop_handlesCancellationConcurrencyAndInFlightRollback() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
+    File dir = testDirectory;
+    File log1 = createFile("log1_", 1L, ".bin", "c1");
+    File log2 = createFile("log2_", 2L, ".bin", "c2");
+    CrumblesSendAndMarkProcessingWorker worker =
+        TestListenableWorkerBuilder.from(context, CrumblesSendAndMarkProcessingWorker.class)
+            .build();
+    fakeDriveProvider.onOpenFile =
+        () -> callInstanceMethod(worker, "stop", ClassParameter.from(int.class, 1));
+    assertEquals(Result.retry(), worker.doWork());
+    assertThat(dir.list((d, n) -> n.endsWith(CrumblesConstants.SENT_SUFFIX))).hasLength(1);
+    verify(mockAuditLogger).logEvent(eq("LOGS_UPLOAD_SUCCESS"), anyString());
+    verify(mockAuditLogger, never()).logEvent(eq("LOGS_UPLOAD_FAILED"), anyString());
+    fakeDriveProvider.onOpenFile = null;
+    assertTrue((log1.exists() ? log1 : log2).delete());
+    RemoteStorageUploader up = mock(RemoteStorageUploader.class);
+    assertFalse(uploadSingleFile(context, up, log2, dir));
+    File f1 = createFile("f1_", 1L, ".bin", "c1");
+    createFile("f2_", 2L, ".bin", "c2");
+    when(up.uploadFile(any(), any(), anyString()))
+        .thenAnswer(
+            i -> {
+              File p = i.getArgument(1);
+              String n = i.getArgument(2);
+              if (!n.equals("f1_1.bin")) {
+                return p.delete() && n.equals("d1_1.bin");
+              }
+              assertFalse(Thread.holdsLock(CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK));
+              assertEquals(Result.success(), runWorker());
+              assertTrue(p.exists() && new File(dir, "f2_2_sent.bin").exists());
+              return false;
+            });
+    assertTrue(!uploadSingleFile(context, up, f1, dir) && f1.exists());
+    assertTrue(f1.renameTo(new File(dir, "f1_1_processing.bin")));
+    assertTrue(runWorker().equals(Result.success()) && new File(dir, "f1_1_sent.bin").exists());
+    assertFalse(uploadSingleFile(context, up, createFile("d1_", 1L, ".bin", "c"), dir));
+    assertFalse(uploadSingleFile(context, up, createFile("d2_", 2L, ".bin", "c"), dir));
   }
 }

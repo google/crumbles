@@ -16,6 +16,7 @@
 -->
 
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <files-path name="secure_logs" path="logs/" />
+    <!-- Only re-encrypted copies are shared. Stored batches have no path here, so that no URI,
+         and so no grant, can name one. -->
     <cache-path name="shared_logs" path="reencrypted_logs/" />
 </paths>

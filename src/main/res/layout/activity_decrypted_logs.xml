@@ -43,12 +43,18 @@
         android:layout_below="@id/warning_text_view"
         android:layout_marginBottom="8dp">
 
+        <!-- Plaintext logs must not reach the clipboard, so the text cannot be
+             selected or long-pressed. Only accessibility tools such as screen
+             readers may read it: FLAG_SECURE does not keep it from other
+             accessibility services. -->
         <TextView
             android:id="@+id/decrypted_logs_text_view"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textAppearance="?android:attr/textAppearanceSmall"
-            android:textIsSelectable="true"/>
+            android:textIsSelectable="false"
+            android:longClickable="false"
+            android:accessibilityDataSensitive="yes"/>
     </androidx.core.widget.NestedScrollView>
 
     <LinearLayout

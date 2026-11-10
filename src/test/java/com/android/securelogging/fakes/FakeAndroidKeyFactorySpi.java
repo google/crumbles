@@ -29,8 +29,8 @@ import java.security.spec.KeySpec;
 
 /**
  * Fake AndroidKeyStore {@link KeyFactorySpi} that only exposes the {@link KeyInfo} of private keys
- * held by {@link FakeAndroidKeyStoreSpi}, reporting the encryption paddings they were generated
- * with.
+ * held by {@link FakeAndroidKeyStoreSpi}, reporting the encryption paddings and the user
+ * authentication they were generated with.
  */
 public class FakeAndroidKeyFactorySpi extends KeyFactorySpi {
 
@@ -43,12 +43,16 @@ public class FakeAndroidKeyFactorySpi extends KeyFactorySpi {
     }
     KeyInfo keyInfo = mock(KeyInfo.class);
     when(keyInfo.getEncryptionPaddings()).thenReturn(entry.getSpec().getEncryptionPaddings());
+    when(keyInfo.isUserAuthenticationRequired())
+        .thenReturn(entry.getSpec().isUserAuthenticationRequired());
+    when(keyInfo.getUserAuthenticationValidityDurationSeconds())
+        .thenReturn(entry.getSpec().getUserAuthenticationValidityDurationSeconds());
     return keySpec.cast(keyInfo);
   }
 
   @Override
-  protected PublicKey engineGeneratePublic(KeySpec keySpec) {
-    throw new UnsupportedOperationException("Not supported by this fake.");
+  protected PublicKey engineGeneratePublic(KeySpec keySpec) throws InvalidKeySpecException {
+    throw new InvalidKeySpecException("Not supported by this fake.");
   }
 
   @Override

@@ -19,12 +19,19 @@ package com.android.securelogging;
 import static com.google.common.base.Strings.isNullOrEmpty;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ComponentCallbacks2;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.SpannableStringBuilder;
 import android.util.Log;
+import android.view.Window;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.TextView;
@@ -32,27 +39,42 @@ import android.widget.Toast;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 import androidx.core.content.FileProvider;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.android.securelogging.exceptions.CrumblesKeysException;
+import com.google.common.collect.ImmutableList;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.PublicKey;
 import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
-import java.util.stream.Stream;
 
 /** An activity to display decrypted Crumbles logs and offer re-encryption and sharing options. */
 public class CrumblesDecryptedLogsActivity extends Activity {
   private static final String TAG = "[CrumblesDecryptedLogsView]";
   private static final int RE_ENCRYPT_KEY_REQUEST_CODE = 42; // Unique request code.
+  private static final int SHARE_REQUEST_CODE = 43;
 
-  private ArrayList<CrumblesDecryptedLogEntry> decryptedLogEntries;
+  /** The activity this viewer started and waits for, which decides what leaving the screen does. */
+  private enum AwaitedResult {
+    NONE,
+    KEY_SELECTION,
+    SHARE
+  }
+
+  private ArrayList<CrumblesDecryptedLogEntry> decryptedLogEntries = new ArrayList<>();
+  private long sessionId;
+  private TextView decryptedLogsTextView;
+  private AwaitedResult awaitedResult = AwaitedResult.NONE;
+
   private CrumblesLogsEncryptor logsEncryptor;
   private CrumblesExternalPublicKeyManager publicKeyManager;
-  private ArrayList<File> tempReEncryptedFilesForSharing = new ArrayList<>();
+  private final ArrayList<File> tempReEncryptedFilesForSharing = new ArrayList<>();
+  @Nullable @VisibleForTesting AlertDialog activeShareDialog;
 
   @SuppressWarnings("NonFinalStaticField")
   @VisibleForTesting
@@ -61,11 +83,16 @@ public class CrumblesDecryptedLogsActivity extends Activity {
   @Override
   protected void onCreate(Bundle savedInstanceState) {
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
     setContentView(R.layout.activity_decrypted_logs);
+    CrumblesWindowInsets.applySystemBarPadding(this);
     setTitle(R.string.decrypted_logs_viewer_title);
+    // Any staged file belongs to an earlier share that is over by now, for instance because the
+    // process was killed before onDestroy() could run.
+    CrumblesReEncryptedCache.sweep(this);
 
-    TextView decryptedLogsTextView = findViewById(R.id.decrypted_logs_text_view);
+    decryptedLogsTextView = findViewById(R.id.decrypted_logs_text_view);
     Button closeButton = findViewById(R.id.close_button);
     Button reEncryptAndShareButton = findViewById(R.id.reencrypt_and_share_button);
 
@@ -85,7 +112,7 @@ public class CrumblesDecryptedLogsActivity extends Activity {
     }
 
     Intent intent = getIntent();
-    long sessionId =
+    sessionId =
         intent != null
             ? intent.getLongExtra(
                 CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, /* defaultValue= */ -1)
@@ -126,6 +153,8 @@ public class CrumblesDecryptedLogsActivity extends Activity {
         v -> {
           if (decryptedLogEntries != null && !decryptedLogEntries.isEmpty()) {
             Intent keySelectorIntent = new Intent(this, CrumblesReEncryptKeysActivity.class);
+            keySelectorIntent.putExtra(CrumblesConstants.EXTRA_DECRYPTED_SESSION_ID, sessionId);
+            awaitedResult = AwaitedResult.KEY_SELECTION;
             startActivityForResult(keySelectorIntent, RE_ENCRYPT_KEY_REQUEST_CODE);
           } else {
             showToast("No content to re-encrypt and share.");
@@ -134,20 +163,48 @@ public class CrumblesDecryptedLogsActivity extends Activity {
   }
 
   @Override
+  protected void onStart() {
+    super.onStart();
+
+  }
+
+  @Override
   protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
     super.onActivityResult(requestCode, resultCode, data);
     if (requestCode == RE_ENCRYPT_KEY_REQUEST_CODE) {
+      awaitedResult = AwaitedResult.NONE;
       if (resultCode == Activity.RESULT_OK && data != null) {
+        if (CrumblesDecryptedLogsSession.getSession(sessionId).isEmpty()) {
+          wipeDecryptedLogs();
+          finish();
+          return;
+        }
         String keyIdentifier =
             data.getStringExtra(CrumblesReEncryptKeysActivity.EXTRA_SELECTED_KEY_ALIAS);
         boolean isInternal =
             data.getBooleanExtra(
                 CrumblesReEncryptKeysActivity.EXTRA_SELECTED_KEY_IS_INTERNAL, false);
         handleReEncryption(keyIdentifier, isInternal);
+      } else if (CrumblesDecryptedLogsSession.getSession(sessionId).isEmpty()) {
+        wipeDecryptedLogs();
+        finish();
       } else {
         showToast("Re-encryption cancelled.");
       }
+    } else if (requestCode == SHARE_REQUEST_CODE) {
+      awaitedResult = AwaitedResult.NONE;
+      onBackFromShare();
     }
+  }
+
+  /**
+   * Deletes the staged copies once the user is back from sharing them, and leaves if the share
+   * target had covered this screen, since {@link #onStop()} wiped the logs then.
+   */
+  private void onBackFromShare() {
+    cleanUpTemporaryFiles();
+    wipeDecryptedLogs();
+    finish();
   }
 
   @VisibleForTesting
@@ -161,9 +218,14 @@ public class CrumblesDecryptedLogsActivity extends Activity {
     try {
       List<PublicKey> externalKeys = publicKeyManager.getExternalReEncryptPublicKeys();
       for (PublicKey key : externalKeys) {
-        if (CrumblesLogsEncryptor.getPublicKeyHash(key).equals(keyIdentifier)) {
-          reEncryptionKey = key;
-          break;
+        try {
+          if (CrumblesLogsEncryptor.getPublicKeyFingerprint(key).equals(keyIdentifier)) {
+            reEncryptionKey = key;
+            break;
+          }
+        } catch (CrumblesKeysException e) {
+          // Skip only this key: the selected one can come later in the list.
+          Log.e(TAG, "Error calculating fingerprint for re-encryption key", e);
         }
       }
     } catch (RuntimeException e) {
@@ -180,7 +242,8 @@ public class CrumblesDecryptedLogsActivity extends Activity {
 
   @VisibleForTesting
   void reEncryptAndOfferToShareLogs(PublicKey reEncryptionKey) {
-    File tempDirBase = new File(getCacheDir(), CrumblesConstants.TEMP_RE_ENCRYPTED_DIR);
+    CrumblesReEncryptedCache.sweep(this);
+    File tempDirBase = CrumblesReEncryptedCache.getDirectory(this);
     if (!tempDirBase.exists()) {
       if (!tempDirBase.mkdirs()) {
         Log.e(
@@ -190,8 +253,6 @@ public class CrumblesDecryptedLogsActivity extends Activity {
         showToast("Error creating temporary storage.");
         return;
       }
-    } else {
-      clearDirectory(tempDirBase.toPath());
     }
 
     tempReEncryptedFilesForSharing.clear();
@@ -207,8 +268,7 @@ public class CrumblesDecryptedLogsActivity extends Activity {
         continue;
       }
       try {
-        LogBatch encryptedBatch =
-            logsEncryptor.reEncryptLogBatch(entry.getRawBytes(), reEncryptionKey);
+        LogBatch encryptedBatch = reEncryptEntry(entry, entry.getRawBytes(), reEncryptionKey);
 
         String sanitizedOriginalFileName = entry.getFileName().replaceAll("[^a-zA-Z0-9._-]", "_");
         String tempFileName =
@@ -255,20 +315,25 @@ public class CrumblesDecryptedLogsActivity extends Activity {
         shareIntent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, reEncryptedFileUris);
         shareIntent.setType("*/*");
       }
+      shareIntent.setClipData(clipDataFor(reEncryptedFileUris));
       shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
       shareIntent.putExtra(Intent.EXTRA_SUBJECT, "Re-encrypted Crumbles Log(s)");
 
-      try {
-        startActivity(Intent.createChooser(shareIntent, "Share Re-encrypted Log(s) Via"));
-        String shareMessage =
-            allSuccess
-                ? "All logs re-encrypted. Choose an app to share."
-                : "Some logs re-encrypted. Choose an app to share.";
-        showToast(shareMessage);
-      } catch (ActivityNotFoundException ex) {
-        showToast("No application can handle this share request.");
-        cleanUpTemporaryFiles();
-      }
+      String shareMessage =
+          allSuccess
+              ? "All logs re-encrypted. Choose an app to share."
+              : "Some logs re-encrypted. Choose an app to share.";
+      // The batches can now leave the phone, for whoever holds the key's private key.
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              "LOGS_RE_ENCRYPTED",
+              "Re-encrypted "
+                  + reEncryptedFileUris.size()
+                  + " batch(es) to share them, to the key with fingerprint "
+                  + fingerprintOf(reEncryptionKey)
+                  + ".");
+      showToast(shareMessage);
+      chooseShareTarget(shareIntent);
     } else if (allSuccess && decryptedLogEntries != null && !decryptedLogEntries.isEmpty()) {
       showToast("Re-encryption seems to have produced no files to share.");
     } else if (!allSuccess) {
@@ -278,64 +343,124 @@ public class CrumblesDecryptedLogsActivity extends Activity {
     }
   }
 
-  private void cleanUpTemporaryFiles() {
-    if (tempReEncryptedFilesForSharing.isEmpty()) {
-      Log.d(TAG, "No temporary files to clean up.");
-      return;
+  /**
+   * Packs {@code uris} into a {@link ClipData} so {@link Intent#FLAG_GRANT_READ_URI_PERMISSION}
+   * grants the chosen recipient read access to every staged file.
+   */
+  private static ClipData clipDataFor(List<Uri> uris) {
+    ClipData clipData = ClipData.newRawUri(/* label= */ null, uris.get(0));
+    for (int i = 1; i < uris.size(); i++) {
+      clipData.addItem(new ClipData.Item(uris.get(i)));
     }
-    Log.d(
-        TAG, "Cleaning up " + tempReEncryptedFilesForSharing.size() + " temporary share files...");
-    for (File file : tempReEncryptedFilesForSharing) {
-      if (file.exists()) {
-        if (file.delete()) {
-          Log.d(TAG, "Deleted temporary file: " + file.getAbsolutePath());
-        } else {
-          Log.w(TAG, "Failed to delete temporary file: " + file.getAbsolutePath());
-        }
-      }
-    }
-    tempReEncryptedFilesForSharing.clear();
+    return clipData;
+  }
 
-    File tempDirBase = new File(getCacheDir(), CrumblesConstants.TEMP_RE_ENCRYPTED_DIR);
-    if (tempDirBase.exists() && tempDirBase.isDirectory()) {
-      File[] filesInDir = tempDirBase.listFiles();
-      if (filesInDir == null || filesInDir.length == 0) {
-        if (tempDirBase.delete()) {
-          Log.d(TAG, "Deleted empty temporary directory: " + tempDirBase.getAbsolutePath());
-        } else {
-          Log.w(
-              TAG, "Failed to delete empty temporary directory: " + tempDirBase.getAbsolutePath());
-        }
-      }
+  /** Returns the fingerprint of {@code key}, or "unavailable" if it cannot be computed. */
+  private static String fingerprintOf(PublicKey key) {
+    try {
+      return CrumblesLogsEncryptor.getPublicKeyFingerprint(key);
+    } catch (CrumblesKeysException e) {
+      return "unavailable";
     }
   }
 
-  /* Helper method to clear a directory. */
-  private void clearDirectory(Path directory) {
-    if (Files.exists(directory) && Files.isDirectory(directory)) {
-      try (Stream<Path> stream = Files.walk(directory)) {
-        if (stream != null) {
-          stream
-              .sorted((path1, path2) -> path2.compareTo(path1))
-              .forEach(
-                  path -> {
-                    try {
-                      if (!path.equals(directory)) { // Don't delete the root dir itself here.
-                        Files.delete(path);
-                        Log.d(TAG, "Cleaned old file/dir: " + path.toFile().getAbsolutePath());
-                      }
-                    } catch (IOException e) {
-                      Log.w(
-                          TAG,
-                          "Failed to delete old file/dir: " + path.toFile().getAbsolutePath(),
-                          e);
-                    }
-                  });
-        }
-      } catch (IOException e) {
-        Log.w(TAG, "Failed to clear directory: " + directory.toFile().getAbsolutePath(), e);
-      }
+  /**
+   * Lists the apps that accept {@code shareIntent} for the user to pick one. Unlike the system
+   * chooser, which can read the staged files as soon as it opens, no app can read them before the
+   * user confirms it.
+   */
+  private void chooseShareTarget(Intent shareIntent) {
+    PackageManager packageManager = getPackageManager();
+    ImmutableList<ResolveInfo> targets =
+        ImmutableList.sortedCopyOf(
+            new ResolveInfo.DisplayNameComparator(packageManager),
+            packageManager.queryIntentActivities(shareIntent, PackageManager.MATCH_DEFAULT_ONLY));
+    if (targets.isEmpty()) {
+      showToast(getString(R.string.toast_no_app_for_re_encrypted_logs));
+      cleanUpTemporaryFiles();
+      return;
     }
+    CharSequence[] labels = targets.stream().map(this::labelOf).toArray(CharSequence[]::new);
+    showSecureShareDialog(
+        new AlertDialog.Builder(this)
+            .setTitle(R.string.dialog_title_choose_share_target)
+            .setItems(
+                labels, (dialog, which) -> confirmShareTarget(targets.get(which), shareIntent))
+            .setOnCancelListener(dialog -> cleanUpTemporaryFiles())
+            .create());
+  }
+
+  /**
+   * Returns the label of {@code target}, {@link CrumblesDeviceAdminReceiver#escapeLabel escaped and
+   * capped} so that line breaks, bidi controls or long runs of filler characters in it cannot hide
+   * or push out of view the package name shown next to it.
+   */
+  private String labelOf(ResolveInfo target) {
+    return getString(
+        R.string.share_target_app,
+        CrumblesDeviceAdminReceiver.escapeLabel(target.loadLabel(getPackageManager())),
+        target.activityInfo.packageName);
+  }
+
+  /** Names the picked app and its package, and sends it the staged files once the user confirms. */
+  private void confirmShareTarget(ResolveInfo target, Intent shareIntent) {
+    String escapedLabel =
+        CrumblesDeviceAdminReceiver.escapeLabel(target.loadLabel(getPackageManager()));
+    String packageName = target.activityInfo.packageName;
+    showSecureShareDialog(
+        new AlertDialog.Builder(this)
+            .setTitle(
+                getString(R.string.dialog_title_confirm_share_target, escapedLabel, packageName))
+            .setMessage(
+                getString(R.string.dialog_message_confirm_share_target, escapedLabel, packageName))
+            .setPositiveButton(
+                R.string.dialog_button_send,
+                (dialog, which) -> shareWith(target.activityInfo, shareIntent))
+            .setNegativeButton(android.R.string.cancel, (dialog, which) -> cleanUpTemporaryFiles())
+            .setOnCancelListener(dialog -> cleanUpTemporaryFiles())
+            .create());
+  }
+
+  private void showSecureShareDialog(AlertDialog dialog) {
+    activeShareDialog = dialog;
+    dialog.setOnDismissListener(
+        dismissed -> {
+          if (Objects.equals(activeShareDialog, dismissed)) {
+            activeShareDialog = null;
+          }
+        });
+    Window window = dialog.getWindow();
+    if (window != null) {
+      // A dialog window does not inherit FLAG_SECURE or overlay hiding from the activity window.
+      window.addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+      window.setHideOverlayWindows(true);
+    }
+    dialog.show();
+  }
+
+  /**
+   * Sends the staged files to {@code target} only, which gets a grant to read each of them. {@link
+   * CrumblesReEncryptedCache#sweep} revokes those grants when it deletes the files.
+   */
+  private void shareWith(ActivityInfo target, Intent shareIntent) {
+    try {
+      // The target's result tells this viewer that the user is back.
+      startActivityForResult(
+          new Intent(shareIntent).setClassName(target.packageName, target.name),
+          SHARE_REQUEST_CODE);
+      awaitedResult = AwaitedResult.SHARE;
+    } catch (ActivityNotFoundException | SecurityException e) {
+      // The app was removed, or stopped exporting the activity, after the user picked it.
+      Log.e(TAG, "Failed to send the re-encrypted logs to " + target.packageName, e);
+      showToast(getString(R.string.toast_no_app_for_re_encrypted_logs));
+      cleanUpTemporaryFiles();
+    }
+  }
+
+  private void cleanUpTemporaryFiles() {
+    Log.d(TAG, "Cleaning up " + tempReEncryptedFilesForSharing.size() + " temporary share files.");
+    tempReEncryptedFilesForSharing.clear();
+    CrumblesReEncryptedCache.sweep(this);
   }
 
   private void showToast(String message) {
@@ -345,40 +470,94 @@ public class CrumblesDecryptedLogsActivity extends Activity {
   @Override
   protected void onDestroy() {
     super.onDestroy();
+    if (isChangingConfigurations()) {
+      return; // The recreated viewer shows the same session.
+    }
     cleanUpTemporaryFiles();
-    CrumblesDecryptedLogsSession.destroyActiveSession();
-    if (decryptedLogEntries != null) {
-      for (CrumblesDecryptedLogEntry entry : decryptedLogEntries) {
-        entry.wipe();
+    wipeDecryptedLogs();
+  }
+
+  /**
+   * Wipes the decrypted logs once this screen is no longer visible, so that showing them again
+   * takes a new decryption, and with it a new authentication, from {@link CrumblesMain}.
+   */
+  @Override
+  protected void onStop() {
+    super.onStop();
+
+    if (isChangingConfigurations()) {
+      return; // The recreated viewer shows the same session.
+    }
+    switch (awaitedResult) {
+      case KEY_SELECTION -> {} // The re-encryption that follows needs the decrypted bytes.
+      case SHARE -> wipeDecryptedLogs(); // Stay to delete the staged copies once the user is back.
+      case NONE -> {
+        if (activeShareDialog != null) {
+          activeShareDialog.dismiss();
+        }
+        cleanUpTemporaryFiles();
+        wipeDecryptedLogs();
+        finish();
       }
-      decryptedLogEntries.clear();
     }
   }
 
-  /** FOR TESTING PURPOSES ONLY to allow tests to populate the list. */
-  void addFileToTrackForTesting(File f) {
-    if (tempReEncryptedFilesForSharing == null) {
-      tempReEncryptedFilesForSharing = new ArrayList<>();
+  /** Wipes the logs if the user leaves the app from the key picker, as no result will use them. */
+  @Override
+  public void onTrimMemory(int level) {
+    super.onTrimMemory(level);
+    if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+        && awaitedResult.equals(AwaitedResult.KEY_SELECTION)) {
+      wipeDecryptedLogs();
+      finish();
     }
-    tempReEncryptedFilesForSharing.add(f);
   }
 
-  /** FOR TESTING PURPOSES ONLY to allow tests to modify internal state. */
-  @VisibleForTesting
-  void setDecryptedLogEntriesForTest(List<CrumblesDecryptedLogEntry> entries) {
-    this.decryptedLogEntries = new ArrayList<>(entries);
-    Button reEncryptAndShareButton = findViewById(R.id.reencrypt_and_share_button);
-    TextView decryptedLogsTextView = findViewById(R.id.decrypted_logs_text_view);
-
-    if (reEncryptAndShareButton != null) {
-      reEncryptAndShareButton.setEnabled(
-          this.decryptedLogEntries != null && !this.decryptedLogEntries.isEmpty());
+  /**
+   * Re-encrypts {@code rawBytes} for {@code reEncryptionKey}. When {@code entry} came from a batch
+   * signed by this installation, the new batch is signed again under the original sequence number,
+   * attributed to this installation's device ID and sealing the attestation chain of its
+   * batch-signing key.
+   *
+   * <p>Format version 2 batches leave the cleartext outer {@code device_id} empty, so signing a
+   * re-encrypted copy stamped from {@code entry.getDeviceId()} would attest {@code unknown_device}.
+   * Any other batch, including one whose signature does not verify with this installation's key, is
+   * written unsigned with {@code entry.getDeviceId()}, without an attestation chain and without
+   * creating a batch-signing key.
+   */
+  private LogBatch reEncryptEntry(
+      CrumblesDecryptedLogEntry entry, byte[] rawBytes, PublicKey reEncryptionKey)
+      throws CrumblesKeysException {
+    LogBatch originalBatch = entry.getOriginalBatch();
+    if (originalBatch == null || !originalBatch.hasSignature()) {
+      return logsEncryptor.reEncryptLogBatch(rawBytes, reEncryptionKey, entry.getDeviceId());
     }
-
-    if (decryptedLogsTextView != null) {
-      if (this.decryptedLogEntries == null || this.decryptedLogEntries.isEmpty()) {
-        decryptedLogsTextView.setText(R.string.no_decrypted_log_content_to_display);
+    CrumblesBatchSigner batchSigner = new CrumblesBatchSigner(this);
+    if (batchSigner.isSignedByThisInstallation(originalBatch)) {
+      LogBatch localBatch =
+          logsEncryptor.reEncryptLogBatchForSigning(this, rawBytes, reEncryptionKey);
+      try {
+        return batchSigner.signAgain(originalBatch, localBatch);
+      } catch (CrumblesKeysException e) {
+        Log.e(TAG, "Failed to sign a re-encrypted log batch again; writing it unsigned.", e);
       }
     }
+    CrumblesAppAuditLogger.getInstance(this)
+        .logEvent(
+            CrumblesDeviceAdminReceiver.AUDIT_EVENT_BATCH_SIGNING_FAILED,
+            "Re-encrypted log batch "
+                + originalBatch.getSequenceNumber()
+                + " written without a signature: signing it again failed.");
+    return logsEncryptor.reEncryptLogBatch(rawBytes, reEncryptionKey, entry.getDeviceId());
+  }
+
+  /**
+   * Ends the session that held the decrypted logs, which zeroes the entries this viewer shares with
+   * it, and clears them from the screen.
+   */
+  private void wipeDecryptedLogs() {
+    decryptedLogEntries.clear();
+    CrumblesDecryptedLogsSession.destroySession(sessionId);
+    decryptedLogsTextView.setText("");
   }
 }

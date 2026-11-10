@@ -29,21 +29,48 @@
   <uses-permission android:name="android.permission.CAMERA" />
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <!-- Lets security-critical windows hide the overlays of other apps, which could otherwise spoof
+       what the user confirms. -->
+  <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
+  <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+  <!-- Lets the device admin receiver save, once the user unlocks the phone after a restart, the
+       security logs that the platform kept from before it. -->
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
   <application
       android:label="Crumbles"
       android:allowBackup="false"
       android:dataExtractionRules="@xml/data_extraction_rules"
       android:fullBackupContent="false"
+      android:networkSecurityConfig="@xml/network_security_config"
       android:theme="@style/Theme.Crumbles"
       android:icon="@mipmap/ic_launcher"
       android:roundIcon="@mipmap/ic_launcher_round">
-    <activity android:name=".CrumblesMain" android:exported="true">
+    <!-- Opened through one of the two launcher aliases below, or by Crumbles itself. -->
+    <activity android:name=".CrumblesMain" android:exported="false" />
+    <!-- Launcher entries: CrumblesLauncherEntry keeps exactly one of these two enabled. -->
+    <activity-alias
+            android:name=".CrumblesLauncher"
+            android:targetActivity=".CrumblesMain"
+            android:exported="true">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
         <category android:name="android.intent.category.LAUNCHER"/>
       </intent-filter>
-    </activity>
+    </activity-alias>
+    <activity-alias
+            android:name=".CrumblesNeutralLauncher"
+            android:targetActivity=".CrumblesMain"
+            android:label="@string/neutral_launcher_label"
+            android:icon="@mipmap/ic_launcher_neutral"
+            android:roundIcon="@mipmap/ic_launcher_neutral"
+            android:enabled="false"
+            android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity-alias>
     <activity
             android:name="CrumblesDecryptedLogsActivity"
             android:label="@string/decrypted_logs_viewer_title"
@@ -64,16 +91,24 @@
     </activity>
     <activity android:name=".audit.CrumblesAuditLogViewerActivity"
             android:label="@string/title_audit_log_viewer"
-            android:parentActivityName=".CrumblesMain">
+            android:parentActivityName=".CrumblesMain"
+            android:exported="false">
             <meta-data
                 android:name="android.support.PARENT_ACTIVITY"
                 android:value=".CrumblesMain" />
     </activity>
-    <activity android:name=".CrumblesReEncryptKeysActivity" />
+    <activity android:name=".CrumblesReEncryptKeysActivity" android:exported="false" />
+    <!-- Lists what Crumbles collects, where it goes and what it never does. CrumblesMain opens
+         it until the user acknowledges it, so it needs no intent filter and is not exported. -->
+    <activity
+            android:name=".CrumblesSetupActivity"
+            android:label="@string/setup_title"
+            android:exported="false" />
     <activity android:name=".CrumblesQrScannerActivity"
             android:label="Scan QR Code"
             android:screenOrientation="portrait"
-            android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+            android:theme="@style/Theme.Material3.DayNight.NoActionBar"
+            android:exported="false">
     </activity>
     <provider
           android:name="androidx.core.content.FileProvider"
@@ -84,10 +119,12 @@
             android:name="android.support.FILE_PROVIDER_PATHS"
             android:resource="@xml/file_paths" />
     </provider>
+    <!-- Exported, as Android documents for a device admin receiver. Only the system holds
+         BIND_DEVICE_ADMIN, so no other app can send it a broadcast. -->
     <receiver
             android:name=".CrumblesDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
-            android:exported="false">
+            android:exported="true">
             <meta-data
                 android:name="android.app.device_admin"
                 android:resource="@xml/device_admin" />
@@ -95,14 +132,35 @@
             <intent-filter>
                 <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
                 <action android:name="android.app.action.NETWORK_LOGS_AVAILABLE" />
+                <action android:name="android.app.action.USER_ADDED" />
+                <action android:name="android.app.action.USER_REMOVED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
-    <!-- Not exported. The chooser result is delivered through a
-         PendingIntent created by this app, so the receiver never needs
-         to be reachable by other applications. -->
+    <!-- Receives the logs once a device owner delegated security or network logging to
+         Crumbles. The platform finds this receiver through its intent filter. Only the system
+         holds BIND_DEVICE_ADMIN, so no other app can send it these broadcasts. -->
     <receiver
-        android:name=".CrumblesShareResultReceiver"
-        android:exported="false" />
+            android:name=".CrumblesDelegatedAdminReceiver"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.app.action.NETWORK_LOGS_AVAILABLE" />
+                <action android:name="android.app.action.SECURITY_LOGS_AVAILABLE" />
+            </intent-filter>
+        </receiver>
+    <!-- Quick Settings tile "Sync now". Exported so that System UI can bind it; only the system
+         holds BIND_QUICK_SETTINGS_TILE, so no app can bind or start it. -->
+    <service
+            android:name=".CrumblesSyncNowTileService"
+            android:label="@string/sync_now_tile_label"
+            android:icon="@drawable/ic_sync_now_tile"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+        <intent-filter>
+            <action android:name="android.service.quicksettings.action.QS_TILE" />
+        </intent-filter>
+    </service>
   </application>
     <queries>
         <intent>

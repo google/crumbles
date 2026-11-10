@@ -19,22 +19,55 @@ package com.android.securelogging;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import androidx.annotation.Nullable;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.Serializable;
 import java.util.Arrays;
 
 /** Represents a decrypted log entry retaining mutable raw bytes in volatile memory. */
 public class CrumblesDecryptedLogEntry implements Serializable {
   private final String fileName;
+  @Nullable private final String deviceId;
   private byte[] rawBytes;
+  @Nullable private final LogBatch originalBatch;
 
   /** Constructs a new entry with the file name and optional mutable raw bytes buffer. */
   public CrumblesDecryptedLogEntry(String fileName, @Nullable byte[] rawBytes) {
+    this(fileName, rawBytes, /* deviceId= */ null, /* originalBatch= */ null);
+  }
+
+  /**
+   * Constructs a new entry decrypted from a batch, retaining the original batch.
+   *
+   * @param fileName the name of the file the entry was decrypted from
+   * @param rawBytes the optional mutable raw bytes buffer
+   * @param deviceId the device id recorded in the original batch's metadata, or {@code null}
+   * @param originalBatch the original parsed LogBatch, or {@code null}
+   */
+  public CrumblesDecryptedLogEntry(
+      String fileName,
+      @Nullable byte[] rawBytes,
+      @Nullable String deviceId,
+      @Nullable LogBatch originalBatch) {
     this.fileName = fileName;
     this.rawBytes = rawBytes;
+    this.deviceId = deviceId;
+    this.originalBatch = originalBatch;
   }
 
   public String getFileName() {
     return fileName;
+  }
+
+  /** Returns the device id recorded in the original batch, or {@code null} if unknown. */
+  @Nullable
+  public String getDeviceId() {
+    return deviceId;
+  }
+
+  /** Returns the original batch if retained, or {@code null}. */
+  @Nullable
+  public LogBatch getOriginalBatch() {
+    return originalBatch;
   }
 
   @Nullable

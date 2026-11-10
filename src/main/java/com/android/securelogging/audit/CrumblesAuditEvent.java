@@ -25,6 +25,7 @@ import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.util.Date;
 import java.util.Locale;
+import java.util.OptionalLong;
 import javax.crypto.Mac;
 import javax.crypto.SecretKey;
 import org.json.JSONException;
@@ -37,6 +38,7 @@ public class CrumblesAuditEvent {
   private final String eventType;
   private final String message;
   @Nullable private final String tag;
+  @Nullable private final Long sequenceNumber;
 
   private static final ThreadLocal<SimpleDateFormat> dateFormat =
       ThreadLocal.withInitial(
@@ -48,10 +50,20 @@ public class CrumblesAuditEvent {
 
   public CrumblesAuditEvent(
       Instant timestamp, String eventType, String message, @Nullable String tag) {
+    this(timestamp, eventType, message, tag, /* sequenceNumber= */ null);
+  }
+
+  private CrumblesAuditEvent(
+      Instant timestamp,
+      String eventType,
+      String message,
+      @Nullable String tag,
+      @Nullable Long sequenceNumber) {
     this.timestamp = timestamp;
     this.eventType = eventType;
     this.message = message;
     this.tag = tag;
+    this.sequenceNumber = sequenceNumber;
   }
 
   @Nullable
@@ -60,7 +72,19 @@ public class CrumblesAuditEvent {
   }
 
   public CrumblesAuditEvent withTag(@Nullable String newTag) {
-    return new CrumblesAuditEvent(timestamp, eventType, message, newTag);
+    return new CrumblesAuditEvent(timestamp, eventType, message, newTag, sequenceNumber);
+  }
+
+  /**
+   * Returns the position of the record in the audit log, counted from 1 across rotations and
+   * clearing, or empty if the record was written before records were numbered.
+   */
+  public OptionalLong getSequenceNumber() {
+    return sequenceNumber != null ? OptionalLong.of(sequenceNumber) : OptionalLong.empty();
+  }
+
+  public CrumblesAuditEvent withSequenceNumber(long newSequenceNumber) {
+    return new CrumblesAuditEvent(timestamp, eventType, message, tag, newSequenceNumber);
   }
 
   public String computeTag(SecretKey key, String previousTag) throws GeneralSecurityException {
@@ -69,6 +93,9 @@ public class CrumblesAuditEvent {
     String payload =
         previousTag
             + '\n'
+            // Records written before records were numbered have no sequence line. Its "#" keeps it
+            // apart from the timestamp line, so the two layouts never yield the same payload.
+            + (sequenceNumber != null ? "#" + sequenceNumber + '\n' : "")
             + (timestamp.getEpochSecond() * 1_000_000_000L + timestamp.getNano())
             + '\n'
             + eventType.length()
@@ -109,6 +136,7 @@ public class CrumblesAuditEvent {
           .put("eventType", eventType)
           .put("message", message)
           .putOpt("tag", tag)
+          .putOpt("sequenceNumber", sequenceNumber)
           .toString();
     } catch (JSONException e) {
       return "{}";
@@ -127,6 +155,7 @@ public class CrumblesAuditEvent {
         retrievedInstant,
         jsonObject.getString("eventType"),
         jsonObject.getString("message"),
-        jsonObject.has("tag") ? jsonObject.getString("tag") : null);
+        jsonObject.has("tag") ? jsonObject.getString("tag") : null,
+        jsonObject.has("sequenceNumber") ? jsonObject.getLong("sequenceNumber") : null);
   }
 }

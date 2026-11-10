@@ -16,14 +16,17 @@
 
 package com.android.securelogging;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 import android.content.Context;
 import android.net.Uri;
 import android.util.Base64;
 import android.util.Log;
+import androidx.annotation.Nullable;
 import com.google.common.base.Ascii;
+import com.google.common.base.Strings;
+import com.google.common.base.Throwables;
 import com.google.common.io.ByteStreams;
 import com.google.common.net.InetAddresses;
 import java.io.File;
@@ -37,9 +40,23 @@ import java.net.ProtocolException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLConnection;
+import java.security.GeneralSecurityException;
+import java.util.Arrays;
 import java.util.Objects;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509ExtendedTrustManager;
 
-/** WebDAV (RFC 4918) remote storage uploader supporting TLS and HTTP Basic Authentication. */
+/**
+ * WebDAV (RFC 4918) remote storage uploader supporting TLS and HTTP Basic Authentication.
+ *
+ * <p>Credentials are held as byte arrays rather than strings so that {@link #close()} can overwrite
+ * them; a {@code String} would stay readable in the heap until garbage collected. Use instances
+ * inside a try-with-resources block.
+ */
 public final class WebDavStorageUploader implements RemoteStorageUploader {
 
   private static final String TAG = "WebDavStorageUploader";
@@ -55,31 +72,74 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
     SUCCESS,
     AUTH_FAILED,
     SERVER_NOT_FOUND,
+    /** The server answered with a redirect, which uploads never follow. */
+    REDIRECTED,
     INVALID_URL,
     NETWORK_ERROR
   }
 
   private final String serverUrl;
-  private final String username;
-  private final String password;
+  private final byte[] username;
+  private final byte[] password;
+  @Nullable private final SSLSocketFactory tlsSocketFactory;
+  private boolean serverKeyRejected;
+  private boolean transportFailed;
 
-  public WebDavStorageUploader(String serverUrl, String username, String password) {
+  /**
+   * Creates an uploader for {@code serverUrl}.
+   *
+   * <p>The credential arrays are copied, so the caller stays free to wipe the arrays it passed in.
+   */
+  public WebDavStorageUploader(String serverUrl, byte[] username, byte[] password) {
+    this(serverUrl, username, password, /* tlsSocketFactory= */ null);
+  }
+
+  /**
+   * Creates an uploader for {@code serverUrl} whose TLS connections go through {@code
+   * tlsSocketFactory} (refusing plaintext HTTP when set), or the platform default if {@code null}.
+   */
+  public WebDavStorageUploader(
+      String serverUrl,
+      byte[] username,
+      byte[] password,
+      @Nullable SSLSocketFactory tlsSocketFactory) {
     this.serverUrl = checkNotNull(serverUrl, "serverUrl cannot be null");
-    this.username = checkNotNull(username, "username cannot be null");
-    this.password = checkNotNull(password, "password cannot be null");
+    this.username = checkNotNull(username, "username cannot be null").clone();
+    this.password = checkNotNull(password, "password cannot be null").clone();
+    this.tlsSocketFactory = tlsSocketFactory;
+  }
+
+  /**
+   * Overwrites the stored credentials with zeroes.
+   *
+   * <p>Uploads attempted after this point authenticate with the wiped credentials and so are
+   * rejected by the server.
+   */
+  @Override
+  public void close() {
+    Arrays.fill(username, (byte) 0);
+    Arrays.fill(password, (byte) 0);
   }
 
   @Override
   public boolean uploadFile(Context context, File file, String remoteFileName) {
+    if (!isAcceptableServerUrl(serverUrl)) {
+      // The URL stays out of the log, because it can name the account.
+      Log.e(TAG, "WebDAV server URL rejected by the transport policy");
+      return false;
+    }
     String targetUrlString = buildTargetUrl(serverUrl, remoteFileName);
     HttpURLConnection conn = null;
+    CrumblesTransferDeadline.Disarm deadline = CrumblesTransferDeadline.Disarm.NONE;
     try {
       URL url = toAbsoluteUrl(targetUrlString);
-      if (!isAllowedScheme(url)) {
-        Log.e(TAG, "Insecure HTTP scheme rejected for WebDAV endpoint: " + targetUrlString);
+      conn = (HttpURLConnection) url.openConnection();
+      if (!routeThroughTlsSocketFactory(conn, tlsSocketFactory)) {
+        Log.e(TAG, "Plaintext WebDAV URL rejected: this uploader connects only through TLS");
         return false;
       }
-      conn = (HttpURLConnection) url.openConnection();
+      deadline = CrumblesTransferDeadline.arm(file.length(), conn::disconnect);
+      conn.setInstanceFollowRedirects(false);
       conn.setRequestMethod("PUT");
       conn.setDoOutput(true);
       conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
@@ -100,14 +160,21 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
         return true;
       }
       Log.e(TAG, "WebDAV upload failed with HTTP status code: " + responseCode);
-    } catch (URISyntaxException
-        | IllegalArgumentException
-        | MalformedURLException
-        | ProtocolException e) {
-      Log.e(TAG, "Invalid WebDAV URL or HTTP protocol configuration: " + targetUrlString, e);
+    } catch (URISyntaxException | IllegalArgumentException | MalformedURLException e) {
+      // Leaves the exception out, because its message would echo the URL.
+      Log.e(TAG, "Invalid WebDAV target URL");
+    } catch (ProtocolException e) {
+      Log.e(TAG, "Invalid HTTP protocol configuration for WebDAV", e);
     } catch (IOException | SecurityException e) {
-      Log.e(TAG, "I/O or network failure uploading " + remoteFileName + " to WebDAV", e);
+      if (isServerKeyMismatch(e)) {
+        serverKeyRejected = true;
+        Log.e(TAG, "WebDAV server presented a public key other than the pinned one", e);
+      } else {
+        transportFailed = true;
+        Log.e(TAG, "I/O or network failure uploading " + remoteFileName + " to WebDAV", e);
+      }
     } finally {
+      deadline.close();
       if (conn != null) {
         conn.disconnect();
       }
@@ -115,16 +182,59 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
     return false;
   }
 
-  /** Verifies server connectivity and authentication credentials via an HTTP test request. */
+  /**
+   * Has {@code conn} use {@code tlsSocketFactory}, if one was given.
+   *
+   * @return {@code false} if a factory was given but {@code conn} is plaintext HTTP, which the
+   *     factory cannot secure
+   */
+  private static boolean routeThroughTlsSocketFactory(
+      HttpURLConnection conn, @Nullable SSLSocketFactory tlsSocketFactory) {
+    if (tlsSocketFactory == null) {
+      return true;
+    }
+    if (conn instanceof HttpsURLConnection httpsConnection) {
+      httpsConnection.setSSLSocketFactory(tlsSocketFactory);
+      return true;
+    }
+    return false;
+  }
+
+  /** Returns whether {@code failure} arose because the server's key does not match the pin. */
+  private static boolean isServerKeyMismatch(Throwable failure) {
+    return Throwables.getCausalChain(failure).stream()
+        .anyMatch(WebDavServerKeyPin.ServerKeyMismatchException.class::isInstance);
+  }
+
+  /**
+   * Verifies server connectivity and authentication credentials via an HTTP test request.
+   *
+   * <p>A redirect is reported rather than followed. Uploads never follow one, so a probe that did
+   * would vouch for a URL that every upload then fails against.
+   */
   public static ConnectionTestResult testConnection(
-      String serverUrl, String username, String password) {
+      String serverUrl, byte[] username, byte[] password) {
+    return testConnection(serverUrl, username, password, /* tlsSocketFactory= */ null);
+  }
+
+  public static ConnectionTestResult testConnection(
+      String serverUrl,
+      byte[] username,
+      byte[] password,
+      @Nullable SSLSocketFactory tlsSocketFactory) {
+    if (!isAcceptableServerUrl(serverUrl)) {
+      return ConnectionTestResult.INVALID_URL;
+    }
     HttpURLConnection conn = null;
+    CrumblesTransferDeadline.Disarm deadline = CrumblesTransferDeadline.Disarm.NONE;
     try {
       URL url = toAbsoluteUrl(serverUrl);
-      if (!isAllowedScheme(url)) {
+      conn = (HttpURLConnection) url.openConnection();
+      if (!routeThroughTlsSocketFactory(conn, tlsSocketFactory)) {
         return ConnectionTestResult.INVALID_URL;
       }
-      conn = (HttpURLConnection) url.openConnection();
+      deadline = CrumblesTransferDeadline.arm(conn::disconnect);
+      conn.setInstanceFollowRedirects(false);
       conn.setRequestMethod("OPTIONS");
       conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
       conn.setReadTimeout(READ_TIMEOUT_MS);
@@ -134,6 +244,10 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
       int responseCode = conn.getResponseCode();
       if (acceptsConnectionProbe(responseCode)) {
         return ConnectionTestResult.SUCCESS;
+      }
+      if (responseCode >= HttpURLConnection.HTTP_MULT_CHOICE
+          && responseCode < HttpURLConnection.HTTP_BAD_REQUEST) {
+        return ConnectionTestResult.REDIRECTED;
       }
       if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED
           || responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
@@ -148,10 +262,60 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
     } catch (IOException | SecurityException e) {
       return ConnectionTestResult.NETWORK_ERROR;
     } finally {
+      deadline.close();
       if (conn != null) {
         conn.disconnect();
       }
     }
+  }
+
+  /**
+   * Connects to {@code serverUrl} without credentials and returns the pin of the public key in the
+   * server's own certificate, for the user to confirm before uploads rely on it.
+   *
+   * <p>The certificate chain must be one that {@code trustManager} accepts, and the certificate
+   * must be valid for the host. The connection carries no credentials and is closed after the TLS
+   * handshake.
+   *
+   * @param serverUrl an HTTPS URL that {@link #isAcceptableServerUrl} accepts
+   * @param trustManager decides which certificate chains to accept: {@link
+   *     WebDavServerKeyPin#platformTrustManager()} outside tests
+   * @throws IllegalArgumentException if {@code serverUrl} is not such an HTTPS URL
+   * @throws IOException if the server cannot be reached or does not prove its identity
+   * @throws GeneralSecurityException if TLS cannot be set up
+   */
+  static WebDavServerKeyPin fetchServerKeyPin(
+      String serverUrl, X509ExtendedTrustManager trustManager)
+      throws IOException, GeneralSecurityException {
+    HttpsURLConnection httpsConnection = openHttpsConnection(serverUrl, trustManager);
+    try (CrumblesTransferDeadline.Disarm deadline =
+        CrumblesTransferDeadline.arm(httpsConnection::disconnect)) {
+      httpsConnection.connect();
+      return WebDavServerKeyPin.of(httpsConnection.getServerCertificates()[0].getPublicKey());
+    } finally {
+      httpsConnection.disconnect();
+    }
+  }
+
+  static HttpsURLConnection openHttpsConnection(
+      String serverUrl, X509ExtendedTrustManager trustManager)
+      throws IOException, GeneralSecurityException {
+    checkArgument(isAcceptableServerUrl(serverUrl), "WebDAV server URL rejected");
+    URLConnection connection;
+    try {
+      connection = toAbsoluteUrl(serverUrl).openConnection();
+    } catch (URISyntaxException e) {
+      throw new IllegalArgumentException("WebDAV server URL rejected", e);
+    }
+    checkArgument(
+        connection instanceof HttpsURLConnection, "Only an HTTPS server has a key to pin");
+    HttpsURLConnection httpsConnection = (HttpsURLConnection) connection;
+    SSLContext sslContext = SSLContext.getInstance("TLS");
+    sslContext.init(/* km= */ null, new TrustManager[] {trustManager}, /* random= */ null);
+    httpsConnection.setSSLSocketFactory(sslContext.getSocketFactory());
+    httpsConnection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+    httpsConnection.setReadTimeout(READ_TIMEOUT_MS);
+    return httpsConnection;
   }
 
   /**
@@ -208,10 +372,46 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
     return base.endsWith("/") ? base + encodedFileName : base + "/" + encodedFileName;
   }
 
-  private static String buildBasicAuthHeader(String user, String pass) {
-    String credentials = user + ":" + pass;
-    String encoded = Base64.encodeToString(credentials.getBytes(UTF_8), Base64.NO_WRAP);
-    return "Basic " + encoded;
+  /**
+   * Returns the {@code Authorization} header value for {@code username} and {@code password}.
+   *
+   * <p>The credentials are concatenated in a byte array that is wiped before returning, so no
+   * plaintext {@code user:password} string is ever created. The Base64 form is unavoidably a
+   * string, because that is what {@link HttpURLConnection#setRequestProperty} accepts; keeping it
+   * to a per-request local at least stops it from being retained.
+   */
+  private static String buildBasicAuthHeader(byte[] username, byte[] password) {
+    byte[] credentials = new byte[username.length + 1 + password.length];
+    try {
+      System.arraycopy(username, 0, credentials, 0, username.length);
+      credentials[username.length] = (byte) ':';
+      System.arraycopy(password, 0, credentials, username.length + 1, password.length);
+      return "Basic " + Base64.encodeToString(credentials, Base64.NO_WRAP);
+    } finally {
+      Arrays.fill(credentials, (byte) 0);
+    }
+  }
+
+  /**
+   * Returns whether {@code serverUrl} is acceptable as the base URL of a WebDAV server.
+   *
+   * <p>On top of passing {@link #isAllowedScheme}, the URL must name a host and carry no user-info,
+   * query or fragment. Credentials travel only in the {@code Authorization} header, never in a URL
+   * that could end up logged or displayed. A query or fragment would swallow the file name that
+   * uploads append, sending every batch to the same resource.
+   */
+  static boolean isAcceptableServerUrl(String serverUrl) {
+    URL url;
+    try {
+      url = toAbsoluteUrl(serverUrl);
+    } catch (URISyntaxException | IllegalArgumentException | MalformedURLException e) {
+      return false;
+    }
+    return !Strings.isNullOrEmpty(url.getHost())
+        && isAllowedScheme(url)
+        && url.getUserInfo() == null
+        && url.getQuery() == null
+        && url.getRef() == null;
   }
 
   /**
@@ -250,7 +450,23 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
   }
 
   @Override
+  public boolean rejectedServerKey() {
+    return serverKeyRejected;
+  }
+
+  @Override
+  public boolean transportFailed() {
+    return transportFailed;
+  }
+
+  /**
+   * Returns a description that leaves out the server URL.
+   *
+   * <p>The description reaches notifications, the audit trail and logcat, whereas the URL can name
+   * the account, as in {@code https://cloud.example.com/remote.php/dav/files/alice/}.
+   */
+  @Override
   public String getDestinationDescription() {
-    return "WebDAV (" + serverUrl + ")";
+    return "WebDAV server";
   }
 }

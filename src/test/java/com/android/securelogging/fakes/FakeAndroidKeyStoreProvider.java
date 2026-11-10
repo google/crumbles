@@ -32,7 +32,32 @@ public class FakeAndroidKeyStoreProvider extends Provider {
     // CrumblesLogsEncryptor calls: KeyPairGenerator.getInstance("RSA", "AndroidKeyStore").
     // So, our provider (named "AndroidKeyStore") needs to offer an "RSA" KeyPairGenerator.
     put("KeyPairGenerator.RSA", FakeAndroidKeyPairGeneratorSpi.class.getName());
+    put("KeyPairGenerator.EC", FakeAndroidKeyPairGeneratorSpi.Ec.class.getName());
     put("KeyGenerator.HmacSHA256", FakeAndroidKeyStoreSpi.HmacKeyGeneratorSpi.class.getName());
+    put("KeyGenerator.AES", FakeAndroidKeyStoreSpi.AesKeyGeneratorSpi.class.getName());
     put("KeyFactory.RSA", FakeAndroidKeyFactorySpi.class.getName());
+    // Only offered for keys that FakeAndroidKeyStoreSpi.invalidateKey() invalidated, which no other
+    // provider accepts.
+    put("Cipher.RSA", FakeAndroidKeyStoreSpi.InvalidatedKeyCipherSpi.class.getName());
+    put(
+        "Cipher.RSA SupportedKeyClasses",
+        FakeAndroidKeyStoreSpi.InvalidatedPrivateKey.class.getName());
+    for (String transformation :
+        new String[] {
+          "RSA/ECB/OAEPWithSHA-256AndMGF1Padding", "RSA/ECB/PKCS1Padding", "AES/CBC/NoPadding"
+        }) {
+      putService(
+          new Service(this, "Cipher", transformation, "Spi", null, null) {
+            @Override
+            public boolean supportsParameter(Object key) {
+              return FakeAndroidKeyStoreSpi.holdsKey(key);
+            }
+
+            @Override
+            public Object newInstance(Object parameter) {
+              return new FakeAndroidKeyStoreSpi.FakeCipherSpi(transformation);
+            }
+          });
+    }
   }
 }

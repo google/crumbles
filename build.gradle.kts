@@ -9,7 +9,8 @@ android {
 
     defaultConfig {
         applicationId = "com.android.securelogging"
-        minSdk = 26
+        // The same as android:minSdkVersion in AndroidManifest.xml, which this value would override.
+        minSdk = 34
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
@@ -19,7 +20,7 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -56,13 +57,13 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.2.0")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.core:core-i18n:1.0.0")
     implementation("androidx.work:work-runtime:2.10.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.camera:camera-core:1.4.1")
     implementation("androidx.camera:camera-camera2:1.4.1")
     implementation("androidx.camera:camera-lifecycle:1.4.1")
     implementation("androidx.camera:camera-view:1.4.1")
-    implementation("com.google.mlkit:barcode-scanning:17.3.0")
     implementation("com.google.zxing:core:3.5.3")
     implementation("com.google.guava:guava:33.3.1-android")
     implementation("com.google.protobuf:protobuf-javalite:3.25.5")

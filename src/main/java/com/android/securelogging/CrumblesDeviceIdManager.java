@@ -25,6 +25,8 @@ import android.os.Build;
 import android.provider.Settings;
 import android.util.Log;
 import androidx.annotation.Nullable;
+import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.android.securelogging.exceptions.CrumblesKeysException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -65,10 +67,39 @@ public final class CrumblesDeviceIdManager {
   /**
    * Enables or disables hardware-backed attribution, which stays disabled by default because the
    * resolved identifier is not covered by the batch ciphertext.
+   *
+   * <p>A change of the setting changes the device ID, which is the attestation challenge of {@link
+   * CrumblesBatchSigningKey}, so the key is then deleted and the next batch is signed with a new
+   * key attested to the new ID.
    */
   public static void setHardwareAttributionEnabled(Context ctx, boolean enabled) {
-    getPreferences(ctx)
-        .ifPresent(prefs -> prefs.edit().putBoolean(PREF_USE_HARDWARE_SERIAL, enabled).apply());
+    Optional<SharedPreferences> prefs = getPreferences(ctx);
+    if (prefs.isEmpty() || isHardwareAttributionEnabled(ctx) == enabled) {
+      return;
+    }
+    prefs.get().edit().putBoolean(PREF_USE_HARDWARE_SERIAL, enabled).apply();
+    rotateBatchSigningKey(ctx, enabled);
+  }
+
+  /** Deletes the batch-signing key attested to the former device ID and logs the rotation. */
+  private static void rotateBatchSigningKey(Context ctx, boolean hardwareAttributionEnabled) {
+    String change = "Hardware attribution " + (hardwareAttributionEnabled ? "enabled" : "disabled");
+    try {
+      new CrumblesBatchSigningKey(ctx).delete();
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to delete the batch-signing key", e);
+      CrumblesAppAuditLogger.getInstance(ctx)
+          .logEvent(
+              "BATCH_SIGNING_KEY_ROTATION_FAILED",
+              change
+                  + ", but the batch-signing key attested to the former device ID could not be"
+                  + " deleted, so batches fail the attestation challenge check.");
+      return;
+    }
+    CrumblesAppAuditLogger.getInstance(ctx)
+        .logEvent(
+            "BATCH_SIGNING_KEY_ROTATED",
+            change + "; the next batch is signed with a new key attested to the new device ID.");
   }
 
   public static String getDeviceId(@Nullable Context context) {

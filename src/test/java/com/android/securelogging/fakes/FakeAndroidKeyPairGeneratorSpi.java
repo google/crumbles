@@ -19,6 +19,7 @@ package com.android.securelogging.fakes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.StrongBoxUnavailableException;
 import com.google.common.collect.ImmutableSet;
 import java.math.BigInteger;
 import java.security.InvalidAlgorithmParameterException;
@@ -31,8 +32,10 @@ import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
 import java.security.Principal;
 import java.security.Provider;
+import java.security.ProviderException;
 import java.security.PublicKey;
 import java.security.SecureRandom;
+import java.security.Security;
 import java.security.SignatureException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateEncodingException;
@@ -48,6 +51,7 @@ import java.util.Calendar;
 import java.util.Collection;
 import java.util.Date;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import javax.annotation.Nullable;
 import javax.security.auth.x500.X500Principal;
@@ -58,10 +62,31 @@ import javax.security.auth.x500.X500Principal;
  */
 public class FakeAndroidKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
   private KeyGenParameterSpec keyGenParameterSpec;
-  private final KeyPairGenerator standardRsaGenerator;
+  private final KeyPairGenerator standardGenerator;
 
   public FakeAndroidKeyPairGeneratorSpi() throws Exception {
-    this.standardRsaGenerator = KeyPairGenerator.getInstance("RSA");
+    this(KeyPairGenerator.getInstance("RSA", nonKeystoreProvider("RSA")));
+  }
+
+  private FakeAndroidKeyPairGeneratorSpi(KeyPairGenerator standardGenerator) {
+    this.standardGenerator = standardGenerator;
+  }
+
+  /** The EC variant, for {@code KeyPairGenerator.getInstance("EC", "AndroidKeyStore")}. */
+  public static final class Ec extends FakeAndroidKeyPairGeneratorSpi {
+    public Ec() throws Exception {
+      super(KeyPairGenerator.getInstance("EC", nonKeystoreProvider("EC")));
+    }
+  }
+
+  private static Provider nonKeystoreProvider(String algorithm) throws NoSuchAlgorithmException {
+    for (Provider provider : Security.getProviders()) {
+      if (!provider.getName().equals(FakeAndroidKeyStoreProvider.PROVIDER_NAME)
+          && provider.getService("KeyPairGenerator", algorithm) != null) {
+        return provider;
+      }
+    }
+    throw new NoSuchAlgorithmException("No KeyPairGenerator provider for " + algorithm);
   }
 
   @Override
@@ -71,13 +96,21 @@ public class FakeAndroidKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
       throw new InvalidAlgorithmParameterException(
           "Unsupported params: " + params.getClass().getName());
     }
+    if (keyGenParameterSpec.isStrongBoxBacked()
+        && FakeAndroidKeyStoreSpi.isStrongBoxThrowingGeneralSecurityException) {
+      throw new InvalidAlgorithmParameterException("StrongBox rejected parameters");
+    }
     this.keyGenParameterSpec = keyGenParameterSpec;
-    this.standardRsaGenerator.initialize(this.keyGenParameterSpec.getKeySize(), random);
+    if (keyGenParameterSpec.getAlgorithmParameterSpec() != null) {
+      this.standardGenerator.initialize(keyGenParameterSpec.getAlgorithmParameterSpec(), random);
+    } else {
+      this.standardGenerator.initialize(this.keyGenParameterSpec.getKeySize(), random);
+    }
   }
 
   @Override
   public void initialize(int keysize, SecureRandom random) {
-    this.standardRsaGenerator.initialize(keysize, random);
+    this.standardGenerator.initialize(keysize, random);
   }
 
   @Override
@@ -86,8 +119,15 @@ public class FakeAndroidKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
       throw new IllegalStateException(
           "KeyPairGeneratorSpi not initialized with KeyGenParameterSpec");
     }
+    if (this.keyGenParameterSpec.isStrongBoxBacked()
+        && !FakeAndroidKeyStoreSpi.isStrongBoxSupported) {
+      throw new StrongBoxUnavailableException("StrongBox unavailable");
+    }
+    if (this.keyGenParameterSpec.isStrongBoxBacked() && FakeAndroidKeyStoreSpi.isStrongBoxFailing) {
+      throw new ProviderException("Failed to generate key pair.");
+    }
 
-    KeyPair keyPair = this.standardRsaGenerator.generateKeyPair();
+    KeyPair keyPair = this.standardGenerator.generateKeyPair();
     String alias = this.keyGenParameterSpec.getKeystoreAlias();
 
     try {
@@ -144,7 +184,7 @@ public class FakeAndroidKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
     private final BigInteger serialNumber;
     private final Date notBefore;
     private final Date notAfter;
-    private final byte[] encoded = "fakeEncodedData".getBytes(UTF_8); // Simple placeholder.
+    private final byte[] encoded; // The public key's encoding, which differs between keys.
 
     MinimalFakeX509Certificate(
         PublicKey publicKey,
@@ -153,6 +193,7 @@ public class FakeAndroidKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
         Date notBefore,
         Date notAfter) {
       this.publicKey = publicKey;
+      this.encoded = publicKey.getEncoded();
       this.subjectX500Principal = subjectAndIssuer;
       this.issuerX500Principal = subjectAndIssuer; // Self-signed.
       this.serialNumber = serialNumber;
@@ -175,9 +216,7 @@ public class FakeAndroidKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
     @Override
     public void checkValidity(Date date)
         throws CertificateExpiredException, CertificateNotYetValidException {
-      if (date == null) {
-        throw new IllegalArgumentException("date is null");
-      }
+      Objects.requireNonNull(date, "date is null");
       if (date.before(notBefore)) {
         throw new CertificateNotYetValidException("Certificate not valid until " + notBefore);
       }

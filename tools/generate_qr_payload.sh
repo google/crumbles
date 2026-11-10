@@ -15,6 +15,11 @@
 
 # Helper script to generate Android Enterprise QR Code provisioning JSON payload for Crumbles.
 # Calculates the URL-safe base64 SHA-256 signing certificate checksum required by Android DevicePolicyManager.
+#
+# The checksum only binds the install to the key this payload names; it does not
+# make the payload itself trustworthy. Publish the resulting QR code's download
+# URL and checksum over a channel independent of the code itself, so recipients
+# can carry out the verification described in HOW_TO.md before scanning.
 
 set -euo pipefail
 

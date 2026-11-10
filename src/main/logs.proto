@@ -24,8 +24,37 @@ option java_multiple_files = true;
 enum LogEncryptionType {
   LOG_ENCRYPTION_TYPE_UNSPECIFIED = 0;
   LOG_ENCRYPTION_TYPE_AES_GCM = 1;
+  // AES-GCM over the logs padded to a size bucket: the length of the logs as a
+  // 4-byte big-endian integer, the logs, then zero bytes up to the next power
+  // of two of at least 4096 bytes. blob_size then reveals only the bucket.
+  LOG_ENCRYPTION_TYPE_AES_GCM_PADDED = 2;
+  // Format version 2: as LOG_ENCRYPTION_TYPE_AES_GCM_PADDED, but what is padded
+  // is a serialized SealedLogs, which also holds the timestamp and the device
+  // identifier of the batch and the attestation chain of the key that signs it.
+  // The cleartext metadata then carries only blob_size and this encryption
+  // type, and the cleartext signature only the signature itself. The associated
+  // data starts with the label "crumbles/v2/batch" and ends with the SHA-256
+  // digest of the recipient's public key (its DER SubjectPublicKeyInfo).
+  LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA = 3;
 }
 
+// LINT.IfChange
+// What a LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA batch pads and encrypts.
+message SealedLogs {
+  // The fields of the batch metadata that its cleartext metadata leaves out:
+  // the timestamp and the device identifier.
+  LogMetadata metadata = 1;
+  bytes logs = 2;
+  // DER-encoded X.509 certificates of the installation's batch-signing key
+  // from Android key attestation, leaf first, sealed inside the ciphertext so
+  // that the device identifier in the attestation challenge and the OS
+  // verified-boot key and patch level are not exposed in cleartext.
+  repeated bytes attestation_chain = 3
+      [(datapol.semantic_type) = ST_IDENTIFYING_ID];
+}
+// LINT.ThenChange(../../tools/analyst/crumbles_analyst.py)
+
+// LINT.IfChange
 enum KeyEncryptionType {
   KEY_ENCRYPTION_TYPE_UNSPECIFIED = 0;
   KEY_ENCRYPTION_TYPE_ASYMMETRIC = 1;
@@ -34,6 +63,7 @@ enum KeyEncryptionType {
   reserved KEY_ENCRYPTION_TYPE_CIPHER_MODE_RSA_ECB_PKCS1;
   KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256 = 4;
 }
+// LINT.ThenChange(../../tools/analyst/crumbles_analyst.py)
 
 enum UploadLogResult {
   UPLOAD_LOG_RESULT_UNSPECIFIED = 0;
@@ -41,6 +71,7 @@ enum UploadLogResult {
   UPLOAD_LOG_RESULT_FAILURE = 2;
 }
 
+// LINT.IfChange
 message DeviceId {
   // A hardware ID - precisely which TBD
   string device_id = 1 [(datapol.semantic_type) = ST_IDENTIFYING_ID];
@@ -61,6 +92,16 @@ message LogKey {
   KeyEncryptionType key_encryption_type = 1;
   bytes encrypted_symmetric_key = 2 [(datapol.semantic_type) = ST_SECURITY_KEY];
   bytes iv = 3;
+  // The symmetric key again, encrypted on the device that wrote the batch with
+  // its AES batch-wrap Keystore key: the 16-byte IV, then the AES/CBC/NoPadding
+  // ciphertext. One authentication can unwrap the keys of many batches. Absent
+  // from batches encrypted to an external key. encrypted_symmetric_key stays
+  // the reference.
+  bytes batch_wrapped_symmetric_key = 4
+      [(datapol.semantic_type) = ST_SECURITY_KEY];
+  // Identifies the batch-wrap key that produced batch_wrapped_symmetric_key:
+  // the first 8 bytes of its encryption of an all-zero block.
+  bytes batch_wrap_key_id = 5 [(datapol.semantic_type) = ST_SECURITY_MATERIAL];
 }
 
 message LogBatch {
@@ -69,7 +110,32 @@ message LogBatch {
   // batch for each response, each including only one key+iv.
   LogKey key = 2;
   LogMetadata metadata = 3;
+  // Position of this batch among the batches that the installation which wrote
+  // it has signed, starting at 1. A gap means that a signed batch is missing.
+  int64 sequence_number = 4;
+  // Covers the serialized batch without this field: remove field 5 from the
+  // batch file and verify the remaining bytes. Absent from batches written
+  // before batches were signed and from batches that could not be signed.
+  BatchSignature signature = 5;
 }
+
+// A signature made on the device by its batch-signing key: an attested EC P-256
+// Android Keystore key that never leaves the device.
+message BatchSignature {
+  // DER-encoded ECDSA signature with SHA-256 (SHA256withECDSA).
+  bytes signature = 1;
+  // DER-encoded X.509 certificates of the signing key from Android key
+  // attestation, leaf first. The leaf holds the public key that verifies
+  // `signature`, and its attestation challenge is the device_id of the
+  // installation that made the signature. Absent from format version 2
+  // (LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA) batches, which seal the chain
+  // in SealedLogs.attestation_chain instead, so that their signature can only
+  // be checked after decryption. The signature does not cover this field, so
+  // recipients reject a format version 2 batch that carries a chain here.
+  repeated bytes attestation_chain = 2
+      [(datapol.semantic_type) = ST_IDENTIFYING_ID];
+}
+// LINT.ThenChange(../../tools/analyst/crumbles_analyst.py)
 
 message UploadLogRequest {
   LogBatch log_batch = 1;

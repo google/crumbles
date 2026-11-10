@@ -68,17 +68,23 @@ public final class CrumblesLogStorageQuotaTest {
   @Test
   public void admitNewBatch_warnThresholdBoundary_warnsOnlyAtOrAboveThreshold() throws Exception {
     Path batch = writeBatch("batch_1.bin", /* sizeBytes= */ 799, OLDEST_MILLIS);
-    assertThat(CrumblesLogStorageQuota.admitNewBatch(context, logsDirectory.toFile(), CAP_BYTES))
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 0L))
         .isTrue();
     assertThat(Files.exists(batch)).isTrue();
     assertThat(findStorageNotification()).isNull();
 
     writeBatch("batch_2.bin", /* sizeBytes= */ 1, OLDEST_MILLIS);
-    assertThat(CrumblesLogStorageQuota.admitNewBatch(context, logsDirectory.toFile(), CAP_BYTES))
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 0L))
         .isTrue();
     Notification notification = findStorageNotification();
     assertThat(notification.flags & Notification.FLAG_AUTO_CANCEL)
         .isEqualTo(Notification.FLAG_AUTO_CANCEL);
+    assertThat(notification.flags & Notification.FLAG_ONLY_ALERT_ONCE)
+        .isEqualTo(Notification.FLAG_ONLY_ALERT_ONCE);
     assertThat(notification.priority).isEqualTo(NotificationCompat.PRIORITY_HIGH);
     assertThat(notification.extras.getString(Notification.EXTRA_TITLE))
         .isEqualTo(context.getString(R.string.notification_title_storage));
@@ -103,12 +109,14 @@ public final class CrumblesLogStorageQuotaTest {
         writeBatch(
             "batch_3" + CrumblesConstants.SENT_SUFFIX, /* sizeBytes= */ 250, OLDEST_MILLIS + 2000);
 
-    assertThat(CrumblesLogStorageQuota.admitNewBatch(context, listedNewestFirst(), CAP_BYTES))
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, listedNewestFirst(), CAP_BYTES, false, 0L))
         .isTrue();
     assertThat(Files.exists(reserved)).isTrue();
     assertThat(Files.exists(pending)).isTrue();
     assertThat(Files.exists(uploaded)).isFalse();
-    assertThat(hasAuditMessage("LOGS_STORAGE_CAP_REACHED")).isTrue();
+    assertThat(hasAuditMessage("Reclaimed 1 uploaded copy(ies) (250 bytes): batch_3_sent.bin.")).isTrue();
   }
 
   @Test
@@ -117,7 +125,9 @@ public final class CrumblesLogStorageQuotaTest {
         writeBatch("batch_1" + CrumblesConstants.SENT_SUFFIX, /* sizeBytes= */ 300, OLDEST_MILLIS);
     writeBatch("batch_2.bin", /* sizeBytes= */ 700, OLDEST_MILLIS + 1000);
 
-    assertThat(CrumblesLogStorageQuota.admitNewBatch(context, logsDirectory.toFile(), CAP_BYTES))
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 0L))
         .isTrue();
     assertThat(Files.exists(overrunning)).isFalse();
   }
@@ -129,7 +139,9 @@ public final class CrumblesLogStorageQuotaTest {
     Path oldest = writeBatch("batch_1.bin", /* sizeBytes= */ 600, nowMillis - 2000);
     Path newest = writeBatch("batch_2.bin", /* sizeBytes= */ 600, nowMillis - 1000);
 
-    assertThat(CrumblesLogStorageQuota.admitNewBatch(context, logsDirectory.toFile(), CAP_BYTES))
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 0L))
         .isFalse();
     assertThat(Files.exists(oldest)).isTrue();
     assertThat(Files.exists(newest)).isTrue();
@@ -143,7 +155,8 @@ public final class CrumblesLogStorageQuotaTest {
   public void admitNewBatch_whenDirectoryCannotBeListed_admitsTheBatch() {
     File missing = logsDirectory.resolve("missing").toFile();
 
-    assertThat(CrumblesLogStorageQuota.admitNewBatch(context, missing, CAP_BYTES)).isTrue();
+    assertThat(CrumblesLogStorageQuota.admitNewBatch(context, missing, CAP_BYTES, false, 0L))
+        .isTrue();
   }
 
   @CanIgnoreReturnValue
@@ -173,6 +186,179 @@ public final class CrumblesLogStorageQuotaTest {
 
   private Notification findStorageNotification() {
     return shadowOf(notificationManager)
-        .getNotification(CrumblesLogStorageQuota.STORAGE_NOTIFICATION_ID);
+        .getNotification(CrumblesConstants.STORAGE_NOTIFICATION_ID);
+  }
+
+  @Test
+  public void admitNewBatch_networkBatchBelowEffectiveCap_admitsWithoutReclaiming()
+      throws Exception {
+    writeBatch("batch_1" + CrumblesConstants.SENT_SUFFIX, /* sizeBytes= */ 250, OLDEST_MILLIS);
+    Path reclaimable =
+        writeBatch("batch_2" + CrumblesConstants.SENT_SUFFIX, 349, OLDEST_MILLIS + 1000);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, /* isNetworkBatch= */ true, 0L))
+        .isTrue();
+    assertThat(Files.exists(reclaimable)).isTrue();
+    assertThat(hasAuditMessage("LOGS_STORAGE_CAP_REACHED")).isFalse();
+    assertThat(hasAuditMessage("NETWORK_LOGS_COLLECTION_STOPPED")).isFalse();
+  }
+
+  @Test
+  public void admitNewBatch_networkBatchAtEffectiveCapWithUploadedCopy_reclaims() throws Exception {
+    writeBatch("batch_1" + CrumblesConstants.SENT_SUFFIX, /* sizeBytes= */ 250, OLDEST_MILLIS);
+    Path reclaimable =
+        writeBatch("batch_2" + CrumblesConstants.SENT_SUFFIX, 300, OLDEST_MILLIS + 1000);
+    writeBatch("batch_3" + CrumblesConstants.SENT_SUFFIX, 250, OLDEST_MILLIS + 2000);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, /* isNetworkBatch= */ true, 300L))
+        .isTrue();
+    assertThat(Files.exists(reclaimable)).isFalse();
+    assertThat(hasAuditMessage("Reclaimed 2 uploaded copy(ies) (550 bytes): batch_2_sent.bin, batch_3_sent.bin.")).isTrue();
+    assertThat(hasAuditMessage("NETWORK_LOGS_COLLECTION_STOPPED")).isFalse();
+  }
+
+  @Test
+  public void admitNewBatch_networkBatch_stopsCollectingAtEffectiveCap() throws Exception {
+    long effectiveCap =
+        CAP_BYTES - (CAP_BYTES * CrumblesConstants.LOGS_DIRECTORY_RESERVED_PERCENT / 100);
+    writeBatch("batch_1.bin", (int) effectiveCap, OLDEST_MILLIS);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, /* isNetworkBatch= */ true, 0L))
+        .isFalse();
+    assertThat(hasAuditMessage("NETWORK_LOGS_COLLECTION_STOPPED")).isTrue();
+  }
+
+  @Test
+  public void admitNewBatch_securityBatch_admittedWhenNetworkBatchesFillTheCap() throws Exception {
+    long effectiveCap =
+        CAP_BYTES - (CAP_BYTES * CrumblesConstants.LOGS_DIRECTORY_RESERVED_PERCENT / 100);
+    writeBatch("batch_1.bin", (int) effectiveCap, OLDEST_MILLIS);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, /* isNetworkBatch= */ true, 0L))
+        .isFalse();
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, /* isNetworkBatch= */ false, 0L))
+        .isTrue();
+  }
+
+  @Test
+  public void admitNewBatch_reclaimableUploadedCopiesOutsideReserve_doNotTriggerApproachingAlert()
+      throws Exception {
+    writeBatch("batch_1" + CrumblesConstants.SENT_SUFFIX, /* sizeBytes= */ 250, OLDEST_MILLIS);
+    Path reclaimable =
+        writeBatch("batch_2" + CrumblesConstants.SENT_SUFFIX, 300, OLDEST_MILLIS + 1000);
+    Path pending = writeBatch("batch_3.bin", /* sizeBytes= */ 449, OLDEST_MILLIS + 2000);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 100L))
+        .isTrue();
+    assertThat(Files.exists(reclaimable)).isFalse();
+    assertThat(hasAuditMessage("LOGS_STORAGE_CAP_APPROACHING")).isFalse();
+    assertThat(findStorageNotification()).isNull();
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 101L))
+        .isTrue();
+    assertThat(hasAuditMessage("Stored log batches use 800 of 1000 permitted bytes.")).isTrue();
+
+    CrumblesAppAuditLogger.getInstance(context).clearAllLogs();
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 101L))
+        .isTrue();
+    assertThat(hasAuditMessage("LOGS_STORAGE_CAP_APPROACHING")).isFalse();
+
+    Files.delete(pending);
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 10L))
+        .isTrue();
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 600L))
+        .isTrue();
+    assertThat(hasAuditMessage("Stored log batches use 850 of 1000 permitted bytes.")).isTrue();
+  }
+
+  @Test
+  public void admitNewBatch_capReachedAlert_deduplicatesAndRearmsOnceAdmitted() throws Exception {
+    Path full = writeBatch("batch_1.bin", /* sizeBytes= */ 1000, OLDEST_MILLIS);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 50L, 100L))
+        .isFalse();
+    assertThat(hasAuditMessage("Log batches use 1000 of 1000 permitted bytes.")).isTrue();
+
+    CrumblesAppAuditLogger.getInstance(context).clearAllLogs();
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 1L))
+        .isFalse();
+    assertThat(hasAuditMessage("LOGS_COLLECTION_STOPPED")).isFalse();
+
+    Files.delete(full);
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 1L))
+        .isTrue();
+    writeBatch("batch_2.bin", /* sizeBytes= */ 1000, OLDEST_MILLIS);
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 1L))
+        .isFalse();
+    assertThat(hasAuditMessage("LOGS_COLLECTION_STOPPED")).isTrue();
+  }
+
+  @Test
+  public void admitNewBatch_signatureAllowance_enforcedForAdmissionButExcludedFromReportedBytes()
+      throws Exception {
+    writeBatch("batch_1.bin", /* sizeBytes= */ 700, OLDEST_MILLIS);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 99L, 200L))
+        .isTrue();
+    assertThat(hasAuditMessage("LOGS_STORAGE_CAP_APPROACHING")).isFalse();
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 100L, 200L))
+        .isFalse();
+    assertThat(hasAuditMessage("Log batches use 700 of 1000 permitted bytes.")).isTrue();
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 100L, 199L))
+        .isTrue();
+    assertThat(hasAuditMessage("Stored log batches use 800 of 1000 permitted bytes.")).isTrue();
+  }
+
+  @Test
+  public void admitNewBatch_whenBatchCannotFitEvenAfterReclaiming_keepsUploadedCopies()
+      throws Exception {
+    writeBatch("batch_1" + CrumblesConstants.SENT_SUFFIX, /* sizeBytes= */ 250, OLDEST_MILLIS);
+    Path reclaimable =
+        writeBatch("batch_2" + CrumblesConstants.SENT_SUFFIX, 300, OLDEST_MILLIS + 1000);
+    writeBatch("batch_3.bin", /* sizeBytes= */ 650, OLDEST_MILLIS + 2000);
+
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context, logsDirectory.toFile(), CAP_BYTES, false, 100L, 0L))
+        .isFalse();
+    assertThat(Files.exists(reclaimable)).isTrue();
+    assertThat(hasAuditMessage("Log batches use 900 of 1000 permitted bytes.")).isTrue();
   }
 }

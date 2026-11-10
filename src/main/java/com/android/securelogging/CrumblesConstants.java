@@ -23,7 +23,6 @@ public final class CrumblesConstants {
 
   public static final String FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY = "logs";
   public static final String SENT_SUFFIX = "_sent.bin";
-  public static final String ENCRYPTED_LOG_FILE_NAME = "crumbles_logs_encrypted_";
   public static final String PROCESSING_SUFFIX = "_processing.bin";
 
   /**
@@ -35,18 +34,20 @@ public final class CrumblesConstants {
   public static final String NOTIFICATION_CHANNEL_ID = "email_log_channel";
   public static final String ACTION_NEEDED_NOTIFICATION_CHANNEL_ID = "action_needed_channel";
   public static final String DATA_INTEGRITY_NOTIFICATION_CHANNEL_ID = "data_integrity_channel";
-  public static final String EXTRA_FILES = "files";
   public static final Duration MAX_PROCESSING_FILE_AGE = Duration.ofDays(7);
 
   public static final String MARK_SENT_WORK_TAG = "mark_processing_as_sent_work";
-  public static final long MARK_SENT_REPEAT_INTERVAL_HOURS = 8;
-  public static final long MARK_SENT_INITIAL_DELAY_MINUTES_OFFSET = 10;
 
   public static final String DELETE_WORK_TAG = "delete_sent_log_files_work";
-  public static final long DELETE_REPEAT_INTERVAL_HOURS = 24;
 
   public static final String SEND_WORK_TAG = "send_processing_log_files_work";
-  public static final long SEND_REPEAT_INTERVAL_HOURS = 8;
+  public static final Duration SEND_REPEAT_INTERVAL = Duration.ofHours(8);
+
+  public static final String LOGGING_WATCHDOG_WORK_TAG = "logging_watchdog_work";
+  public static final Duration LOGGING_WATCHDOG_REPEAT_INTERVAL = Duration.ofMinutes(15);
+
+  /** Unique name of the one-time upload requested on top of the periodic one. */
+  public static final String SEND_NOW_WORK_NAME = "send_log_files_now_work";
 
   public static final long MAX_LOGS_DIRECTORY_BYTES = 256L * 1024 * 1024;
   public static final long LOGS_DIRECTORY_WARN_PERCENT = 80;
@@ -60,14 +61,47 @@ public final class CrumblesConstants {
       "com.android.securelogging.fileprovider"; // Matches what is defined in the Manifest.
   public static final String TEMP_RE_ENCRYPTED_DIR = "reencrypted_logs";
 
+  /**
+   * Largest file, in bytes, that decryption reads into memory.
+   *
+   * <p>The largest batch Crumbles produces holds one full platform security log buffer: 10,240
+   * events of at most about 4 KiB each (the logd entry payload limit), roughly 40 MiB once
+   * formatted and encrypted. Network log batches hold at most 1,200 events and are far smaller.
+   * The limit leaves headroom above that worst case while stopping a selected file from exhausting
+   * the heap.
+   */
+  public static final long MAX_DECRYPTION_INPUT_FILE_SIZE_BYTES = 64L * 1024 * 1024;
+
   public static final String PREFS_NAME = "CrumblesPrefs";
   public static final String PREF_UPLOAD_DESTINATION_URI = "uploadDestinationUri";
 
-  /** Whether this device fell back from RSA-OAEP padding to PKCS#1 v1.5 padding. */
-  public static final String PREF_OAEP_PADDING_DISABLED = "oaepPaddingDisabled";
+  /** DataStore entry ID that the WebDAV server URL is sealed with. */
+  public static final String WEBDAV_SERVER_URL_ENTRY_ID = "remote_storage_config/webdav_server_url";
 
-  /** Whether the one-time hardware RSA-OAEP capability probe has already run. */
-  public static final String PREF_OAEP_PROBED = "oaepProbed";
+  /** DataStore entry ID that the WebDAV username is sealed with. */
+  public static final String WEBDAV_USERNAME_ENTRY_ID =
+      "remote_storage_config/webdav_credentials/username";
+
+  /** DataStore entry ID that the WebDAV password is sealed with. */
+  public static final String WEBDAV_PASSWORD_ENTRY_ID =
+      "remote_storage_config/webdav_credentials/password";
+
+  /** DataStore entry ID that the pinned WebDAV server key digest is sealed with. */
+  public static final String WEBDAV_SERVER_KEY_SHA256_ENTRY_ID =
+      "remote_storage_config/webdav_server_key_sha256";
+
+  /** Whether security logging was enabled when the logging watchdog last checked. */
+  public static final String PREF_LAST_OBSERVED_LOGGING_ENABLED = "lastObservedLoggingEnabled";
+
+  /** Whether network logging was enabled when the logging watchdog last checked. */
+  public static final String PREF_LAST_OBSERVED_NETWORK_LOGGING_ENABLED =
+      "lastObservedNetworkLoggingEnabled";
+
+  /**
+   * Tag of the last activity log record sealed into a stored log batch. The next batch carries the
+   * activity log records written after it.
+   */
+  public static final String PREF_AUDIT_SHIPPED_THROUGH_TAG = "auditShippedThroughTag";
 
   public static final String ZXING_PACKAGE_NAME = "com.google.zxing.client.android";
 
@@ -80,8 +114,9 @@ public final class CrumblesConstants {
 
   public static final String CURRENT_LOG_FILE_NAME = "app_audit_log.jsonl";
   public static final String OLD_LOG_FILE_NAME = "app_audit_log.old.jsonl";
+  public static final String AUDIT_LOG_KEY_FILE_NAME = "app_audit_log.key";
   public static final int MAX_MEMORY_EVENTS = 100; // Max events to keep in RAM for quick display.
-  public static final long MAX_LOG_FILE_SIZE_BYTES = 512 * 1024; // 0.5 MB per file pre-rotation.
+  public static final long MAX_LOG_FILE_SIZE_BYTES = 1024 * 1024; // 1 MiB per file pre-rotation.
 
   public static final int QR_CODE_WIDTH_PX = 250;
   public static final int QR_CODE_HEIGHT_PX = 250;
@@ -92,10 +127,24 @@ public final class CrumblesConstants {
 
   public static final int FILE_PICKER_REQUEST_CODE =
       123; // For the file picker needed for decryption.
-  public static final int KEYGUARD_REQUEST_CODE = 456; // For the lock screen prompt.
   public static final int FILE_TREE_REQUEST_CODE = 789; // For selecting the upload destination.
   public static final int KEYGUARD_DESTINATION_REQUEST_CODE =
       790; // For authenticating before changing the upload destination.
+  public static final int KEYGUARD_DISABLE_LOGGING_REQUEST_CODE =
+      791; // For authenticating before turning logging off.
+  public static final int KEYGUARD_DISABLE_NETWORK_COLLECTION_REQUEST_CODE =
+      792; // For authenticating before turning network collection off.
+  public static final int KEYGUARD_WIPE_ANYWAY_REQUEST_CODE =
+      798; // For authenticating before wiping batches that could not be uploaded.
+
+  public static final int UPLOAD_NOTIFICATION_ID = 2001;
+  public static final int DEFERRED_LOGS_NOTIFICATION_ID = 2002;
+  public static final int STORAGE_NOTIFICATION_ID = 2003;
+  public static final int PREFERENCES_UNREADABLE_NOTIFICATION_ID = 2004;
+  public static final int LOGGING_DISABLED_NOTIFICATION_ID = 2005;
+  public static final int NO_SCREEN_LOCK_NOTIFICATION_ID = 2006;
+  public static final int KEY_DELETED_NOTIFICATION_ID = 2007;
+  public static final int COLLECTION_PAUSED_NOTIFICATION_ID = 2008;
 
   private CrumblesConstants() {}
 }

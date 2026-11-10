@@ -19,6 +19,7 @@ package com.android.securelogging;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
@@ -83,6 +84,42 @@ public class CrumblesDecryptedLogEntryTest {
   public void getRawBytes_returnsCorrectValue() {
     CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, testRawBytes);
     assertThat(entry.getRawBytes()).isEqualTo(testRawBytes);
+  }
+
+  @Test
+  public void getDeviceId_withDeviceId_returnsOriginalDeviceId() {
+    CrumblesDecryptedLogEntry entry =
+        new CrumblesDecryptedLogEntry(
+            TEST_FILE_NAME, testRawBytes, "original-device", /* originalBatch= */ null);
+
+    assertThat(entry.getDeviceId()).isEqualTo("original-device");
+  }
+
+  @Test
+  public void getDeviceId_withoutDeviceId_returnsNull() {
+    CrumblesDecryptedLogEntry entry = new CrumblesDecryptedLogEntry(TEST_FILE_NAME, testRawBytes);
+
+    assertThat(entry.getDeviceId()).isNull();
+    assertThat(entry.getOriginalBatch()).isNull();
+  }
+
+  @Test
+  public void getOriginalBatch_withOriginalBatch_returnsOriginalBatch() {
+    LogBatch originalBatch = LogBatch.newBuilder().setSequenceNumber(9).build();
+    CrumblesDecryptedLogEntry entry =
+        new CrumblesDecryptedLogEntry(
+            TEST_FILE_NAME, testRawBytes, "original-device", originalBatch);
+
+    assertThat(entry.getOriginalBatch()).isEqualTo(originalBatch);
+  }
+
+  @Test
+  public void getOriginalBatch_withNullOriginalBatch_returnsNull() {
+    CrumblesDecryptedLogEntry entry =
+        new CrumblesDecryptedLogEntry(
+            TEST_FILE_NAME, testRawBytes, "original-device", /* originalBatch= */ null);
+
+    assertThat(entry.getOriginalBatch()).isNull();
   }
 
   @Test

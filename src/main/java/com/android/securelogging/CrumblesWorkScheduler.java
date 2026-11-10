@@ -17,13 +17,15 @@
 package com.android.securelogging;
 
 import static java.util.concurrent.TimeUnit.DAYS;
-import static java.util.concurrent.TimeUnit.HOURS;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import android.content.Context;
 import android.util.Log;
 import androidx.work.BackoffPolicy;
+import androidx.work.Constraints;
 import androidx.work.ExistingPeriodicWorkPolicy;
+import androidx.work.ExistingWorkPolicy;
+import androidx.work.NetworkType;
+import androidx.work.OneTimeWorkRequest;
 import androidx.work.PeriodicWorkRequest;
 import androidx.work.WorkManager;
 import java.time.Duration;
@@ -33,6 +35,9 @@ import java.util.Calendar;
 final class CrumblesWorkScheduler {
 
   private static final String TAG = "CrumblesWorkScheduler";
+
+  /** First wait before an upload is retried; each further retry waits twice as long. */
+  private static final Duration SEND_RETRY_INITIAL_BACKOFF = Duration.ofMinutes(1);
 
   /**
    * Schedules all periodic work for Crumbles.
@@ -46,33 +51,62 @@ final class CrumblesWorkScheduler {
     // Stale processing recovery is handled synchronously by CrumblesSendAndMarkProcessingWorker.
     workManager.cancelUniqueWork(CrumblesConstants.MARK_SENT_WORK_TAG);
     scheduleDailyFileDeletion(workManager);
+    scheduleLoggingWatchdog(workManager);
+    scheduleHeartbeat(workManager);
     Log.d(TAG, "All periodic work scheduled.");
   }
 
   /**
-   * Schedules the periodic send+process work for Crumbles.
+   * Schedules the periodic send+process work for Crumbles. It runs only with a network and a
+   * battery that is not low, and backs off exponentially between retries.
    *
    * @param workManager The WorkManager to use for scheduling work.
    */
   private static void scheduleSendWork(WorkManager workManager) {
     PeriodicWorkRequest sendWorkRequest =
         new PeriodicWorkRequest.Builder(
-                CrumblesSendAndMarkProcessingWorker.class,
-                CrumblesConstants.SEND_REPEAT_INTERVAL_HOURS,
-                HOURS)
-            .setBackoffCriteria(
-                BackoffPolicy.LINEAR, PeriodicWorkRequest.MIN_BACKOFF_MILLIS, MILLISECONDS)
+                CrumblesSendAndMarkProcessingWorker.class, CrumblesConstants.SEND_REPEAT_INTERVAL)
+            .setConstraints(
+                new Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .setRequiresBatteryNotLow(true)
+                    .build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, SEND_RETRY_INITIAL_BACKOFF)
             .addTag(CrumblesConstants.SEND_WORK_TAG)
             .build();
 
+    // UPDATE applies this request to work scheduled earlier without restarting its period.
     workManager.enqueueUniquePeriodicWork(
-        CrumblesConstants.SEND_WORK_TAG, ExistingPeriodicWorkPolicy.KEEP, sendWorkRequest);
+        CrumblesConstants.SEND_WORK_TAG, ExistingPeriodicWorkPolicy.UPDATE, sendWorkRequest);
 
     Log.d(
         TAG,
         "Periodic send+process work scheduled every "
-            + CrumblesConstants.SEND_REPEAT_INTERVAL_HOURS
+            + CrumblesConstants.SEND_REPEAT_INTERVAL.toHours()
             + " hours.");
+  }
+
+  /**
+   * Asks for the pending log files to be uploaded right away rather than at the next periodic run.
+   *
+   * <p>Queues another run after an earlier request that is already running, so that a batch sealed
+   * while that upload is in flight is still uploaded right away.
+   *
+   * @param workManager The WorkManager to use for scheduling work.
+   */
+  public static void requestImmediateUpload(WorkManager workManager) {
+    OneTimeWorkRequest sendNowWorkRequest =
+        new OneTimeWorkRequest.Builder(CrumblesSendAndMarkProcessingWorker.class)
+            .setConstraints(
+                new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, SEND_RETRY_INITIAL_BACKOFF)
+            .build();
+
+    workManager.enqueueUniqueWork(
+        CrumblesConstants.SEND_NOW_WORK_NAME,
+        ExistingWorkPolicy.APPEND_OR_REPLACE,
+        sendNowWorkRequest);
+    Log.d(TAG, "One-time send+process work requested.");
   }
 
   /* Schedules the worker that deletes files with _sent suffix once a day at night. */
@@ -113,6 +147,33 @@ final class CrumblesWorkScheduler {
     Log.d(TAG, "Daily file deletion work scheduled for ~" + targetHour + ":00 at night.");
   }
 
+  /** Schedules the worker that notices when security or network logging is turned on or off. */
+  private static void scheduleLoggingWatchdog(WorkManager workManager) {
+    PeriodicWorkRequest watchdogWorkRequest =
+        new PeriodicWorkRequest.Builder(
+                CrumblesLoggingWatchdogWorker.class,
+                CrumblesConstants.LOGGING_WATCHDOG_REPEAT_INTERVAL)
+            .addTag(CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG)
+            .build();
+
+    workManager.enqueueUniquePeriodicWork(
+        CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG,
+        ExistingPeriodicWorkPolicy.KEEP,
+        watchdogWorkRequest);
+  }
+
+  /** Schedules the worker that writes a heartbeat batch when no batch was signed for a day. */
+  private static void scheduleHeartbeat(WorkManager workManager) {
+    PeriodicWorkRequest heartbeatWorkRequest =
+        new PeriodicWorkRequest.Builder(
+                CrumblesHeartbeatWorker.class, CrumblesHeartbeatWorker.CHECK_INTERVAL)
+            .addTag(CrumblesHeartbeatWorker.WORK_TAG)
+            .build();
+
+    workManager.enqueueUniquePeriodicWork(
+        CrumblesHeartbeatWorker.WORK_TAG, ExistingPeriodicWorkPolicy.KEEP, heartbeatWorkRequest);
+  }
+
   /**
    * Cancels all periodic work for Crumbles.
    *
@@ -123,6 +184,8 @@ final class CrumblesWorkScheduler {
     workManager.cancelUniqueWork(CrumblesConstants.SEND_WORK_TAG);
     workManager.cancelUniqueWork(CrumblesConstants.MARK_SENT_WORK_TAG);
     workManager.cancelUniqueWork(CrumblesConstants.DELETE_WORK_TAG);
+    workManager.cancelUniqueWork(CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    workManager.cancelUniqueWork(CrumblesHeartbeatWorker.WORK_TAG);
     Log.d(TAG, "All periodic work cancelled.");
   }
 

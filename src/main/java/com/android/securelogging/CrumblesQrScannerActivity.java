@@ -17,52 +17,60 @@
 package com.android.securelogging;
 
 import android.Manifest;
-import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.media.Image;
 import android.os.Bundle;
 import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.view.WindowManager;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
-import androidx.annotation.VisibleForTesting;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
+import androidx.camera.core.ImageProxy.PlaneProxy;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.mlkit.vision.barcode.BarcodeScanner;
-import com.google.mlkit.vision.barcode.BarcodeScannerOptions;
-import com.google.mlkit.vision.barcode.BarcodeScanning;
-import com.google.mlkit.vision.barcode.common.Barcode;
-import com.google.mlkit.vision.common.InputImage;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.ChecksumException;
+import com.google.zxing.FormatException;
+import com.google.zxing.NotFoundException;
+import com.google.zxing.PlanarYUVLuminanceSource;
+import com.google.zxing.Result;
+import com.google.zxing.common.HybridBinarizer;
+import com.google.zxing.qrcode.QRCodeReader;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Activity to scan QR codes. */
+/** Activity to scan QR codes. Decoding happens on the device with ZXing. */
 public class CrumblesQrScannerActivity extends AppCompatActivity {
 
   private static final String TAG = "CrumblesQrScannerActivity";
+  static final String EXTRA_END_DECRYPTED_SESSION_ON_STOP = "end_decrypted_session_on_stop";
   private static final String[] requiredPermissions = new String[] {Manifest.permission.CAMERA};
 
   private PreviewView previewView;
   private ExecutorService cameraExecutor;
-  @VisibleForTesting BarcodeScanner barcodeScanner;
-  private boolean isProcessingBarcode = false;
+  // Read on the camera executor and written on the main thread.
+  private volatile boolean isProcessingBarcode = false;
+  private boolean returningResult = false;
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
     setContentView(R.layout.activity_qr_scanner);
+    CrumblesWindowInsets.applySystemBarPadding(this);
 
     previewView = findViewById(R.id.camera_preview_view);
     cameraExecutor = Executors.newSingleThreadExecutor();
@@ -73,15 +81,6 @@ public class CrumblesQrScannerActivity extends AppCompatActivity {
       ActivityCompat.requestPermissions(
           this, requiredPermissions, CrumblesConstants.QR_SCAN_REQUEST_CODE_PERMISSIONS);
     }
-  }
-
-  private BarcodeScanner getBarcodeScanner() {
-    if (barcodeScanner == null) {
-      BarcodeScannerOptions options =
-          new BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build();
-      barcodeScanner = BarcodeScanning.getClient(options);
-    }
-    return barcodeScanner;
   }
 
   private boolean allPermissionsGranted() {
@@ -137,56 +136,70 @@ public class CrumblesQrScannerActivity extends AppCompatActivity {
     }
   }
 
-  @SuppressLint("UnsafeOptInUsageError")
+  /** Decodes one camera frame and, if it shows a QR code, finishes with the code's text. */
   void processImageProxy(@NonNull ImageProxy imageProxy) {
-    if (isProcessingBarcode) {
-      imageProxy.close();
-      return;
-    }
-    Image mediaImage = imageProxy.getImage();
-    if (mediaImage != null) {
-      InputImage image =
-          InputImage.fromMediaImage(mediaImage, imageProxy.getImageInfo().getRotationDegrees());
-      processInputImage(image, imageProxy);
-    } else {
+    try {
+      if (!isProcessingBarcode) {
+        decodeQrCode(imageProxy).ifPresent(text -> runOnUiThread(() -> handleQrCodeFound(text)));
+      }
+    } finally {
       imageProxy.close();
     }
   }
 
-  private void processInputImage(@NonNull InputImage image, @NonNull ImageProxy imageProxy) {
-    getBarcodeScanner()
-        .process(image)
-        .addOnSuccessListener(
-            barcodes -> {
-              if (!barcodes.isEmpty()) {
-                // When a barcode is found, call our new handler method.
-                handleBarcodeFound(barcodes.get(0));
-              }
-            })
-        .addOnFailureListener(e -> Log.e(TAG, "Barcode scanning failed.", e))
-        .addOnCompleteListener(task -> imageProxy.close());
+  /** Returns the text of the QR code in the luminance plane of a YUV_420_888 frame, if any. */
+  private static Optional<String> decodeQrCode(@NonNull ImageProxy imageProxy) {
+    PlaneProxy luminancePlane = imageProxy.getPlanes()[0];
+    int rowStride = luminancePlane.getRowStride();
+    int height = imageProxy.getHeight();
+    ByteBuffer buffer = luminancePlane.getBuffer();
+    byte[] luminance = new byte[rowStride * height];
+    // The last row of the plane can be shorter than the row stride.
+    buffer.get(luminance, /* off= */ 0, Math.min(buffer.remaining(), luminance.length));
+    PlanarYUVLuminanceSource source =
+        new PlanarYUVLuminanceSource(
+            luminance,
+            rowStride,
+            height,
+            /* left= */ 0,
+            /* top= */ 0,
+            imageProxy.getWidth(),
+            height,
+            /* reverseHorizontal= */ false);
+    Result result;
+    try {
+      result = new QRCodeReader().decode(new BinaryBitmap(new HybridBinarizer(source)));
+    } catch (NotFoundException | ChecksumException | FormatException e) {
+      // Most frames do not contain a readable QR code, so keep scanning.
+      return Optional.empty();
+    }
+    return Optional.of(result.getText());
   }
 
-  /** App's logic to facilitate testing without using framework classes. */
-  @VisibleForTesting
-  void handleBarcodeFound(@NonNull Barcode barcode) {
+  private void handleQrCodeFound(@NonNull String rawValue) {
     if (isProcessingBarcode) {
       return;
     }
     isProcessingBarcode = true;
 
-    String rawValue = barcode.getRawValue();
-    if (rawValue != null) {
-      // Never log the scanned payload: the same scanner is used to import private keys.
-      Log.d(TAG, "QR Code detected, payload length: " + rawValue.length());
-      Intent resultIntent = new Intent();
-      resultIntent.putExtra(CrumblesConstants.SCAN_RESULT_EXTRA, rawValue);
-      setResult(Activity.RESULT_OK, resultIntent);
-    } else {
-      Log.w(TAG, "QR Code detected but raw value is null.");
-      setResult(Activity.RESULT_CANCELED);
-    }
+    // Never log the scanned payload: the same scanner is used to import private keys.
+    Log.d(TAG, "QR Code detected, payload length: " + rawValue.length());
+    returningResult = true;
+    Intent resultIntent = new Intent();
+    resultIntent.putExtra(CrumblesConstants.SCAN_RESULT_EXTRA, rawValue);
+    setResult(Activity.RESULT_OK, resultIntent);
     finish();
+  }
+
+  @Override
+  protected void onStop() {
+    super.onStop();
+    if (!isChangingConfigurations()
+        && !isFinishing()
+        && !returningResult
+        && getIntent().getBooleanExtra(EXTRA_END_DECRYPTED_SESSION_ON_STOP, false)) {
+      CrumblesDecryptedLogsSession.destroyActiveSession();
+    }
   }
 
   @Override
@@ -213,8 +226,11 @@ public class CrumblesQrScannerActivity extends AppCompatActivity {
   protected void onDestroy() {
     super.onDestroy();
     cameraExecutor.shutdown();
-    if (barcodeScanner != null) {
-      barcodeScanner.close();
+    if (isFinishing()) {
+      // The camera is only needed to scan, so give the permission back. The system revokes it,
+      // and kills the app, once the app is in the background and has no active components. A
+      // configuration change destroys the activity without finishing it, and the scan goes on.
+      getApplicationContext().revokeSelfPermissionsOnKill(Arrays.asList(requiredPermissions));
     }
   }
 }

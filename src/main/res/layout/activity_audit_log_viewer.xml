@@ -21,11 +21,24 @@
     android:layout_height="match_parent"
     tools:context=".audit.CrumblesAuditLogViewerActivity">
 
+    <TextView
+        android:id="@+id/tv_audit_chain_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentTop="true"
+        android:padding="16dp"
+        android:accessibilityLiveRegion="polite"
+        android:visibility="gone" />
+
+    <!-- Only accessibility tools such as screen readers may read the timeline:
+         FLAG_SECURE does not keep it from other accessibility services. -->
     <android.support.v7.widget.RecyclerView
         android:id="@+id/rv_audit_logs"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:scrollbars="vertical"
+        android:accessibilityDataSensitive="yes"
+        android:layout_below="@id/tv_audit_chain_status"
         android:layout_above="@+id/btn_clear_audit_logs"/>
 
     <Button

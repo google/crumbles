@@ -19,8 +19,13 @@ package com.android.securelogging;
 import android.content.Context;
 import java.io.File;
 
-/** Interface for uploading encrypted log files to a remote storage destination. */
-public interface RemoteStorageUploader {
+/**
+ * Interface for uploading encrypted log files to a remote storage destination.
+ *
+ * <p>Implementations that hold credential material in memory release it in {@link #close()}, so
+ * callers should use an uploader inside a try-with-resources block.
+ */
+public interface RemoteStorageUploader extends AutoCloseable {
 
   /**
    * Uploads a single encrypted log file to the configured remote destination.
@@ -37,4 +42,26 @@ public interface RemoteStorageUploader {
 
   /** Returns a human-readable display description of the destination for notifications/logs. */
   String getDestinationDescription();
+
+  /**
+   * Returns whether an upload failed because the server presented a key other than the pinned one.
+   */
+  default boolean rejectedServerKey() {
+    return false;
+  }
+
+  /**
+   * Returns whether an upload failed in transit, for example because the destination could not be
+   * reached or did not finish before the deadline, rather than because it refused the batch.
+   */
+  boolean transportFailed();
+
+  /**
+   * Releases any credential material this uploader holds in memory.
+   *
+   * <p>Overrides {@link AutoCloseable#close()} without its checked exception, so callers never need
+   * to handle one. The default implementation does nothing, for uploaders that hold no secrets.
+   */
+  @Override
+  default void close() {}
 }

@@ -17,30 +17,35 @@
 package com.android.securelogging;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.lang.Math.min;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.os.Handler;
-import android.os.Looper;
+import android.os.Build;
+import android.security.KeyStoreException;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyInfo;
+import android.security.keystore.KeyPermanentlyInvalidatedException;
 import android.security.keystore.KeyProperties;
 import android.security.keystore.UserNotAuthenticatedException;
 import android.util.Log;
-import android.widget.Toast;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableList;
 import com.google.common.time.TimeSource;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.ExtensionRegistryLite;
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Timestamp;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.KeyEncryptionType;
@@ -49,10 +54,12 @@ import com.google.protos.wireless_android_security_exploits_secure_logging_src_m
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogEncryptionType;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogKey;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.SealedLogs;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -61,6 +68,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
 import java.security.Key;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -69,6 +78,7 @@ import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
+import java.security.ProviderException;
 import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.interfaces.RSAPublicKey;
@@ -79,9 +89,13 @@ import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -97,7 +111,11 @@ import javax.crypto.spec.SecretKeySpec;
  * stored in the Android Keystore or an external public key can be provided for encryption.
  *
  * <p>Private keys generated in the Keystore are configured to require user authentication (e.g.,
- * fingerprint, PIN) for decryption operations.
+ * fingerprint, PIN) for decryption operations. Authentication is bound to a single operation: the
+ * user has to approve every individual decryption through a {@code BiometricPrompt} carrying a
+ * {@code CryptoObject} that wraps the {@link Cipher} being authorized. On Android 15 and higher,
+ * such keys can also only be used while the device is unlocked. Encryption only needs the public
+ * key, so log batches are still encrypted while the device is locked.
  */
 public class CrumblesLogsEncryptor {
   private static final String TAG = "CrumblesLogsEncryptor";
@@ -108,9 +126,22 @@ public class CrumblesLogsEncryptor {
   @VisibleForTesting static final int GCM_TAG_LEN_BITS = 128;
   @VisibleForTesting static final int GCM_TAG_LEN_BYTES = GCM_TAG_LEN_BITS / 8;
 
+  /** Smallest padded size of the logs in a batch, so that small batches all look alike. */
+  private static final int MIN_PADDED_LOGS_BYTES = 4096;
+
+  /** Label at the start of the associated data of a format version 2 batch. */
+  private static final String V2_ASSOCIATED_DATA_LABEL = "crumbles/v2/batch";
+
   @VisibleForTesting static final String ASYM_ALGORITHM = KeyProperties.KEY_ALGORITHM_RSA;
   private static final String CIPHER_MODE_ASYM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
   private static final int ASYM_BITS = 2048;
+
+  /**
+   * Size of the key pairs generated for export, as CR-04.2 asks for 3072 or 4096 bits. Their
+   * private key is handed over as a QR code of its Base64 encoding, which a 4096-bit key exceeds.
+   */
+  private static final int EXPORTABLE_KEY_BITS = 3072;
+
   private static final int MIN_RSA_MODULUS_BITS = 2048;
   private static final int FINGERPRINT_BYTES_PER_LINE = 8;
   private static final int MAX_RSA_MODULUS_BITS = 4096;
@@ -120,10 +151,6 @@ public class CrumblesLogsEncryptor {
           "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT);
   private static final String CIPHER_MODE_ASYM_PKCS1 = "RSA/ECB/PKCS1Padding";
 
-  private static final String PROBE_KEY_ALIAS = "_oaep_probe_key_";
-  private static final String OAEP_UNSUPPORTED_MESSAGE =
-      "OAEP padding is not supported on this device. Defaulting to standard PKCS#1 padding.";
-  private static volatile boolean isOaepPaddingDisabledInMemory = false;
   private static volatile Context applicationContext = null;
 
   /** Caches the application {@link Context}, or clears it when {@code context} is {@code null}. */
@@ -139,104 +166,33 @@ public class CrumblesLogsEncryptor {
     return applicationContext;
   }
 
-  private static boolean probeOaepSupport() {
-    try {
-      KeyPairGenerator keyPairGenerator =
-          KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, ANDROID_KEYSTORE_PROVIDER);
-      keyPairGenerator.initialize(
-          new KeyGenParameterSpec.Builder(
-                  PROBE_KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
-              .setKeySize(ASYM_BITS)
-              .setDigests(KeyProperties.DIGEST_SHA256)
-              .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
-              .build());
-      KeyPair probeKeyPair = keyPairGenerator.generateKeyPair();
-      SecretKey probeKey = generateSecretKey();
-      byte[] wrapped = wrapAesKey(probeKeyPair.getPublic(), probeKey, /* oaepDisabled= */ false);
-      SecretKey unwrapped = unwrapAesKey(probeKeyPair.getPrivate(), wrapped);
-      return Arrays.equals(probeKey.getEncoded(), unwrapped.getEncoded());
-    } catch (GeneralSecurityException | CrumblesKeysException | RuntimeException e) {
-      Log.w(TAG, "OAEP probe failed on this device.", e);
-      return false;
-    } finally {
-      deleteExistingKeyPair(PROBE_KEY_ALIAS);
+  /**
+   * Authorizes MGF1 with SHA-256 for an RSA-OAEP key, as required by {@link #OAEP_SPEC}.
+   *
+   * <p>Since Android 15, Keystore only authorizes the MGF1 digests requested at key generation
+   * (SHA-1 by default), so unwrapping with {@link #OAEP_SPEC} otherwise fails.
+   */
+  private static KeyGenParameterSpec.Builder authorizeOaepMgf1Sha256(
+      KeyGenParameterSpec.Builder specBuilder) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+      return specBuilder;
     }
-  }
-
-  private static void communicateOaepUnsupported(@Nullable Context context) {
-    if (context == null) {
-      return;
-    }
-    CrumblesAppAuditLogger.getInstance(context)
-        .logEvent("OAEP_UNSUPPORTED", "OAEP unsupported on this device; defaulted to PKCS#1.");
-    new Handler(Looper.getMainLooper())
-        .post(() -> Toast.makeText(context, OAEP_UNSUPPORTED_MESSAGE, Toast.LENGTH_LONG).show());
+    return specBuilder.setMgf1Digests(KeyProperties.DIGEST_SHA256);
   }
 
   /**
-   * Returns whether RSA-OAEP padding is disabled on the current device.
+   * Allows private key operations only while the device is unlocked, on Android 15 and higher.
    *
-   * <p>"Unsupported" means the Keystore lacks functional OAEP unwrapping, verified once via {@link
-   * #probeOaepSupport()}. When unsupported, OAEP becomes "disabled" in {@link SharedPreferences},
-   * permanently falling back to {@code RSA/ECB/PKCS1Padding}.
-   *
-   * @param context the Android context to access preferences, or {@code null} for cached context
-   * @return {@code true} if OAEP padding is disabled on this device; {@code false} if enabled
+   * <p>Android 12 to 14 don't re-authorize these keys after an unlock with a non-strong biometric,
+   * such as face unlock, or with a biometric in a profile that shares its parent's lock, which can
+   * leave the key unusable.
    */
-  @CanIgnoreReturnValue
-  public static boolean isOaepPaddingDisabled(@Nullable Context context) {
-    Context resolvedContext = cacheAndResolveContext(context);
-    if (resolvedContext == null) {
-      return isOaepPaddingDisabledInMemory;
+  private static KeyGenParameterSpec.Builder requireUnlockedDevice(
+      KeyGenParameterSpec.Builder specBuilder) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+      return specBuilder;
     }
-    SharedPreferences preferences =
-        resolvedContext.getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE);
-    if (!preferences.getBoolean(CrumblesConstants.PREF_OAEP_PROBED, false)) {
-      probeAndEnableOaepPadding(resolvedContext);
-      return isOaepPaddingDisabledInMemory;
-    }
-    isOaepPaddingDisabledInMemory =
-        preferences.getBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, false);
-    return isOaepPaddingDisabledInMemory;
-  }
-
-  private static KeyEncryptionType getKeyEncryptionType(@Nullable Context context) {
-    return isOaepPaddingDisabled(context)
-        ? KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC
-        : KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256;
-  }
-
-  /**
-   * Enables RSA-OAEP padding if this device supports it, notifying the user via a toast and an
-   * audit log entry otherwise, and persists the outcome.
-   *
-   * @param context the Android context to persist preferences, or {@code null} for cached context
-   */
-  public static void probeAndEnableOaepPadding(@Nullable Context context) {
-    Context resolvedContext = cacheAndResolveContext(context);
-    boolean supported = probeOaepSupport();
-    if (!supported) {
-      communicateOaepUnsupported(resolvedContext);
-    }
-    persistOaepPaddingDisabled(resolvedContext, !supported);
-  }
-
-  /** Disables RSA-OAEP padding on this device, permanently falling back to PKCS#1 v1.5 padding. */
-  public static void disableOaepPadding(@Nullable Context context) {
-    persistOaepPaddingDisabled(cacheAndResolveContext(context), /* disabled= */ true);
-  }
-
-  private static void persistOaepPaddingDisabled(@Nullable Context context, boolean disabled) {
-    isOaepPaddingDisabledInMemory = disabled;
-    if (context == null) {
-      return;
-    }
-    context
-        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
-        .edit()
-        .putBoolean(CrumblesConstants.PREF_OAEP_PROBED, true)
-        .putBoolean(CrumblesConstants.PREF_OAEP_PADDING_DISABLED, disabled)
-        .apply();
+    return specBuilder.setUnlockedDeviceRequired(true);
   }
 
   private static final String ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore";
@@ -250,7 +206,28 @@ public class CrumblesLogsEncryptor {
 
   private static final String SERIALIZED_ENCRYPTED_DATA_DELIMITER = ":";
 
-  private static final Duration AUTH_VALIDITY_DURATION = Duration.ofSeconds(30);
+  private static final Duration PER_OPERATION_AUTH_TIMEOUT = Duration.ZERO;
+  private static final int ALLOWED_AUTHENTICATORS =
+      KeyProperties.AUTH_BIOMETRIC_STRONG | KeyProperties.AUTH_DEVICE_CREDENTIAL;
+
+  /** Size of the authentication-bound keys in StrongBox, which only guarantees RSA-2048. */
+  private static final int STRONGBOX_KEY_BITS = 2048;
+
+  /** Size of the authentication-bound keys in the TEE, as CR-04.2 asks for 3072 bits. */
+  private static final int TEE_KEY_BITS = 3072;
+
+  private static final String AUDIT_EVENT_DECRYPTION_KEY_STORAGE = "KEYSTORE_KEY_STORAGE";
+  private static final String PREF_KEY_PADDING_CACHE = "keystore_key_authorized_padding";
+  private static final String CACHED_PADDING_OAEP_SUFFIX = ":OAEP";
+  private static final String CACHED_PADDING_PKCS1_SUFFIX = ":PKCS1";
+
+  private static final ConcurrentHashMap<String, Boolean> cachedKeyOaepSupport =
+      new ConcurrentHashMap<>();
+
+  @VisibleForTesting
+  static void clearKeyPaddingCacheForTest() {
+    cachedKeyOaepSupport.clear();
+  }
 
   @Nullable private final Context context;
   private PublicKey externalEncryptionPublicKey;
@@ -281,6 +258,32 @@ public class CrumblesLogsEncryptor {
     void accept(byte[] privateKeyBytes) throws CrumblesKeysException;
   }
 
+  /**
+   * Log batches grouped by the keys that can decrypt them, see {@link #partitionForBulkDecrypt}.
+   *
+   * @param batchUnwrappable batches whose symmetric keys {@link #unwrapBatchKeys} unwraps together,
+   *     with one authorized {@link #createBatchUnwrapCipher() cipher}
+   * @param rsaOnly batches without a usable batch-wrapped key, which only the Keystore RSA key may
+   *     decrypt, one operation each: batches written before the batch-unwrap keys existed, or
+   *     encrypted to an external key
+   * @param undecryptable batches whose batch-unwrap keys were replaced after they were written.
+   *     Those keys are only replaced together with the Keystore RSA key, so no key on this device
+   *     can decrypt these batches.
+   */
+  record BulkDecryptPartition(
+      ImmutableList<LogBatch> batchUnwrappable,
+      ImmutableList<LogBatch> rsaOnly,
+      ImmutableList<LogBatch> undecryptable) {}
+
+  /**
+   * The logs of a decrypted {@link LogBatch}.
+   *
+   * @param metadata the metadata of the batch, which for a format version 2 batch includes the
+   *     timestamp and the device identifier sealed inside it
+   */
+  @SuppressWarnings("ArrayRecordComponent") // Callers wipe the logs in place.
+  record DecryptedLogBatch(LogMetadata metadata, byte[] logs) {}
+
   /** getPublicKey method. */
   @Nullable
   public PublicKey getPublicKey() {
@@ -291,19 +294,56 @@ public class CrumblesLogsEncryptor {
   @Nullable
   public PublicKey getPublicKey(String keyAlias) {
     try {
+      return loadKeystorePublicKey(keyAlias).orElse(null);
+    } catch (CrumblesKeysException e) {
+      Log.e(TAG, "Failed to load public key from Android Keystore for alias: " + keyAlias, e);
+      return null;
+    }
+  }
+
+  private static Optional<PublicKey> loadKeystorePublicKey(String keyAlias)
+      throws CrumblesKeysException {
+    try {
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
-      if (keyStore.containsAlias(keyAlias)) {
-        return keyStore.getCertificate(keyAlias).getPublicKey();
+      if (!keyStore.containsAlias(keyAlias)) {
+        return Optional.empty();
       }
-    } catch (Exception e) {
-      Log.e(TAG, "Failed to load public key from Android Keystore for alias: " + keyAlias, e);
+      return Optional.of(keyStore.getCertificate(keyAlias).getPublicKey());
+    } catch (GeneralSecurityException | IOException | RuntimeException e) {
+      throw new CrumblesKeysException(
+          "Failed to load public key from Android Keystore for alias: " + keyAlias, e);
     }
-    return null;
   }
 
   public boolean doesPrivateKeyExist() {
     return getPublicKey() != null;
+  }
+
+  /**
+   * Returns whether the Keystore permanently invalidated the private key of {@link #KEY_ALIAS} (for
+   * example, after the secure lock screen is removed).
+   */
+  public boolean isPrivateKeyPermanentlyInvalidated() {
+    try {
+      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
+      keyStore.load(null);
+      if (keyStore.getKey(KEY_ALIAS, null) instanceof PrivateKey privateKey) {
+        PublicKey publicKey = keyStore.getCertificate(KEY_ALIAS).getPublicKey();
+        if (!keystoreKeySupportsOaep(KEY_ALIAS, publicKey)) {
+          Cipher.getInstance(CIPHER_MODE_ASYM_PKCS1).init(Cipher.UNWRAP_MODE, privateKey);
+        } else {
+          Cipher.getInstance(CIPHER_MODE_ASYM).init(Cipher.UNWRAP_MODE, privateKey, OAEP_SPEC);
+        }
+      }
+    } catch (KeyPermanentlyInvalidatedException e) {
+      Log.e(TAG, "The Keystore permanently invalidated the private key. Deleting it.", e);
+      deleteExistingKeyPair();
+      return true;
+    } catch (GeneralSecurityException | IOException | RuntimeException | CrumblesKeysException e) {
+      Log.d(TAG, "The private key is not known to be invalidated.", e);
+    }
+    return false;
   }
 
   /**
@@ -339,55 +379,127 @@ public class CrumblesLogsEncryptor {
   /**
    * Generates a new key pair and stores it in the Android Keystore.
    *
+   * <p>If {@code requireUserAuthentication} is true, on Android 15 and higher the private key can
+   * also only be used while the device is unlocked. Public key operations are not restricted.
+   *
+   * <p>A new {@link #KEY_ALIAS} key pair also gets new batch-unwrap keys, see {@link
+   * CrumblesBatchKeyStore}.
+   *
    * @param keyAlias the alias under which to store the key pair
-   * @param requireUserAuthentication whether the key requires user authentication to be used
+   * @param requireUserAuthentication whether the key requires per-operation user authentication
    * @return the generated {@link KeyPair}
-   * @throws CrumblesKeysException if the key pair cannot be generated
+   * @throws CrumblesKeysException if the device has no screen lock or key generation fails
    */
   @CanIgnoreReturnValue
   public synchronized KeyPair generateKeyPair(String keyAlias, boolean requireUserAuthentication)
       throws CrumblesKeysException {
-    return generateKeyPair(keyAlias, requireUserAuthentication, AUTH_VALIDITY_DURATION);
-  }
-
-  /**
-   * Generates a new key pair and stores it in the Android Keystore.
-   *
-   * @param keyAlias the alias under which to store the key pair
-   * @param requireUserAuthentication whether the key requires user authentication to be used
-   * @param authValidityDuration the duration for which the authentication remains valid
-   * @return the generated {@link KeyPair}
-   * @throws CrumblesKeysException if the key pair cannot be generated
-   */
-  @CanIgnoreReturnValue
-  public synchronized KeyPair generateKeyPair(
-      String keyAlias, boolean requireUserAuthentication, Duration authValidityDuration)
-      throws CrumblesKeysException {
+    if (requireUserAuthentication) {
+      requireSecureLockScreen();
+    }
     deleteExistingKeyPair(keyAlias);
+    KeyPair keyPair;
     try {
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
       Log.d(TAG, "Generating new RSA key pair into Android Keystore with alias: " + keyAlias);
-      KeyPairGenerator keyPairGenerator =
-          KeyPairGenerator.getInstance(ASYM_ALGORITHM, ANDROID_KEYSTORE_PROVIDER);
-      boolean oaepDisabled = keyAlias.equals(KEY_ALIAS) && isOaepPaddingDisabled(this.context);
       KeyGenParameterSpec.Builder specBuilder =
           new KeyGenParameterSpec.Builder(
                   keyAlias, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
               .setKeySize(ASYM_BITS)
-              .setEncryptionPaddings(
-                  oaepDisabled
-                      ? KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1
-                      : KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
+              .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
               .setDigests(KeyProperties.DIGEST_SHA256)
-              .setUserAuthenticationRequired(requireUserAuthentication)
-              .setUserAuthenticationValidityDurationSeconds((int) authValidityDuration.toSeconds());
-
-      keyPairGenerator.initialize(specBuilder.build());
-      return keyPairGenerator.generateKeyPair();
+              .setUserAuthenticationRequired(requireUserAuthentication);
+      if (requireUserAuthentication) {
+        specBuilder
+            .setUserAuthenticationParameters(
+                (int) PER_OPERATION_AUTH_TIMEOUT.toSeconds(), ALLOWED_AUTHENTICATORS)
+            // Device credentials remain valid across biometric enrollments, so Android Keystore
+            // ignores biometric-enrollment invalidation when AUTH_DEVICE_CREDENTIAL is authorized.
+            .setInvalidatedByBiometricEnrollment(false);
+      }
+      specBuilder = authorizeOaepMgf1Sha256(specBuilder);
+      if (requireUserAuthentication) {
+        specBuilder = requireUnlockedDevice(specBuilder);
+        keyPair = generateDecryptionKeyPair(specBuilder);
+      } else {
+        keyPair = generateWithSpec(specBuilder);
+      }
     } catch (Exception e) {
       throw new CrumblesKeysException(
           "Failed to generate or load key pair from Android Keystore for alias: " + keyAlias, e);
+    }
+    if (keyAlias.equals(KEY_ALIAS)) {
+      cacheKeyOaepSupport(keyPair.getPublic(), /* supportsOaep= */ true);
+      createBatchUnwrapKeys();
+    }
+    return keyPair;
+  }
+
+  /**
+   * Generates an authentication-bound key pair in StrongBox as an RSA-2048 key or, if StrongBox
+   * cannot create it, in the TEE as an RSA-3072 key, and records which in the activity log.
+   */
+  private KeyPair generateDecryptionKeyPair(KeyGenParameterSpec.Builder specBuilder)
+      throws GeneralSecurityException {
+    try {
+      KeyPair keyPair =
+          generateWithSpec(specBuilder.setKeySize(STRONGBOX_KEY_BITS).setIsStrongBoxBacked(true));
+      recordDecryptionKeyStorage("in StrongBox (RSA-2048)");
+      return keyPair;
+    } catch (GeneralSecurityException | ProviderException e) {
+      // StrongBoxUnavailableException without StrongBox, or any StrongBox failure when TEE works.
+      Log.i(TAG, "StrongBox could not create the key pair; creating it in the TEE instead.", e);
+    }
+    KeyPair keyPair =
+        generateWithSpec(specBuilder.setKeySize(TEE_KEY_BITS).setIsStrongBoxBacked(false));
+    recordDecryptionKeyStorage("in the TEE (RSA-3072), as StrongBox could not create it");
+    return keyPair;
+  }
+
+  private static KeyPair generateWithSpec(KeyGenParameterSpec.Builder specBuilder)
+      throws GeneralSecurityException {
+    KeyPairGenerator keyPairGenerator =
+        KeyPairGenerator.getInstance(ASYM_ALGORITHM, ANDROID_KEYSTORE_PROVIDER);
+    keyPairGenerator.initialize(specBuilder.build());
+    return keyPairGenerator.generateKeyPair();
+  }
+
+  /** Records in the activity log where a new decryption key pair is kept. */
+  private void recordDecryptionKeyStorage(String storage) {
+    Context resolvedContext = cacheAndResolveContext(this.context);
+    if (resolvedContext != null) {
+      CrumblesAppAuditLogger.getInstance(resolvedContext)
+          .logEvent(
+              AUDIT_EVENT_DECRYPTION_KEY_STORAGE,
+              "New decryption key pair generated " + storage + ".");
+    }
+  }
+
+  /**
+   * Creates the batch-unwrap keys of a new {@link #KEY_ALIAS} key pair. Batches are still written
+   * without them, but each one then needs its own authentication to be read.
+   */
+  private void createBatchUnwrapKeys() {
+    try {
+      CrumblesBatchKeyStore.createKeys();
+    } catch (CrumblesKeysException e) {
+      Log.w(TAG, "Failed to create the batch-unwrap keys.", e);
+      logBatchWrapFailure(
+          "Batch-unwrap keys could not be created; each new log batch needs its own"
+              + " authentication to be read.");
+    }
+  }
+
+  private void requireSecureLockScreen() throws CrumblesKeysException {
+    Context resolvedContext = cacheAndResolveContext(this.context);
+    if (resolvedContext == null) {
+      return;
+    }
+    KeyguardManager keyguardManager = resolvedContext.getSystemService(KeyguardManager.class);
+    if (keyguardManager == null || !keyguardManager.isDeviceSecure()) {
+      throw new CrumblesKeysException(
+          "Cannot generate an authentication bound key: this device has no biometric, PIN, pattern"
+              + " or password set up. Configure a screen lock and try again.");
     }
   }
 
@@ -397,6 +509,9 @@ public class CrumblesLogsEncryptor {
   }
 
   private static void deleteExistingKeyPair(String keyAlias) {
+    if (keyAlias.equals(KEY_ALIAS)) {
+      CrumblesBatchKeyStore.deleteKeys();
+    }
     try {
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
@@ -410,8 +525,8 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Generates a new candidate external RSA key pair without activating it or mutating current
-   * state.
+   * Generates a new candidate external 3072-bit RSA key pair without activating it or mutating
+   * current state.
    *
    * @return the newly generated candidate KeyPair
    * @throws CrumblesKeysException if key pair generation fails
@@ -419,7 +534,9 @@ public class CrumblesLogsEncryptor {
   public KeyPair generateCandidateExternalKeyPair() throws CrumblesKeysException {
     try {
       KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(ASYM_ALGORITHM);
-      keyPairGenerator.initialize(ASYM_BITS);
+      // The public exponent that publicKeyFromBase64() requires of imported keys.
+      keyPairGenerator.initialize(
+          new RSAKeyGenParameterSpec(EXPORTABLE_KEY_BITS, EXPECTED_RSA_PUBLIC_EXPONENT));
       KeyPair generatedPair = keyPairGenerator.generateKeyPair();
 
       if (generatedPair == null
@@ -429,14 +546,17 @@ public class CrumblesLogsEncryptor {
             "Generated external KeyPair or its components are null.", null);
       }
       return generatedPair;
-    } catch (NoSuchAlgorithmException | RuntimeException e) {
+    } catch (NoSuchAlgorithmException | InvalidAlgorithmParameterException | RuntimeException e) {
       throw new CrumblesKeysException("Failed to generate external RSA key pair.", e);
     }
   }
 
   /**
-   * Commits and activates a candidate external public key for encryption, and removes any existing
-   * internal keystore key pair.
+   * Commits and activates a candidate external public key for encryption.
+   *
+   * <p>The internal Keystore key pair, if any, is kept: batches already encrypted to it, including
+   * any written while the candidate key waited for confirmation, must stay decryptable. It is only
+   * replaced when a new internal key pair is generated.
    *
    * @param candidatePublicKey the external public key to commit and activate
    * @throws CrumblesKeysException if the candidate public key is null
@@ -447,13 +567,13 @@ public class CrumblesLogsEncryptor {
       throw new CrumblesKeysException("Candidate public key cannot be null.", null);
     }
     this.setExternalEncryptionPublicKey(candidatePublicKey);
-    deleteExistingKeyPair();
     Log.d(TAG, "External public key committed and activated for encryption.");
   }
 
   /**
    * Generates a new external key pair, sets the public key for encryption, and passes the private
-   * key to the provided consumer. Also deletes any existing keystore key pair.
+   * key to the provided consumer. Any internal Keystore key pair is kept, as in {@link
+   * #commitExternalPublicKey}.
    *
    * @param consumer a consumer that will receive the encoded private key bytes
    * @throws CrumblesKeysException if the key pair cannot be generated
@@ -468,22 +588,41 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Computes the Additional Authenticated Data (AAD) for binding a {@link LogBatch}'s metadata and
-   * key encryption parameters to the AES-GCM cipher payload.
+   * Computes the Additional Authenticated Data (AAD) for binding a {@link LogBatch}'s metadata, key
+   * encryption parameters and recipient to the AES-GCM cipher payload.
+   *
+   * <p>For a format version 2 batch, the AAD starts with a label that no version 1 batch has, so
+   * that associated data cannot be carried over from one format to the other. It ends with the
+   * SHA-256 digest of the encoded {@code recipient}, the fingerprint that {@link
+   * #getPublicKeyFingerprint} formats, so that the batch only decrypts as one encrypted to that
+   * key: its symmetric key cannot be wrapped for another recipient without decryption failing.
    *
    * @param metadata the {@link LogMetadata} to authenticate
    * @param keyEncryptionType the {@link KeyEncryptionType} to authenticate
+   * @param recipient the public key that wraps the symmetric key of the batch. Only format version
+   *     2 batches bind it, so it may be {@code null} for the batches of earlier formats.
    * @return deterministic bytes representing the bound associated data
+   * @throws IllegalArgumentException if {@code metadata} is that of a format version 2 batch and
+   *     {@code recipient} is {@code null} or has no encoding
    */
   public static byte[] computeAssociatedData(
-      LogMetadata metadata, KeyEncryptionType keyEncryptionType) {
+      LogMetadata metadata, KeyEncryptionType keyEncryptionType, @Nullable PublicKey recipient) {
+    boolean isVersion2 =
+        metadata
+            .getEncryptionType()
+            .equals(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA);
+    byte[] recipientFingerprint = isVersion2 ? recipientFingerprint(recipient) : new byte[0];
     ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
     CodedOutputStream codedOutput = CodedOutputStream.newInstance(outputStream);
     // NOMUTANTS -- Scalar fields without maps serialize deterministically by default.
     codedOutput.useDeterministicSerialization();
     try {
+      if (isVersion2) {
+        codedOutput.writeRawBytes(V2_ASSOCIATED_DATA_LABEL.getBytes(UTF_8));
+      }
       metadata.writeTo(codedOutput);
       codedOutput.writeEnumNoTag(keyEncryptionType.getNumber());
+      codedOutput.writeRawBytes(recipientFingerprint);
       codedOutput.flush();
     } catch (IOException e) {
       throw new AssertionError("In-memory serialization to ByteArrayOutputStream failed", e);
@@ -491,22 +630,52 @@ public class CrumblesLogsEncryptor {
     return outputStream.toByteArray();
   }
 
+  /**
+   * Returns the SHA-256 digest of the encoded {@code recipient}, which a format version 2 batch
+   * binds.
+   *
+   * @throws IllegalArgumentException if {@code recipient} is {@code null} or has no encoding, as a
+   *     format version 2 batch without it would bind no recipient at all
+   */
+  private static byte[] recipientFingerprint(@Nullable PublicKey recipient) {
+    byte[] encodedRecipient = recipient == null ? null : recipient.getEncoded();
+    if (encodedRecipient == null) {
+      throw new IllegalArgumentException(
+          "A format version 2 batch is bound to its recipient, but no encoded recipient key was"
+              + " given.");
+    }
+    try {
+      return MessageDigest.getInstance("SHA-256").digest(encodedRecipient);
+    } catch (NoSuchAlgorithmException e) {
+      throw new AssertionError("Every Java platform supports SHA-256.", e);
+    }
+  }
+
   public static LogMetadata assembleMetadata(int blobSize, String deviceId) {
-    DeviceId deviceProto =
-        DeviceId.newBuilder()
-            .setDeviceId(
-                isNullOrEmpty(deviceId) ? CrumblesDeviceIdManager.FALLBACK_DEVICE_ID : deviceId)
-            .build();
-    return LogMetadata.newBuilder()
+    return sealedMetadata(deviceId).toBuilder()
         .setBlobSize(blobSize)
-        .setTimestamp(timestampFromMillis(TimeSource.system().instant().toEpochMilli()))
-        .setDevice(deviceProto)
         .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
         .build();
   }
 
   public static LogMetadata assembleMetadata(int blobSize) {
     return assembleMetadata(blobSize, CrumblesDeviceIdManager.FALLBACK_DEVICE_ID);
+  }
+
+  /**
+   * Returns the metadata that a format version 2 batch seals: the current time and {@code
+   * deviceId}, or the fallback device identifier if {@code deviceId} is empty.
+   */
+  private static LogMetadata sealedMetadata(@Nullable String deviceId) {
+    DeviceId deviceProto =
+        DeviceId.newBuilder()
+            .setDeviceId(
+                isNullOrEmpty(deviceId) ? CrumblesDeviceIdManager.FALLBACK_DEVICE_ID : deviceId)
+            .build();
+    return LogMetadata.newBuilder()
+        .setTimestamp(timestampFromMillis(TimeSource.system().instant().toEpochMilli()))
+        .setDevice(deviceProto)
+        .build();
   }
 
   /**
@@ -525,8 +694,8 @@ public class CrumblesLogsEncryptor {
   /**
    * Encrypts data using a hybrid encryption scheme with Additional Authenticated Data (AAD).
    *
-   * <p>The symmetric key is wrapped with RSA-OAEP, unless {@code encryptionKey} is the device
-   * Keystore key and that key is only authorized for PKCS#1 v1.5 padding.
+   * <p>The symmetric key is wrapped with RSA-OAEP, unless {@code encryptionKey} is a device
+   * Keystore key that an earlier version of the app created for PKCS#1 v1.5 padding only.
    *
    * @param data the plaintext data to encrypt
    * @param aad the additional authenticated data to authenticate with AES-GCM, or null if none
@@ -537,13 +706,17 @@ public class CrumblesLogsEncryptor {
    */
   public EncryptedData encryptData(byte[] data, @Nullable byte[] aad, PublicKey encryptionKey)
       throws CrumblesKeysException {
-    return encryptData(data, aad, encryptionKey, wrapsWithPkcs1(encryptionKey));
+    return encryptData(
+        generateSecretKey(), data, aad, encryptionKey, wrapsWithPkcs1(encryptionKey));
   }
 
   private EncryptedData encryptData(
-      byte[] data, @Nullable byte[] aad, PublicKey encryptionKey, boolean oaepDisabled)
+      SecretKey symKey,
+      byte[] data,
+      @Nullable byte[] aad,
+      PublicKey encryptionKey,
+      boolean oaepDisabled)
       throws CrumblesKeysException {
-    SecretKey symKey = generateSecretKey();
     IvParameterSpec generatedIv = generateAesGcmInitializationVector();
     byte[] encryptedBytes = encryptDataWithSymKey(symKey, generatedIv, aad, data);
     byte[] encSymKey = wrapAesKey(encryptionKey, symKey, oaepDisabled);
@@ -553,48 +726,130 @@ public class CrumblesLogsEncryptor {
   /**
    * Returns whether symmetric keys wrapped for {@code recipient} must use PKCS#1 v1.5 padding.
    *
-   * <p>Only the device Keystore key may lack OAEP support, so it is wrapped with the padding its own
-   * authorizations allow. Every other recipient is always wrapped with RSA-OAEP.
+   * <p>Every key pair this version generates is authorized for RSA-OAEP only. Earlier versions
+   * created the device key for PKCS#1 v1.5 padding when a faulty capability probe reported that
+   * OAEP was unsupported. Such a key keeps receiving PKCS#1 v1.5 wraps, the only ones it can
+   * unwrap, until a new device key replaces it. Every other recipient is wrapped with RSA-OAEP.
    */
-  private boolean wrapsWithPkcs1(PublicKey recipient) {
-    PublicKey deviceKey = getPublicKey();
-    return deviceKey != null
-        && Arrays.equals(recipient.getEncoded(), deviceKey.getEncoded())
-        && !keystoreKeySupportsOaep(KEY_ALIAS);
+  private boolean wrapsWithPkcs1(PublicKey recipient) throws CrumblesKeysException {
+    return isDeviceKey(recipient) && !keystoreKeySupportsOaep(KEY_ALIAS, recipient);
+  }
+
+  /** Returns whether {@code recipient} is the public key of the device Keystore key. */
+  private static boolean isDeviceKey(PublicKey recipient) throws CrumblesKeysException {
+    Optional<PublicKey> deviceKey = loadKeystorePublicKey(KEY_ALIAS);
+    return deviceKey.isPresent()
+        && Arrays.equals(recipient.getEncoded(), deviceKey.get().getEncoded());
   }
 
   /**
-   * Returns whether the Keystore key under {@code alias} is authorized for RSA-OAEP padding, or the
-   * persisted OAEP verdict if its authorizations cannot be read.
+   * Returns whether the Keystore key needs its own authentication for each operation, as the keys
+   * that {@link #generateKeyPair()} creates do, rather than opening a time window. Returns false if
+   * there is no such key. Returns true if its authorizations cannot be read, as on some OEM builds,
+   * because only a prompt of its own authorizes a key that {@link #generateKeyPair()} created.
    */
-  private boolean keystoreKeySupportsOaep(String alias) {
-    KeyInfo keyInfo = null;
+  public boolean isKeystoreKeyBoundToEachOperation() {
+    if (!doesPrivateKeyExist()) {
+      return false;
+    }
+    KeyInfo keyInfo = readKeystoreKeyInfo(KEY_ALIAS);
+    return keyInfo == null
+        || (keyInfo.isUserAuthenticationRequired()
+            && keyInfo.getUserAuthenticationValidityDurationSeconds() <= 0);
+  }
+
+  /** Returns the authorizations of the Keystore key under {@code alias}, or null if unavailable. */
+  @Nullable
+  private static KeyInfo readKeystoreKeyInfo(String alias) {
     try {
       KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
       keyStore.load(null);
       Key key = keyStore.getKey(alias, null);
-      if (key != null) {
-        keyInfo =
-            KeyFactory.getInstance(ASYM_ALGORITHM, ANDROID_KEYSTORE_PROVIDER)
-                .getKeySpec(key, KeyInfo.class);
-      }
+      return key == null
+          ? null
+          : KeyFactory.getInstance(ASYM_ALGORITHM, ANDROID_KEYSTORE_PROVIDER)
+              .getKeySpec(key, KeyInfo.class);
     } catch (GeneralSecurityException | IOException | RuntimeException e) {
       // Keystore implementations on some OEM builds throw unchecked exceptions (such as
       // ProviderException) when reading key characteristics.
-      Log.w(TAG, "Failed to read the paddings authorized for a Keystore key.", e);
+      Log.w(TAG, "Failed to read the authorizations of a Keystore key.", e);
+      return null;
     }
-    if (keyInfo == null) {
-      Log.w(TAG, "Keystore key paddings unavailable; using the persisted OAEP verdict.");
-      return !isOaepPaddingDisabled(this.context);
-    }
-    return Arrays.asList(keyInfo.getEncryptionPaddings())
-        .contains(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP);
   }
 
   /**
-   * Encrypts plain logs using the provided public key and context for device attribution.
+   * Returns whether the Keystore key under {@code alias} with {@code publicKey} is authorized for
+   * RSA-OAEP padding, consulting the fingerprint-keyed padding cache before reading {@link
+   * KeyInfo}.
    *
-   * @param context the Android context to resolve device ID from, or {@code null}
+   * @throws CrumblesKeysException if neither the cache nor {@link KeyInfo} can determine the key's
+   *     authorized padding
+   */
+  private boolean keystoreKeySupportsOaep(String alias, PublicKey publicKey)
+      throws CrumblesKeysException {
+    String fingerprint = getPublicKeyFingerprint(publicKey);
+    Boolean cached = lookupCachedKeyOaepSupport(fingerprint);
+    if (cached != null) {
+      return cached;
+    }
+    KeyInfo keyInfo = readKeystoreKeyInfo(alias);
+    if (keyInfo == null) {
+      throw new CrumblesKeysException(
+          "Failed to read the paddings authorized for Keystore alias: " + alias);
+    }
+    boolean supportsOaep =
+        Arrays.asList(keyInfo.getEncryptionPaddings())
+            .contains(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP);
+    cacheKeyOaepSupport(publicKey, supportsOaep);
+    return supportsOaep;
+  }
+
+  private void cacheKeyOaepSupport(PublicKey publicKey, boolean supportsOaep)
+      throws CrumblesKeysException {
+    String fingerprint = getPublicKeyFingerprint(publicKey);
+    cachedKeyOaepSupport.put(fingerprint, supportsOaep);
+    Context resolvedContext = cacheAndResolveContext(this.context);
+    if (resolvedContext != null) {
+      String encodedVerdict =
+          fingerprint + (supportsOaep ? CACHED_PADDING_OAEP_SUFFIX : CACHED_PADDING_PKCS1_SUFFIX);
+      resolvedContext
+          .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+          .edit()
+          .putString(PREF_KEY_PADDING_CACHE, encodedVerdict)
+          .apply();
+    }
+  }
+
+  @Nullable
+  private Boolean lookupCachedKeyOaepSupport(String fingerprint) {
+    Boolean inMemory = cachedKeyOaepSupport.get(fingerprint);
+    if (inMemory != null) {
+      return inMemory;
+    }
+    Context resolvedContext = cacheAndResolveContext(this.context);
+    if (resolvedContext == null) {
+      return null;
+    }
+    String stored =
+        resolvedContext
+            .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_KEY_PADDING_CACHE, /* defValue= */ null);
+    if ((fingerprint + CACHED_PADDING_OAEP_SUFFIX).equals(stored)) {
+      return true;
+    }
+    if ((fingerprint + CACHED_PADDING_PKCS1_SUFFIX).equals(stored)) {
+      return false;
+    }
+    return null;
+  }
+
+  /**
+   * Encrypts plain logs of this installation using the provided public key and context for device
+   * attribution. The batch seals the attestation chain of this installation's batch-signing key,
+   * creating that key if there is none, for {@link CrumblesBatchSigner} to sign the batch.
+   *
+   * @param context the Android context to resolve the device ID and the batch-signing key from, or
+   *     {@code null} to seal no attestation chain
    * @param plainLogsBytes the plain log data
    * @param publicKey the specific public key to use for encryption
    * @return a {@link LogBatch} containing encrypted logs, or {@code null} if no key is available
@@ -603,8 +858,11 @@ public class CrumblesLogsEncryptor {
   @Nullable
   public LogBatch encryptLogs(
       @Nullable Context context, byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
+    if (context != null) {
+      setApplicationContext(context);
+    }
     return encryptLogsInternal(
-        plainLogsBytes, publicKey, CrumblesDeviceIdManager.getDeviceId(context));
+        plainLogsBytes, publicKey, CrumblesDeviceIdManager.getDeviceId(context), context);
   }
 
   /**
@@ -617,14 +875,38 @@ public class CrumblesLogsEncryptor {
   @CanIgnoreReturnValue
   @Nullable
   public LogBatch encryptLogs(byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
-    return encryptLogs(this.context, plainLogsBytes, publicKey);
+    return encryptLogs(cacheAndResolveContext(this.context), plainLogsBytes, publicKey);
   }
 
+  /**
+   * As {@link #encryptLogs(byte[], PublicKey)}, but seals {@code deviceId} in the batch instead of
+   * this device's ID, such as the ID of the device that wrote the batch the logs were decrypted
+   * from. The batch stays unsigned, so it seals no attestation chain and creates no batch-signing
+   * key.
+   */
+  @Nullable
+  LogBatch encryptLogsAttributedTo(
+      String deviceId, byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
+    return encryptLogsInternal(plainLogsBytes, publicKey, deviceId, /* signingContext= */ null);
+  }
+
+  /**
+   * Encrypts {@code plainLogsBytes} for {@code publicKey}, or the Keystore key when it is null.
+   *
+   * @param signingContext the context of the installation that will sign the batch, whose
+   *     batch-signing key's attestation chain the batch seals, or {@code null} for a batch that
+   *     stays unsigned
+   * @return the batch, or {@code null} if there is no key to encrypt to
+   */
   @Nullable
   private LogBatch encryptLogsInternal(
-      byte[] plainLogsBytes, @Nullable PublicKey publicKey, String deviceId) {
+      byte[] plainLogsBytes,
+      @Nullable PublicKey publicKey,
+      String deviceId,
+      @Nullable Context signingContext) {
     try {
-      PublicKey recipient = publicKey != null ? publicKey : getPublicKey();
+      PublicKey recipient =
+          publicKey != null ? publicKey : loadKeystorePublicKey(KEY_ALIAS).orElse(null);
       if (recipient == null) {
         Log.e(TAG, "Encryption failed: No encryption key available.");
         return null;
@@ -635,26 +917,16 @@ public class CrumblesLogsEncryptor {
               ? "Using provided public key for encryption."
               : "Using Keystore public key for encryption.");
 
-      LogMetadata logMetadata =
-          assembleMetadata(plainLogsBytes.length + GCM_TAG_LEN_BYTES, deviceId);
       KeyEncryptionType keyEncryptionType =
           wrapsWithPkcs1(recipient)
               ? KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC
               : KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256;
-      byte[] aad = computeAssociatedData(logMetadata, keyEncryptionType);
-      EncryptedData encryptedData =
-          encryptData(
-              plainLogsBytes,
-              aad,
-              recipient,
-              keyEncryptionType == KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
-
-      return assembleCipherText(
-          encryptedData.ciphertext,
-          encryptedData.encryptedSymmetricKey,
-          encryptedData.initializationVector,
-          logMetadata,
-          keyEncryptionType);
+      return encryptLogBatch(
+          plainLogsBytes,
+          recipient,
+          deviceId,
+          keyEncryptionType,
+          batchSigningKeyAttestationChain(signingContext));
     } catch (CrumblesKeysException | RuntimeException e) {
       Log.e(TAG, "Unexpected runtime error during encryption process.", e);
       throw new CrumblesLogsEncryptionException(
@@ -663,10 +935,159 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
+   * Encrypts {@code plainLogsBytes} into a format version 2 {@link LogBatch} for {@code recipient}:
+   * a {@link SealedLogs} that holds the logs, the current time, {@code deviceId} and {@code
+   * attestationChain}, padded to its size bucket and bound to {@code recipient} by its associated
+   * data. A batch for the device Keystore key also carries its symmetric key wrapped with the
+   * batch-wrap key.
+   *
+   * @param attestationChain the attestation chain of this installation's batch-signing key for a
+   *     batch that it will sign, or an empty list for a batch that stays unsigned
+   */
+  private LogBatch encryptLogBatch(
+      byte[] plainLogsBytes,
+      PublicKey recipient,
+      @Nullable String deviceId,
+      KeyEncryptionType keyEncryptionType,
+      ImmutableList<ByteString> attestationChain)
+      throws CrumblesKeysException {
+    SealedLogs sealedLogs =
+        SealedLogs.newBuilder()
+            .setMetadata(sealedMetadata(deviceId))
+            .setLogs(ByteString.copyFrom(plainLogsBytes))
+            .addAllAttestationChain(attestationChain)
+            .build();
+    byte[] paddedLogs = padToSizeBucket(sealedLogs.toByteArray());
+    LogMetadata logMetadata =
+        LogMetadata.newBuilder()
+            .setBlobSize(paddedLogs.length + GCM_TAG_LEN_BYTES)
+            .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA)
+            .build();
+    SecretKey symKey = generateSecretKey();
+    EncryptedData encryptedData =
+        encryptData(
+            symKey,
+            paddedLogs,
+            computeAssociatedData(logMetadata, keyEncryptionType, recipient),
+            recipient,
+            keyEncryptionType == KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
+    LogBatch logBatch =
+        assembleCipherText(
+            encryptedData.ciphertext,
+            encryptedData.encryptedSymmetricKey,
+            encryptedData.initializationVector,
+            logMetadata,
+            keyEncryptionType);
+    return isDeviceKey(recipient) ? addBatchWrappedKey(logBatch, symKey) : logBatch;
+  }
+
+  /**
+   * Returns the attestation chain of the batch-signing key of the installation that {@code
+   * signingContext} belongs to, for a format version 2 batch that it will sign to seal, as {@link
+   * CrumblesBatchSigner} leaves the chain out of the cleartext signature. Reading the chain creates
+   * the key if the installation has none.
+   *
+   * <p>Returns an empty list without a context, so that a batch that stays unsigned neither seals a
+   * chain nor creates a key, and if the chain cannot be read, as on devices without key
+   * attestation: the batch is then still written, without the chain that its recipient needs to
+   * check a signature.
+   */
+  private static ImmutableList<ByteString> batchSigningKeyAttestationChain(
+      @Nullable Context signingContext) {
+    if (signingContext == null) {
+      return ImmutableList.of();
+    }
+    try {
+      return new CrumblesBatchSigningKey(signingContext).attestationChain();
+    } catch (CrumblesKeysException | RuntimeException e) {
+      // Sealing the chain must never keep the logs from being written, and Keystore on some OEM
+      // builds throws unchecked exceptions other than the ProviderException that
+      // attestationChain() reports as CrumblesKeysException.
+      Log.w(TAG, "Failed to read the attestation chain of the batch-signing key.", e);
+      return ImmutableList.of();
+    }
+  }
+
+  /**
+   * Adds {@code symKey}, wrapped with the batch-wrap key, to {@code logBatch}, so that one
+   * authentication can unwrap it together with the keys of other batches. Without batch-unwrap
+   * keys, or if wrapping fails, the batch keeps only its RSA-wrapped key.
+   */
+  private LogBatch addBatchWrappedKey(LogBatch logBatch, SecretKey symKey) {
+    if (!CrumblesBatchKeyStore.hasKeys()) {
+      return logBatch;
+    }
+    CrumblesBatchKeyStore.WrappedKey wrappedKey;
+    try {
+      wrappedKey = CrumblesBatchKeyStore.wrap(symKey);
+    } catch (CrumblesKeysException e) {
+      Log.w(TAG, "Failed to wrap a batch key with the batch-wrap key.", e);
+      logBatchWrapFailure(
+          "A log batch was written without its batch-wrapped key; reading it needs its own"
+              + " authentication.");
+      return logBatch;
+    }
+    return logBatch.toBuilder()
+        .setKey(
+            logBatch.getKey().toBuilder()
+                .setBatchWrappedSymmetricKey(wrappedKey.wrappedKey())
+                .setBatchWrapKeyId(wrappedKey.keyId()))
+        .build();
+  }
+
+  private void logBatchWrapFailure(String message) {
+    Context resolvedContext = cacheAndResolveContext(this.context);
+    if (resolvedContext != null) {
+      CrumblesAppAuditLogger.getInstance(resolvedContext).logEvent("BATCH_WRAP_FAILED", message);
+    }
+  }
+
+  /**
+   * Creates an initialized {@link Cipher} to unwrap the symmetric key of {@code logBatch} via a
+   * {@code BiometricPrompt.CryptoObject}.
+   */
+  public Cipher createUnwrapCipher(LogBatch logBatch) throws CrumblesKeysException {
+    PrivateKey privateKey = loadKeystorePrivateKey();
+    boolean usesPkcs1Padding =
+        logBatch.getKey().getKeyEncryptionType()
+            == KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC;
+    Cipher cipher;
+    try {
+      if (usesPkcs1Padding) {
+        cipher = Cipher.getInstance(CIPHER_MODE_ASYM_PKCS1);
+        cipher.init(Cipher.UNWRAP_MODE, privateKey);
+      } else {
+        cipher = Cipher.getInstance(CIPHER_MODE_ASYM);
+        cipher.init(Cipher.UNWRAP_MODE, privateKey, OAEP_SPEC);
+      }
+    } catch (GeneralSecurityException e) {
+      throw new CrumblesKeysException("Failed to initialize the unwrap cipher.", e);
+    }
+    return cipher;
+  }
+
+  private static PrivateKey loadKeystorePrivateKey() throws CrumblesKeysException {
+    PrivateKey privateKey;
+    try {
+      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
+      keyStore.load(null);
+      privateKey = (PrivateKey) keyStore.getKey(KEY_ALIAS, null);
+    } catch (GeneralSecurityException | IOException e) {
+      throw new CrumblesKeysException(
+          "Failed to load key pair from Android Keystore for decryption.", e);
+    }
+    if (privateKey == null) {
+      throw new CrumblesKeysException(
+          "Failed to load key pair from Android Keystore for decryption.", null);
+    }
+    return privateKey;
+  }
+
+  /**
    * Decrypts a {@link LogBatch} protobuf message using the Keystore private key and validates AAD.
    *
    * <p>A batch that cannot be unwrapped (wrong key or corrupt file) fails with a decryption error
-   * and never changes the Keystore key or the padding chosen for this device.
+   * and never changes the Keystore key.
    *
    * @param logBatch the {@link LogBatch} containing ciphertext, wrapped symmetric key, and metadata
    * @return the decrypted log bytes
@@ -676,35 +1097,62 @@ public class CrumblesLogsEncryptor {
   @CanIgnoreReturnValue
   public byte[] decryptLogs(LogBatch logBatch)
       throws CrumblesKeysException, UserNotAuthenticatedException {
-    if (!doesPrivateKeyExist()) {
+    return decryptLogBatch(logBatch).logs();
+  }
+
+  /**
+   * Decrypts a {@link LogBatch} protobuf message and validates AAD, unwrapping the symmetric key
+   * with {@code authorizedUnwrapCipher} (or the Keystore private key if {@code null}).
+   */
+  @CanIgnoreReturnValue
+  public byte[] decryptLogs(LogBatch logBatch, @Nullable Cipher authorizedUnwrapCipher)
+      throws CrumblesKeysException, UserNotAuthenticatedException {
+    return decryptLogBatch(logBatch, authorizedUnwrapCipher).logs();
+  }
+
+  /**
+   * Decrypts {@code logBatch} as {@link #decryptLogs} does and returns its logs with its metadata,
+   * which for a format version 2 batch includes the timestamp and the device identifier sealed
+   * inside it.
+   */
+  DecryptedLogBatch decryptLogBatch(LogBatch logBatch)
+      throws CrumblesKeysException, UserNotAuthenticatedException {
+    return decryptLogBatch(logBatch, /* authorizedUnwrapCipher= */ null);
+  }
+
+  /**
+   * Decrypts {@code logBatch} as {@link #decryptLogs(LogBatch, Cipher)} does and returns its logs
+   * with its metadata, as {@link #decryptLogBatch(LogBatch)} does. A format version 2 batch must be
+   * bound to the Keystore public key by its associated data.
+   */
+  DecryptedLogBatch decryptLogBatch(LogBatch logBatch, @Nullable Cipher authorizedUnwrapCipher)
+      throws CrumblesKeysException, UserNotAuthenticatedException {
+    PublicKey recipient = getPublicKey();
+    if (recipient == null) {
       throw new CrumblesKeysException(
           "Private key not available in Keystore for decryption.", null);
     }
-    PrivateKey privateKey;
-    try {
-      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
-      keyStore.load(null);
-      privateKey = (PrivateKey) keyStore.getKey(KEY_ALIAS, null);
-      if (privateKey == null) {
-        throw new CrumblesKeysException("Failed to load private key from Keystore.", null);
-      }
-    } catch (Exception e) {
-      throw new CrumblesKeysException(
-          "Failed to load key pair from Android Keystore for decryption.", e);
-    }
+    PrivateKey privateKey = authorizedUnwrapCipher == null ? loadKeystorePrivateKey() : null;
 
     try {
       byte[] encryptedLogsBytes = logBatch.getData().getLogBlob().toByteArray();
       byte[] cipherSymKeyBytes = logBatch.getKey().getEncryptedSymmetricKey().toByteArray();
       byte[] cipherIvBytes = logBatch.getKey().getIv().toByteArray();
       byte[] aad =
-          computeAssociatedData(logBatch.getMetadata(), logBatch.getKey().getKeyEncryptionType());
+          computeAssociatedData(
+              logBatch.getMetadata(), logBatch.getKey().getKeyEncryptionType(), recipient);
 
       KeyEncryptionType keyEncryptionType = logBatch.getKey().getKeyEncryptionType();
       SecretKey decryptedSymKey =
           switch (keyEncryptionType) {
-            case KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256 -> unwrapAesKey(privateKey, cipherSymKeyBytes);
-            case KEY_ENCRYPTION_TYPE_ASYMMETRIC -> unwrapAesKeyPkcs1(privateKey, cipherSymKeyBytes);
+            case KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256 ->
+                authorizedUnwrapCipher == null
+                    ? unwrapAesKey(privateKey, cipherSymKeyBytes)
+                    : unwrapAesKey(authorizedUnwrapCipher, cipherSymKeyBytes);
+            case KEY_ENCRYPTION_TYPE_ASYMMETRIC ->
+                authorizedUnwrapCipher == null
+                    ? unwrapAesKeyPkcs1(privateKey, cipherSymKeyBytes)
+                    : unwrapAesKey(authorizedUnwrapCipher, cipherSymKeyBytes);
             default ->
                 throw new CrumblesLogsDecryptionException(
                     "A cryptographic error occurred during log decryption.", null);
@@ -716,7 +1164,7 @@ public class CrumblesLogsEncryptor {
           decryptUsingAes256Gcm(
               decryptedSymKeySpec, new IvParameterSpec(cipherIvBytes), aad, encryptedLogsBytes);
       Log.d(TAG, "Log file decrypted successfully using Keystore private key.");
-      return decryptedLogsBytes;
+      return decryptedLogBatch(logBatch.getMetadata(), decryptedLogsBytes);
     } catch (CrumblesKeysException e) {
       // If the cause is UserNotAuthenticatedException, rethrow it so the OS can handle it.
       if (e.getCause() instanceof UserNotAuthenticatedException) {
@@ -728,6 +1176,108 @@ public class CrumblesLogsEncryptor {
       throw new CrumblesLogsDecryptionException(
           "An unexpected runtime error occurred during log decryption.", e);
     }
+  }
+
+  /**
+   * Groups {@code logBatches} by the keys that can decrypt them, so that one authentication covers
+   * every batch whose key the current batch-unwrap key can unwrap. Each group keeps the order of
+   * {@code logBatches}.
+   */
+  BulkDecryptPartition partitionForBulkDecrypt(List<LogBatch> logBatches) {
+    Optional<ByteString> batchWrapKeyId = currentBatchWrapKeyId();
+    ImmutableList.Builder<LogBatch> batchUnwrappable = ImmutableList.builder();
+    ImmutableList.Builder<LogBatch> rsaOnly = ImmutableList.builder();
+    ImmutableList.Builder<LogBatch> undecryptable = ImmutableList.builder();
+    for (LogBatch logBatch : logBatches) {
+      LogKey key = logBatch.getKey();
+      if (!carriesBatchWrappedKey(key) || batchWrapKeyId.isEmpty()) {
+        rsaOnly.add(logBatch);
+      } else if (key.getBatchWrapKeyId().equals(batchWrapKeyId.get())) {
+        batchUnwrappable.add(logBatch);
+      } else {
+        undecryptable.add(logBatch);
+      }
+    }
+    return new BulkDecryptPartition(
+        batchUnwrappable.build(), rsaOnly.build(), undecryptable.build());
+  }
+
+  /**
+   * Returns the id of the current batch-wrap key, or empty if the batch-unwrap keys are missing or
+   * unusable. Batches are then left to the RSA key rather than reported as undecryptable.
+   */
+  private static Optional<ByteString> currentBatchWrapKeyId() {
+    if (!CrumblesBatchKeyStore.hasKeys()) {
+      return Optional.empty();
+    }
+    try {
+      return Optional.of(CrumblesBatchKeyStore.keyId());
+    } catch (CrumblesKeysException e) {
+      Log.w(TAG, "Failed to compute the id of the batch-wrap key.", e);
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Returns whether {@code key} carries a key id and a batch-wrapped key in the format that {@link
+   * #unwrapBatchKeys} takes.
+   */
+  private static boolean carriesBatchWrappedKey(LogKey key) {
+    return key.hasBatchWrapKeyId()
+        && key.getBatchWrappedSymmetricKey().size() == CrumblesBatchKeyStore.WRAPPED_KEY_SIZE_BYTES;
+  }
+
+  /**
+   * Returns the cipher that {@link #unwrapBatchKeys} needs, for a {@code BiometricPrompt} to
+   * authorize through a {@code CryptoObject}.
+   *
+   * @throws CrumblesKeysException if the cipher cannot be initialized
+   */
+  Cipher createBatchUnwrapCipher() throws CrumblesKeysException {
+    return CrumblesBatchKeyStore.createUnwrapCipher();
+  }
+
+  /**
+   * Unwraps the symmetric keys of {@code batchUnwrappable}, in order, in the one operation of
+   * {@code authorizedCipher} that the user authorized.
+   *
+   * @param authorizedCipher a cipher from {@link #createBatchUnwrapCipher}, used up by this call
+   * @param batchUnwrappable batches from {@link BulkDecryptPartition#batchUnwrappable}
+   * @throws CrumblesKeysException if the operation fails, as when it was not authorized
+   */
+  ImmutableList<SecretKey> unwrapBatchKeys(Cipher authorizedCipher, List<LogBatch> batchUnwrappable)
+      throws CrumblesKeysException {
+    return CrumblesBatchKeyStore.unwrap(
+        authorizedCipher,
+        batchUnwrappable.stream()
+            .map(logBatch -> logBatch.getKey().getBatchWrappedSymmetricKey())
+            .collect(toImmutableList()));
+  }
+
+  /**
+   * Decrypts {@code logBatch} with its symmetric key from {@link #unwrapBatchKeys}, validates its
+   * AAD and returns its logs with its metadata, as {@link #decryptLogBatch} does. Batch-wrapped
+   * keys only go with batches for the Keystore key, so a format version 2 batch must be bound to
+   * the Keystore public key by its associated data.
+   *
+   * @throws CrumblesLogsDecryptionException if the key does not decrypt the batch, as when the
+   *     batch or its batch-wrapped key was modified, or if the Keystore public key that the batch
+   *     is bound to is not available. Its RSA-wrapped key may still decrypt it.
+   */
+  DecryptedLogBatch decryptLogsWithSymmetricKey(LogBatch logBatch, SecretKey symmetricKey) {
+    PublicKey recipient = getPublicKey();
+    if (recipient == null) {
+      throw new CrumblesLogsDecryptionException(
+          "The Keystore public key that log batches are bound to is not available.", null);
+    }
+    LogKey key = logBatch.getKey();
+    return decryptedLogBatch(
+        logBatch.getMetadata(),
+        decryptUsingAes256Gcm(
+            symmetricKey,
+            new IvParameterSpec(key.getIv().toByteArray()),
+            computeAssociatedData(logBatch.getMetadata(), key.getKeyEncryptionType(), recipient),
+            logBatch.getData().getLogBlob().toByteArray()));
   }
 
   private static SecretKey generateSecretKey() throws CrumblesKeysException {
@@ -785,6 +1335,16 @@ public class CrumblesLogsEncryptor {
     }
   }
 
+  private static SecretKey unwrapAesKey(Cipher authorizedUnwrapCipher, byte[] wrappedAesKeyBytes)
+      throws CrumblesKeysException {
+    try {
+      return (SecretKey)
+          authorizedUnwrapCipher.unwrap(wrappedAesKeyBytes, SYM_ALGORITHM, Cipher.SECRET_KEY);
+    } catch (GeneralSecurityException e) {
+      throw new CrumblesKeysException("Failed to unwrap AES key with private key.", e);
+    }
+  }
+
   private static SecretKey unwrapAesKey(PrivateKey privateKey, byte[] wrappedAesKeyBytes)
       throws CrumblesKeysException {
     try {
@@ -808,7 +1368,7 @@ public class CrumblesLogsEncryptor {
   }
 
   private static byte[] decryptUsingAes256Gcm(
-      SecretKeySpec key, IvParameterSpec ivSpec, @Nullable byte[] aad, byte[] cipherTextBytes) {
+      SecretKey key, IvParameterSpec ivSpec, @Nullable byte[] aad, byte[] cipherTextBytes) {
     try {
       Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
       GCMParameterSpec gcmParameterSpec = new GCMParameterSpec(GCM_TAG_LEN_BITS, ivSpec.getIV());
@@ -946,7 +1506,7 @@ public class CrumblesLogsEncryptor {
         cipherSymKeyBytes,
         cipherIvBytes,
         logMetadata,
-        getKeyEncryptionType(/* context= */ null));
+        KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
   }
 
   /**
@@ -970,10 +1530,9 @@ public class CrumblesLogsEncryptor {
 
   /**
    * Assembles a {@link LogBatch} protobuf message using the provided Android {@link Context} to
-   * resolve device attribution and OAEP fallback configuration.
+   * resolve device attribution.
    *
-   * @param context the Android context used for device ID attribution and preferences, or {@code
-   *     null}
+   * @param context the Android context used for device ID attribution, or {@code null}
    * @param encryptedLogsBytes the encrypted log data blob
    * @param cipherSymKeyBytes the wrapped symmetric key bytes
    * @param cipherIvBytes the initialization vector bytes
@@ -989,7 +1548,7 @@ public class CrumblesLogsEncryptor {
         cipherSymKeyBytes,
         cipherIvBytes,
         assembleMetadata(encryptedLogsBytes.length, CrumblesDeviceIdManager.getDeviceId(context)),
-        getKeyEncryptionType(context));
+        KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
   }
 
   /**
@@ -1042,6 +1601,8 @@ public class CrumblesLogsEncryptor {
     PublicKey publicKey = getPublicKey(PREFERENCE_PRIMARY_KEY_ALIAS);
     if (publicKey == null) {
       publicKey = generateKeyPair(PREFERENCE_PRIMARY_KEY_ALIAS, false).getPublic();
+    } else if (isPrimaryKeyPermanentlyUnusable(publicKey)) {
+      publicKey = replaceUnusablePrimaryKey();
     }
     EncryptedData encData = encryptData(plaintext, entryIdAsAssociatedData(entryId), publicKey);
     return EncryptedPayload.newBuilder()
@@ -1052,15 +1613,65 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Decrypts an EncryptedPayload. It unwraps the AES key using the primary key from the Android
-   * Keystore and then performs AES-GCM decryption.
+   * Returns whether the primary key can no longer unwrap a key wrapped with its own public key.
    *
-   * @param payload The encrypted payload to decrypt.
-   * @return The original plaintext data.
-   * @throws CrumblesKeysException If decryption fails due to key errors or data tampering.
+   * <p>On Android 15 and later, the Keystore refuses RSA-OAEP unwrapping with keys created without
+   * an MGF1-SHA-256 authorization, so every entry sealed to such a key is unreadable. Transient
+   * failures do not count: replacing the key then would destroy entries that are still readable.
    */
-  public byte[] decryptData(EncryptedPayload payload) throws CrumblesKeysException {
-    return decryptDataStoreEntryWithAad(payload, /* aad= */ null);
+  private static boolean isPrimaryKeyPermanentlyUnusable(PublicKey primaryPublicKey) {
+    try {
+      KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER);
+      keyStore.load(null);
+      if (!(keyStore.getKey(PREFERENCE_PRIMARY_KEY_ALIAS, null) instanceof PrivateKey privateKey)) {
+        return false;
+      }
+      SecretKey probeKey = generateSecretKey();
+      byte[] wrapped = wrapAesKey(primaryPublicKey, probeKey, /* oaepDisabled= */ false);
+      return !Arrays.equals(probeKey.getEncoded(), unwrapAesKey(privateKey, wrapped).getEncoded());
+    } catch (GeneralSecurityException | IOException | CrumblesKeysException | RuntimeException e) {
+      Log.w(TAG, "Primary key self-test failed.", e);
+      return isPermanentKeyRefusal(e);
+    }
+  }
+
+  /**
+   * Returns whether {@code failure} shows that the Keystore refuses the key itself, as opposed to a
+   * transient or authentication failure that may succeed on a later attempt.
+   */
+  private static boolean isPermanentKeyRefusal(Throwable failure) {
+    boolean refused = false;
+    for (Throwable cause : Throwables.getCausalChain(failure)) {
+      if (cause instanceof UserNotAuthenticatedException
+          || (cause instanceof KeyStoreException keyStoreException
+              && keyStoreException.isTransientFailure())) {
+        return false;
+      }
+      refused |= cause instanceof InvalidKeyException || cause instanceof BadPaddingException;
+    }
+    return refused;
+  }
+
+  /**
+   * Replaces a primary key that the Keystore permanently refuses and records the replacement.
+   *
+   * <p>Entries sealed to the old key were already unreadable, so nothing readable is lost; the user
+   * has to save those settings again.
+   */
+  private PublicKey replaceUnusablePrimaryKey() throws CrumblesKeysException {
+    Log.w(TAG, "Primary key can no longer decrypt; replacing it.");
+    PublicKey publicKey =
+        generateKeyPair(PREFERENCE_PRIMARY_KEY_ALIAS, /* requireUserAuthentication= */ false)
+            .getPublic();
+    Context resolvedContext = cacheAndResolveContext(this.context);
+    if (resolvedContext != null) {
+      CrumblesAppAuditLogger.getInstance(resolvedContext)
+          .logEvent(
+              "PRIMARY_KEY_REPLACED",
+              "Settings storage key could not decrypt and was replaced; saved settings may need to"
+                  + " be entered again.");
+    }
+    return publicKey;
   }
 
   /**
@@ -1114,6 +1725,18 @@ public class CrumblesLogsEncryptor {
     } catch (Exception e) {
       throw new CrumblesKeysException("Failed to perform AES-GCM decryption.", e);
     }
+  }
+
+  /**
+   * Decrypts an EncryptedPayload. It unwraps the AES key using the primary key from the Android
+   * Keystore and then performs AES-GCM decryption.
+   *
+   * @param payload The encrypted payload to decrypt.
+   * @return The original plaintext data.
+   * @throws CrumblesKeysException If decryption fails due to key errors or data tampering.
+   */
+  public byte[] decryptData(EncryptedPayload payload) throws CrumblesKeysException {
+    return decryptDataStoreEntryWithAad(payload, /* aad= */ null);
   }
 
   public byte[] decryptData(String serializedPayload) throws CrumblesKeysException {
@@ -1242,23 +1865,115 @@ public class CrumblesLogsEncryptor {
    * Re-encrypts plain log bytes under a new public key and packages the result into a {@link
    * LogBatch}.
    *
+   * <p>The new batch is attributed to {@code originalDeviceId}, the device that produced the batch
+   * the logs were decrypted from, in the metadata that it seals. It stays unsigned, so it seals no
+   * attestation chain and creates no batch-signing key; see {@link #reEncryptLogBatchForSigning}
+   * for a batch that this installation signed.
+   *
    * @param plainLogsBytes the plain log bytes to re-encrypt
    * @param reEncryptionKey the public key to wrap the per-batch symmetric key with
+   * @param originalDeviceId the device id from the original batch's {@link LogMetadata}, or {@code
+   *     null} if unknown
    * @return a newly assembled {@link LogBatch} bound with AAD
    * @throws CrumblesKeysException if key wrapping fails
    */
-  public LogBatch reEncryptLogBatch(byte[] plainLogsBytes, PublicKey reEncryptionKey)
+  public LogBatch reEncryptLogBatch(
+      byte[] plainLogsBytes, PublicKey reEncryptionKey, @Nullable String originalDeviceId)
       throws CrumblesKeysException {
-    LogMetadata logMetadata = assembleMetadata(plainLogsBytes.length + GCM_TAG_LEN_BYTES);
-    byte[] aad =
-        computeAssociatedData(logMetadata, KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
-    EncryptedData encryptedData =
-        encryptData(plainLogsBytes, aad, reEncryptionKey, /* oaepDisabled= */ false);
-    return assembleCipherText(
-        encryptedData.ciphertext,
-        encryptedData.encryptedSymmetricKey,
-        encryptedData.initializationVector,
-        logMetadata,
-        KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+    return encryptLogBatch(
+        plainLogsBytes,
+        reEncryptionKey,
+        originalDeviceId,
+        KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256,
+        /* attestationChain= */ ImmutableList.of());
+  }
+
+  /**
+   * As {@link #reEncryptLogBatch}, but for the logs of a batch that this installation signed, for
+   * {@link CrumblesBatchSigner#signAgain} to sign the new batch: it is attributed to this device
+   * and seals the attestation chain of this installation's batch-signing key, read with {@code
+   * context}.
+   *
+   * <p>Reading the chain creates the batch-signing key if the installation has none, so only call
+   * this once {@link CrumblesBatchSigner#isSignedByThisInstallation} confirmed that the original
+   * batch is this installation's.
+   *
+   * @throws CrumblesKeysException if key wrapping fails
+   */
+  LogBatch reEncryptLogBatchForSigning(
+      Context context, byte[] plainLogsBytes, PublicKey reEncryptionKey)
+      throws CrumblesKeysException {
+    return encryptLogBatch(
+        plainLogsBytes,
+        reEncryptionKey,
+        CrumblesDeviceIdManager.getDeviceId(context),
+        KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256,
+        batchSigningKeyAttestationChain(context));
+  }
+
+  /**
+   * Returns {@code logs} laid out for {@link LogEncryptionType#LOG_ENCRYPTION_TYPE_AES_GCM_PADDED}:
+   * their length as a 4-byte big-endian integer, the logs, then zero bytes up to the next power of
+   * two of at least {@value #MIN_PADDED_LOGS_BYTES} bytes.
+   */
+  private static byte[] padToSizeBucket(byte[] logs) {
+    int paddedLength = MIN_PADDED_LOGS_BYTES;
+    while (paddedLength < Integer.BYTES + logs.length) {
+      paddedLength = Math.multiplyExact(paddedLength, 2);
+    }
+    return ByteBuffer.allocate(paddedLength).putInt(logs.length).put(logs).array();
+  }
+
+  /**
+   * Returns the logs in {@code plaintext}, decrypted from a batch with {@code metadata}, with the
+   * metadata of the batch. The padding of a padded batch is removed. A format version 2 batch holds
+   * its logs in a {@link SealedLogs}, together with the timestamp and the device identifier that
+   * its cleartext metadata leaves out; older batches hold the logs alone.
+   *
+   * @throws CrumblesLogsDecryptionException if the plaintext does not have the layout that the
+   *     encryption type of the batch announces
+   */
+  private static DecryptedLogBatch decryptedLogBatch(LogMetadata metadata, byte[] plaintext) {
+    return switch (metadata.getEncryptionType()) {
+      case LOG_ENCRYPTION_TYPE_AES_GCM_PADDED ->
+          new DecryptedLogBatch(metadata, stripPadding(plaintext));
+      case LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA -> {
+        SealedLogs sealedLogs = parseSealedLogs(stripPadding(plaintext));
+        LogMetadata sealedMetadata = sealedLogs.getMetadata();
+        yield new DecryptedLogBatch(
+            metadata.toBuilder()
+                .setTimestamp(sealedMetadata.getTimestamp())
+                .setDevice(sealedMetadata.getDevice())
+                .build(),
+            sealedLogs.getLogs().toByteArray());
+      }
+      default -> new DecryptedLogBatch(metadata, plaintext);
+    };
+  }
+
+  /**
+   * Reverses {@link #padToSizeBucket}.
+   *
+   * @throws CrumblesLogsDecryptionException if {@code paddedLogs} declares more logs than it holds
+   */
+  private static byte[] stripPadding(byte[] paddedLogs) {
+    ByteBuffer buffer = ByteBuffer.wrap(paddedLogs);
+    int logsLength = buffer.remaining() >= Integer.BYTES ? buffer.getInt() : -1;
+    if (logsLength < 0 || logsLength > buffer.remaining()) {
+      throw new CrumblesLogsDecryptionException(
+          "A padded log batch declares more logs than it holds.", null);
+    }
+    byte[] logs = new byte[logsLength];
+    buffer.get(logs);
+    return logs;
+  }
+
+  private static SealedLogs parseSealedLogs(byte[] serializedSealedLogs) {
+    try {
+      return SealedLogs.parseFrom(serializedSealedLogs, ExtensionRegistryLite.getEmptyRegistry());
+    } catch (InvalidProtocolBufferException e) {
+      throw new CrumblesLogsDecryptionException(
+          "A format version 2 log batch holds malformed sealed logs.", e);
+    }
   }
 }
