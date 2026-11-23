@@ -28,12 +28,15 @@ import androidx.annotation.StringRes;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.google.common.collect.ImmutableList;
 import java.io.File;
 import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Keeps the encrypted log directory within a byte cap without destroying evidence by reclaiming
@@ -45,6 +48,13 @@ final class CrumblesLogStorageQuota {
   static final int SIGNATURE_ALLOWANCE_BYTES = 8192;
   private static final String PREF_ALERTED_APPROACHING = "quotaAlertedApproaching";
   private static final String PREF_ALERTED_REACHED = "quotaAlertedReached";
+
+  /** Preferences numbering each batch, by its name without suffix, in the order first seen. */
+  private static final String ADMISSION_ORDER_PREFS = "CrumblesBatchAdmissionOrder";
+
+  /** Suffixes that a batch file name takes through its upload, with .bin, which ends all, last. */
+  private static final ImmutableList<String> UPLOAD_STATE_SUFFIXES =
+      ImmutableList.of(CrumblesConstants.SENT_SUFFIX, CrumblesConstants.PROCESSING_SUFFIX, ".bin");
 
   private CrumblesLogStorageQuota() {}
 
@@ -71,7 +81,7 @@ final class CrumblesLogStorageQuota {
       Log.w(TAG, "Unable to list the logs directory; admitting the batch unchecked.");
       return true;
     }
-    Arrays.sort(batches, Comparator.comparingLong(File::lastModified));
+    sortByAdmissionOrder(context, batches);
     long usedBytes = Arrays.stream(batches).mapToLong(File::length).sum();
     long effectiveCapBytes =
         isNetworkBatch
@@ -111,6 +121,50 @@ final class CrumblesLogStorageQuota {
           isNetworkBatch);
     }
     return admitted;
+  }
+
+  /**
+   * Sorts {@code batches} oldest first in the order in which this class first saw them, which it
+   * records. Their modification times follow the wall clock and change at upload, so a clock set
+   * back would let new batches take the reserve. Batches first seen together, as when this order
+   * was introduced, keep the order of their modification times.
+   */
+  private static void sortByAdmissionOrder(Context context, File[] batches) {
+    SharedPreferences preferences =
+        context.getSharedPreferences(ADMISSION_ORDER_PREFS, Context.MODE_PRIVATE);
+    Map<String, ?> recorded = preferences.getAll();
+    long next =
+        1
+            + recorded.values().stream()
+                .filter(Long.class::isInstance)
+                .mapToLong(Long.class::cast)
+                .max()
+                .orElse(0);
+    Arrays.sort(batches, Comparator.comparingLong(File::lastModified));
+    Map<String, Long> order = new HashMap<>();
+    for (File batch : batches) {
+      String name = nameWithoutSuffix(batch);
+      if (!order.containsKey(name)) {
+        order.put(name, recorded.get(name) instanceof Long number ? number : next++);
+      }
+    }
+    if (!order.equals(recorded)) {
+      SharedPreferences.Editor editor = preferences.edit().clear();
+      order.forEach(editor::putLong);
+      editor.apply();
+    }
+    Arrays.sort(batches, Comparator.comparingLong(batch -> order.get(nameWithoutSuffix(batch))));
+  }
+
+  /** Returns the name of {@code batch} without the suffix that its upload changes. */
+  private static String nameWithoutSuffix(File batch) {
+    String name = batch.getName();
+    for (String suffix : UPLOAD_STATE_SUFFIXES) {
+      if (name.endsWith(suffix)) {
+        return name.substring(0, name.length() - suffix.length());
+      }
+    }
+    return name;
   }
 
   private static long getNonReclaimableBytes(File[] oldestFirst, long capBytes) {
@@ -156,6 +210,7 @@ final class CrumblesLogStorageQuota {
     long olderBytes = 0;
     long freedBytes = 0;
     List<String> reclaimed = new ArrayList<>();
+    List<String> unverified = new ArrayList<>();
     for (File batch : oldestFirst) {
       if (usedBytes < targetBytes) {
         break;
@@ -171,6 +226,9 @@ final class CrumblesLogStorageQuota {
         usedBytes -= batchBytes;
         freedBytes += batchBytes;
         reclaimed.add(batch.getName());
+        if (CrumblesDeleteSentFilesWorker.isUnverifiedSafCopy(context, batch.getName())) {
+          unverified.add(batch.getName());
+        }
       } else {
         Log.e(TAG, "Failed to reclaim the uploaded copy " + batch.getName());
       }
@@ -180,6 +238,17 @@ final class CrumblesLogStorageQuota {
           "Reclaimed " + reclaimed.size() + " uploaded copy(ies) (" + freedBytes + " bytes): ";
       CrumblesAppAuditLogger.getInstance(context)
           .logEvent("LOGS_STORAGE_CAP_REACHED", msg + String.join(", ", reclaimed) + ".");
+    }
+    if (!unverified.isEmpty()) {
+      // The folder may have lost these copies since their upload, taking their logs with them.
+      CrumblesAppAuditLogger.getInstance(context)
+          .logEvent(
+              CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST,
+              "Reclaimed "
+                  + unverified.size()
+                  + " uploaded copy(ies) that no re-check found at the destination: "
+                  + String.join(", ", unverified)
+                  + ".");
     }
     return usedBytes;
   }

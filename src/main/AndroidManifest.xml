@@ -27,14 +27,16 @@
   <uses-permission android:name="android.permission.REQUEST_PASSWORD_COMPLEXITY" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
   <uses-permission android:name="android.permission.CAMERA" />
+  <!-- The camera only scans QR codes of public keys: Crumbles logs on devices without one. -->
+  <uses-feature android:name="android.hardware.camera" android:required="false" />
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
   <!-- Lets security-critical windows hide the overlays of other apps, which could otherwise spoof
        what the user confirms. -->
   <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
   <uses-permission android:name="android.permission.USE_BIOMETRIC" />
-  <!-- Lets the device admin receiver save, once the user unlocks the phone after a restart, the
-       security logs that the platform kept from before it. -->
+  <!-- Lets the device admin receiver save, after a restart, the security logs that the platform
+       kept from before it, before the first unlock too. -->
   <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
   <application
@@ -120,10 +122,12 @@
             android:resource="@xml/file_paths" />
     </provider>
     <!-- Exported, as Android documents for a device admin receiver. Only the system holds
-         BIND_DEVICE_ADMIN, so no other app can send it a broadcast. -->
+         BIND_DEVICE_ADMIN, so no other app can send it a broadcast. Direct boot aware, so that it
+         collects security logs before the first unlock after a restart. -->
     <receiver
             android:name=".CrumblesDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:directBootAware="true"
             android:exported="true">
             <meta-data
                 android:name="android.app.device_admin"
@@ -135,6 +139,8 @@
                 <action android:name="android.app.action.USER_ADDED" />
                 <action android:name="android.app.action.USER_REMOVED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
     <!-- Receives the logs once a device owner delegated security or network logging to
@@ -143,12 +149,18 @@
     <receiver
             android:name=".CrumblesDelegatedAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:directBootAware="true"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.app.action.NETWORK_LOGS_AVAILABLE" />
                 <action android:name="android.app.action.SECURITY_LOGS_AVAILABLE" />
             </intent-filter>
         </receiver>
+    <!-- Posts an alert again when the user dismisses it while its problem lasts. Only the delete
+         intent of the alert, which names it, sends it broadcasts, so it is not exported. -->
+    <receiver
+            android:name=".CrumblesAlertDismissedReceiver"
+            android:exported="false" />
     <!-- Quick Settings tile "Sync now". Exported so that System UI can bind it; only the system
          holds BIND_QUICK_SETTINGS_TILE, so no app can bind or start it. -->
     <service

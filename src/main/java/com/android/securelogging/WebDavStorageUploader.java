@@ -21,13 +21,13 @@ import static com.google.common.base.Preconditions.checkNotNull;
 
 import android.content.Context;
 import android.net.Uri;
+import android.security.NetworkSecurityPolicy;
 import android.util.Base64;
 import android.util.Log;
 import androidx.annotation.Nullable;
 import com.google.common.base.Ascii;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
-import com.google.common.io.ByteStreams;
 import com.google.common.net.InetAddresses;
 import java.io.File;
 import java.io.FileInputStream;
@@ -37,6 +37,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.ProtocolException;
+import java.net.Proxy;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -62,7 +63,12 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
   private static final String TAG = "WebDavStorageUploader";
   private static final int CONNECT_TIMEOUT_MS = 15000;
   private static final int READ_TIMEOUT_MS = 30000;
-  private static final String USER_AGENT = "Crumbles-Android";
+
+  /**
+   * A common value, so that the server's access logs do not name the app. The platform default
+   * would name the device and its build.
+   */
+  private static final String USER_AGENT = "Mozilla/5.0";
 
   private static final int HTTP_SUCCESS_MIN = 200;
   private static final int HTTP_SUCCESS_MAX = 299;
@@ -84,6 +90,7 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
   @Nullable private final SSLSocketFactory tlsSocketFactory;
   private boolean serverKeyRejected;
   private boolean transportFailed;
+  private boolean failedMidBody;
 
   /**
    * Creates an uploader for {@code serverUrl}.
@@ -123,6 +130,8 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
 
   @Override
   public boolean uploadFile(Context context, File file, String remoteFileName) {
+    transportFailed = false;
+    failedMidBody = false;
     if (!isAcceptableServerUrl(serverUrl)) {
       // The URL stays out of the log, because it can name the account.
       Log.e(TAG, "WebDAV server URL rejected by the transport policy");
@@ -131,14 +140,17 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
     String targetUrlString = buildTargetUrl(serverUrl, remoteFileName);
     HttpURLConnection conn = null;
     CrumblesTransferDeadline.Disarm deadline = CrumblesTransferDeadline.Disarm.NONE;
+    boolean sendingBody = false;
     try {
       URL url = toAbsoluteUrl(targetUrlString);
-      conn = (HttpURLConnection) url.openConnection();
+      conn = openConnection(url);
       if (!routeThroughTlsSocketFactory(conn, tlsSocketFactory)) {
         Log.e(TAG, "Plaintext WebDAV URL rejected: this uploader connects only through TLS");
         return false;
       }
-      deadline = CrumblesTransferDeadline.arm(file.length(), conn::disconnect);
+      CrumblesTransferDeadline.Transfer transfer =
+          CrumblesTransferDeadline.arm(file.length(), conn::disconnect);
+      deadline = transfer;
       conn.setInstanceFollowRedirects(false);
       conn.setRequestMethod("PUT");
       conn.setDoOutput(true);
@@ -149,11 +161,15 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
       conn.setRequestProperty("Authorization", buildBasicAuthHeader(username, password));
       conn.setRequestProperty("User-Agent", USER_AGENT);
 
+      transfer.checkInTime();
       try (InputStream in = new FileInputStream(file);
           OutputStream out = conn.getOutputStream()) {
-        ByteStreams.copy(in, out);
+        sendingBody = true;
+        @SuppressWarnings("unused")
+        var unusedBytes = CrumblesTransferDeadline.copy(in, out, transfer);
         out.flush();
       }
+      sendingBody = false;
 
       int responseCode = conn.getResponseCode();
       if (confirmsBatchIsStored(responseCode)) {
@@ -171,6 +187,7 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
         Log.e(TAG, "WebDAV server presented a public key other than the pinned one", e);
       } else {
         transportFailed = true;
+        failedMidBody = sendingBody;
         Log.e(TAG, "I/O or network failure uploading " + remoteFileName + " to WebDAV", e);
       }
     } finally {
@@ -180,6 +197,15 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
       }
     }
     return false;
+  }
+
+  /**
+   * Opens a connection to {@code url}. A loopback server is reached directly: a proxy would take
+   * the request, credentials included, off the device, in plaintext over HTTP.
+   */
+  private static HttpURLConnection openConnection(URL url) throws IOException {
+    return (HttpURLConnection)
+        (isLoopbackHost(url.getHost()) ? url.openConnection(Proxy.NO_PROXY) : url.openConnection());
   }
 
   /**
@@ -229,7 +255,7 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
     CrumblesTransferDeadline.Disarm deadline = CrumblesTransferDeadline.Disarm.NONE;
     try {
       URL url = toAbsoluteUrl(serverUrl);
-      conn = (HttpURLConnection) url.openConnection();
+      conn = openConnection(url);
       if (!routeThroughTlsSocketFactory(conn, tlsSocketFactory)) {
         return ConnectionTestResult.INVALID_URL;
       }
@@ -303,7 +329,7 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
     checkArgument(isAcceptableServerUrl(serverUrl), "WebDAV server URL rejected");
     URLConnection connection;
     try {
-      connection = toAbsoluteUrl(serverUrl).openConnection();
+      connection = openConnection(toAbsoluteUrl(serverUrl));
     } catch (URISyntaxException e) {
       throw new IllegalArgumentException("WebDAV server URL rejected", e);
     }
@@ -415,16 +441,37 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
   }
 
   /**
+   * Returns the scheme, host and port of {@code serverUrl}, to which a server key is bound, in the
+   * same form however the URL spells them: {@code https://DAV.example.org/dav} and {@code
+   * https://dav.example.org:443/} both give {@code https://dav.example.org:443}.
+   *
+   * @throws IllegalArgumentException if {@code serverUrl} is not an absolute URL
+   */
+  static String serverOrigin(String serverUrl) {
+    URL url;
+    try {
+      url = toAbsoluteUrl(serverUrl);
+    } catch (URISyntaxException | MalformedURLException e) {
+      throw new IllegalArgumentException("Invalid WebDAV server URL", e);
+    }
+    int port = url.getPort() != -1 ? url.getPort() : url.getDefaultPort();
+    return url.getProtocol() + "://" + Ascii.toLowerCase(url.getHost()) + ":" + port;
+  }
+
+  /**
    * Returns whether {@code url} may carry WebDAV traffic.
    *
-   * <p>HTTPS is always permitted. Plaintext HTTP is permitted only towards a loopback address,
-   * because that traffic never leaves the device and so is not exposed to network interception.
+   * <p>HTTPS is always permitted. Plaintext HTTP is permitted only towards a loopback address that
+   * the network security config opens to cleartext, as only debug builds do: any app can listen on
+   * a loopback port while the intended server is down, and take the credentials.
    */
   private static boolean isAllowedScheme(URL url) {
     if (Objects.equals(url.getProtocol(), "https")) {
       return true;
     }
-    return Objects.equals(url.getProtocol(), "http") && isLoopbackHost(url.getHost());
+    return Objects.equals(url.getProtocol(), "http")
+        && isLoopbackHost(url.getHost())
+        && NetworkSecurityPolicy.getInstance().isCleartextTrafficPermitted(url.getHost());
   }
 
   /**
@@ -457,6 +504,11 @@ public final class WebDavStorageUploader implements RemoteStorageUploader {
   @Override
   public boolean transportFailed() {
     return transportFailed;
+  }
+
+  @Override
+  public boolean failedMidBody() {
+    return failedMidBody;
   }
 
   /**

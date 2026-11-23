@@ -18,6 +18,8 @@ package com.android.securelogging;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -29,6 +31,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.robolectric.Shadows.shadowOf;
@@ -57,17 +60,18 @@ import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.security.keystore.UserNotAuthenticatedException;
-import android.support.v4.app.DialogFragment;
-import android.support.v4.app.Fragment;
-import android.support.v7.app.ActionBar;
-import android.support.v7.app.AlertDialog;
-import android.support.v7.app.AppCompatActivity;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ImageView;
+import android.widget.ListAdapter;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import androidx.appcompat.app.ActionBar;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.fragment.app.DialogFragment;
+import androidx.fragment.app.Fragment;
 import androidx.lifecycle.Lifecycle;
 import androidx.lifecycle.LifecycleRegistry;
 import androidx.test.core.app.ActivityScenario;
@@ -77,18 +81,26 @@ import com.android.securelogging.CrumblesLogsEncryptor.BulkDecryptPartition;
 import com.android.securelogging.CrumblesLogsEncryptor.DecryptedLogBatch;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
+import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
+import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.truth.Expect;
+import com.google.common.util.concurrent.Uninterruptibles;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.Timestamp;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.BatchSignature;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.KeyEncryptionType;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogKey;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -97,12 +109,17 @@ import java.security.ProviderException;
 import java.security.PublicKey;
 import java.security.Security;
 import java.security.spec.RSAKeyGenParameterSpec;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import javax.crypto.Cipher;
 import org.junit.After;
 import org.junit.Before;
@@ -121,6 +138,7 @@ import org.robolectric.shadows.ShadowBiometricPrompt;
 import org.robolectric.shadows.ShadowDialog;
 import org.robolectric.shadows.ShadowLooper;
 import org.robolectric.shadows.ShadowResolveInfo;
+import org.robolectric.shadows.ShadowSystemClock;
 import org.robolectric.shadows.ShadowToast;
 import org.robolectric.util.ReflectionHelpers;
 
@@ -140,6 +158,8 @@ public class CrumblesManageExternalKeysActivityTest {
       DocumentsContract.buildDocumentUri(FOLDER_AUTHORITY, "chosen_file");
   private static final String LOG_CONTENT = "encrypted log batch";
   private static final String THEATRE_TICKET_QR_PAYLOAD = "TICKET:Hamlet;ROW=F;SEAT=12";
+  private static final ByteString CURRENT_BATCH_WRAP_KEY_ID = ByteString.copyFromUtf8("current");
+  private static final ByteString REPLACED_BATCH_WRAP_KEY_ID = ByteString.copyFromUtf8("replaced");
 
   @Rule public final Expect expect = Expect.create();
 
@@ -205,13 +225,14 @@ public class CrumblesManageExternalKeysActivityTest {
     // batches without batch-unwrap keys.
     when(mockLogsEncryptor.deserializeFile(any()))
         .thenAnswer(invocation -> LogBatch.newBuilder().build());
-    when(mockLogsEncryptor.partitionForBulkDecrypt(any()))
-        .thenAnswer(
-            invocation ->
-                new BulkDecryptPartition(
-                    ImmutableList.of(),
-                    ImmutableList.copyOf(invocation.<List<LogBatch>>getArgument(0)),
-                    ImmutableList.of()));
+    when(mockLogsEncryptor.partitionForKeyChange(any(), any()))
+        .thenAnswer(invocation ->
+            new BulkDecryptPartition(
+                ImmutableList.of(),
+                ImmutableList.copyOf(invocation.<List<LogBatch>>getArgument(0)),
+                ImmutableList.of()));
+    // And: No external key is saved.
+    when(mockPublicKeyManager.getSavedExternalPublicKeys()).thenReturn(ImmutableList.of());
     // And: The CrumblesAppAuditLogger singleton is replaced with our mock for this test class.
     CrumblesAppAuditLogger.setInstanceForTest(mockAuditLogger);
   }
@@ -234,11 +255,10 @@ public class CrumblesManageExternalKeysActivityTest {
     scenario = ActivityScenario.launch(CrumblesManageExternalKeysActivity.class);
     // Inject mocks after launch but before the activity is resumed. Keys are generated on the
     // calling thread, so that each step of a key change has completed when the test checks it.
-    scenario.onActivity(
-        activity -> {
-          activity.setPublicKeyManagerForTest(mockPublicKeyManager);
-          activity.setKeyGenerationExecutorForTest(Runnable::run);
-        });
+    scenario.onActivity(activity -> {
+      activity.setPublicKeyManagerForTest(mockPublicKeyManager);
+      activity.setKeyGenerationExecutorForTest(Runnable::run);
+    });
     scenario.moveToState(Lifecycle.State.RESUMED);
     ShadowLooper.idleMainLooper(); // Ensure all initial UI tasks complete.
   }
@@ -249,12 +269,11 @@ public class CrumblesManageExternalKeysActivityTest {
    */
   private void startKeyChange(int buttonId, List<Runnable> keyGenerationTasks) {
     launchActivity();
-    scenario.onActivity(
-        activity -> {
-          activity.updateStatusUi();
-          activity.setKeyGenerationExecutorForTest(keyGenerationTasks::add);
-          activity.findViewById(buttonId).performClick();
-        });
+    scenario.onActivity(activity -> {
+      activity.updateStatusUi();
+      activity.setKeyGenerationExecutorForTest(keyGenerationTasks::add);
+      activity.findViewById(buttonId).performClick();
+    });
     ShadowLooper.idleMainLooper();
     scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
     keyGenerationTasks.remove(0).run();
@@ -277,8 +296,18 @@ public class CrumblesManageExternalKeysActivityTest {
 
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
-      assertThat(method).isEqualTo("android:createDocument");
       Bundle result = new Bundle();
+      if (method.equals("android:isChildDocument")) {
+        result.putBoolean("result", true);
+        return result;
+      }
+      if (method.equals("android:deleteDocument")) {
+        Uri document = extras.getParcelable("uri", Uri.class);
+        return new File(getContext().getCacheDir(), document.getLastPathSegment()).delete()
+            ? result
+            : null;
+      }
+      assertThat(method).isEqualTo("android:createDocument");
       result.putParcelable(
           "uri",
           DocumentsContract.buildDocumentUri(
@@ -327,16 +356,16 @@ public class CrumblesManageExternalKeysActivityTest {
             appContext.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
     assertThat(logsDir.isDirectory() || logsDir.mkdirs()).isTrue();
     File logFile = new File(logsDir, fileName);
-    Files.writeString(logFile.toPath(), LOG_CONTENT);
+    Files.write(logFile.toPath(), LOG_CONTENT.getBytes(UTF_8));
     return logFile;
   }
 
-  /** Starts a Keystore key change and picks "Upload As-Is" for the pending logs. */
+  /**
+   * Starts clearing the external key, a change that keeps the built-in key and so offers "Upload
+   * As-Is", and picks it for the pending logs.
+   */
   private void chooseUploadAsIs() {
-    scenario.onActivity(
-        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
-    ShadowLooper.idleMainLooper();
-    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+    clickAndConfirmClearActiveKey();
     getLatestAppCompatAlertDialog()
         .getListView()
         .performItemClick(/* view= */ null, /* position= */ 1, /* id= */ 1);
@@ -345,12 +374,11 @@ public class CrumblesManageExternalKeysActivityTest {
 
   /** Ends the folder picker that "Upload As-Is" opened with the given result. */
   private void returnFromFolderPicker(int resultCode, Intent result) {
-    scenario.onActivity(
-        activity -> {
-          Intent pickerIntent = shadowOf(activity).getNextStartedActivityForResult().intent;
-          assertThat(pickerIntent.getAction()).isEqualTo(Intent.ACTION_OPEN_DOCUMENT_TREE);
-          shadowOf(activity).receiveResult(pickerIntent, resultCode, result);
-        });
+    scenario.onActivity(activity -> {
+      Intent pickerIntent = shadowOf(activity).getNextStartedActivityForResult().intent;
+      assertThat(pickerIntent.getAction()).isEqualTo(Intent.ACTION_OPEN_DOCUMENT_TREE);
+      shadowOf(activity).receiveResult(pickerIntent, resultCode, result);
+    });
     ShadowLooper.idleMainLooper();
   }
 
@@ -404,11 +432,10 @@ public class CrumblesManageExternalKeysActivityTest {
     expect
         .that(progressMessage.getText().toString())
         .isEqualTo(appContext.getString(R.string.dialog_message_generating_key));
-    scenario.onActivity(
-        activity ->
-            expect
-                .that(activity.getRequestedOrientation())
-                .isEqualTo(ActivityInfo.SCREEN_ORIENTATION_LOCKED));
+    scenario.onActivity(activity ->
+        expect
+            .that(activity.getRequestedOrientation())
+            .isEqualTo(ActivityInfo.SCREEN_ORIENTATION_LOCKED));
 
     keyGenerationTasks.forEach(Runnable::run);
 
@@ -420,13 +447,12 @@ public class CrumblesManageExternalKeysActivityTest {
                 + fingerprintOf(testPublicKey)
                 + ".");
     expect.that(progressDialog.isShowing()).isFalse();
-    scenario.onActivity(
-        activity -> {
-          expect
-              .that(activity.getRequestedOrientation())
-              .isEqualTo(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-          expect.that(activity.isFinishing()).isTrue();
-        });
+    scenario.onActivity(activity -> {
+      expect
+          .that(activity.getRequestedOrientation())
+          .isEqualTo(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+      expect.that(activity.isFinishing()).isTrue();
+    });
   }
 
   @Test
@@ -489,11 +515,10 @@ public class CrumblesManageExternalKeysActivityTest {
 
     expect.that(progressDialog.isShowing()).isFalse();
     expect.that(plaintext).isEqualTo(new byte[] {0, 0, 0});
-    scenario.onActivity(
-        activity ->
-            expect
-                .that(activity.getRequestedOrientation())
-                .isEqualTo(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED));
+    scenario.onActivity(activity ->
+        expect
+            .that(activity.getRequestedOrientation())
+            .isEqualTo(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED));
   }
 
   @Test
@@ -505,16 +530,15 @@ public class CrumblesManageExternalKeysActivityTest {
     launchActivity();
 
     // When: The "Clear Active External Key" button is clicked.
-    scenario.onActivity(
-        activity -> {
-          // Manually call updateStatusUi() after injection to refresh the view state.
-          activity.updateStatusUi();
+    scenario.onActivity(activity -> {
+      // Manually call updateStatusUi() after injection to refresh the view state.
+      activity.updateStatusUi();
 
-          // The button should be visible now.
-          Button clearButton = activity.findViewById(R.id.btn_clear_active_external_key);
-          assertThat(clearButton.getVisibility()).isEqualTo(View.VISIBLE);
-          clearButton.performClick();
-        });
+      // The button should be visible now.
+      Button clearButton = activity.findViewById(R.id.btn_clear_active_external_key);
+      assertThat(clearButton.getVisibility()).isEqualTo(View.VISIBLE);
+      clearButton.performClick();
+    });
     ShadowLooper.idleMainLooper();
     scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
 
@@ -601,11 +625,41 @@ public class CrumblesManageExternalKeysActivityTest {
     inOrder.verify(mockPublicKeyManager).saveActiveExternalPublicKey(isNull());
     inOrder.verify(mockLogsEncryptor).encryptLogsAttributedTo(any(), any(), isNull());
     expect.that(progressDialog.isShowing()).isFalse();
-    scenario.onActivity(
-        activity ->
-            expect
-                .that(activity.findViewById(R.id.btn_clear_active_external_key).getVisibility())
-                .isEqualTo(View.GONE));
+    scenario.onActivity(activity ->
+        expect
+            .that(activity.findViewById(R.id.btn_clear_active_external_key).getVisibility())
+            .isEqualTo(View.GONE));
+  }
+
+  @Test
+  public void onClearActiveKey_letsTheUserStopWaitingForTheHandover() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockPublicKeyManager.getActiveExternalPublicKey()).thenReturn(testPublicKey);
+    List<Runnable> backgroundTasks = new ArrayList<>();
+    startKeyChange(R.id.btn_clear_active_external_key, backgroundTasks);
+
+    AlertDialog progressDialog = getLatestAppCompatAlertDialog();
+
+    TextView progressMessage = progressDialog.findViewById(android.R.id.message);
+    expect
+        .that(progressMessage.getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_message_handing_over_key));
+    expect
+        .that(progressDialog.getButton(DialogInterface.BUTTON_NEGATIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_stop_waiting));
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_letsTheUserStopWaitingForTheHandoverItStartsWith()
+      throws Exception {
+    List<Runnable> keyGenerationTasks = new ArrayList<>();
+    startKeyChange(R.id.btn_generate_keystore_key, keyGenerationTasks);
+
+    AlertDialog progressDialog = getLatestAppCompatAlertDialog();
+
+    expect
+        .that(progressDialog.getButton(DialogInterface.BUTTON_NEGATIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_stop_waiting));
   }
 
   @Test
@@ -618,29 +672,26 @@ public class CrumblesManageExternalKeysActivityTest {
   @Test
   public void onCreate_setsFlagSecure() {
     launchActivity();
-    scenario.onActivity(
-        activity ->
-            assertThat(
-                    activity.getWindow().getAttributes().flags
-                        & WindowManager.LayoutParams.FLAG_SECURE)
-                .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE));
+    scenario.onActivity(activity ->
+        assertThat(
+                activity.getWindow().getAttributes().flags & WindowManager.LayoutParams.FLAG_SECURE)
+            .isEqualTo(WindowManager.LayoutParams.FLAG_SECURE));
   }
 
   @Test
   public void onCreate_configuresSupportActionBarTitleAndUpNavigation() {
     launchActivity();
 
-    scenario.onActivity(
-        activity -> {
-          ActionBar actionBar = activity.getSupportActionBar();
-          assertThat(actionBar).isNotNull();
-          expect
-              .that(actionBar.getDisplayOptions() & ActionBar.DISPLAY_HOME_AS_UP)
-              .isEqualTo(ActionBar.DISPLAY_HOME_AS_UP);
-          expect
-              .that(actionBar.getTitle().toString())
-              .isEqualTo(appContext.getString(R.string.title_manage_external_keys));
-        });
+    scenario.onActivity(activity -> {
+      ActionBar actionBar = activity.getSupportActionBar();
+      assertThat(actionBar).isNotNull();
+      expect
+          .that(actionBar.getDisplayOptions() & ActionBar.DISPLAY_HOME_AS_UP)
+          .isEqualTo(ActionBar.DISPLAY_HOME_AS_UP);
+      expect
+          .that(actionBar.getTitle().toString())
+          .isEqualTo(appContext.getString(R.string.title_manage_external_keys));
+    });
   }
 
   @Test
@@ -650,40 +701,38 @@ public class CrumblesManageExternalKeysActivityTest {
     launchActivity();
 
     // When: All actions are performed on the UI thread first.
-    scenario.onActivity(
-        activity -> {
-          // Perform the click that shows the choice dialog.
-          activity.findViewById(R.id.btn_generate_exportable_key).performClick();
-          ShadowLooper.idleMainLooper();
-          confirmCredential(activity);
+    scenario.onActivity(activity -> {
+      // Perform the click that shows the choice dialog.
+      activity.findViewById(R.id.btn_generate_exportable_key).performClick();
+      ShadowLooper.idleMainLooper();
+      confirmCredential(activity);
 
-          // And: The user clicks "View as Text" in the choice dialog.
-          AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
-          assertThat(choiceDialog).isNotNull();
-          choiceDialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
-        });
+      // And: The user clicks "View as Text" in the choice dialog.
+      AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
+      assertThat(choiceDialog).isNotNull();
+      choiceDialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    });
 
     ShadowLooper.idleMainLooper();
 
     // Then: Perform assertions in a separate block to check the final state.
-    scenario.onActivity(
-        activity -> {
-          activity.getSupportFragmentManager().executePendingTransactions();
-          DialogFragment dialogFragment =
-              (DialogFragment)
-                  activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
-          assertThat(dialogFragment).isNotNull();
-          Dialog dialog = dialogFragment.getDialog();
-          assertThat(dialog).isNotNull();
+    scenario.onActivity(activity -> {
+      activity.getSupportFragmentManager().executePendingTransactions();
+      DialogFragment dialogFragment =
+          (DialogFragment)
+              activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
+      assertThat(dialogFragment).isNotNull();
+      Dialog dialog = dialogFragment.getDialog();
+      assertThat(dialog).isNotNull();
 
-          // And: It starts in the correct text view state.
-          ScrollView textScrollView = dialog.findViewById(R.id.private_key_text_scrollview);
-          ImageView qrCodeImageView = dialog.findViewById(R.id.private_key_qr_code_imageview);
-          assertThat(textScrollView).isNotNull();
-          assertThat(qrCodeImageView).isNotNull();
-          assertThat(textScrollView.getVisibility()).isEqualTo(View.VISIBLE);
-          assertThat(qrCodeImageView.getVisibility()).isEqualTo(View.GONE);
-        });
+      // And: It starts in the correct text view state.
+      ScrollView textScrollView = dialog.findViewById(R.id.private_key_text_scrollview);
+      ImageView qrCodeImageView = dialog.findViewById(R.id.private_key_qr_code_imageview);
+      assertThat(textScrollView).isNotNull();
+      assertThat(qrCodeImageView).isNotNull();
+      assertThat(textScrollView.getVisibility()).isEqualTo(View.VISIBLE);
+      assertThat(qrCodeImageView.getVisibility()).isEqualTo(View.GONE);
+    });
   }
 
   @Test
@@ -693,64 +742,60 @@ public class CrumblesManageExternalKeysActivityTest {
     launchActivity();
 
     // When: All actions are performed on the UI thread first.
-    scenario.onActivity(
-        activity -> {
-          // Perform the click that shows the choice dialog.
-          activity.findViewById(R.id.btn_generate_exportable_key).performClick();
-          ShadowLooper.idleMainLooper();
-          confirmCredential(activity);
+    scenario.onActivity(activity -> {
+      // Perform the click that shows the choice dialog.
+      activity.findViewById(R.id.btn_generate_exportable_key).performClick();
+      ShadowLooper.idleMainLooper();
+      confirmCredential(activity);
 
-          // And: The user clicks "View as QR Code" in the choice dialog.
-          AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
-          assertThat(choiceDialog).isNotNull();
-          choiceDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
-        });
+      // And: The user clicks "View as QR Code" in the choice dialog.
+      AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
+      assertThat(choiceDialog).isNotNull();
+      choiceDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+    });
 
     ShadowLooper.idleMainLooper();
 
     // Then: Perform assertions in a separate block to check the final state.
-    scenario.onActivity(
-        activity -> {
-          activity.getSupportFragmentManager().executePendingTransactions();
-          DialogFragment dialogFragment =
-              (DialogFragment)
-                  activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
-          assertThat(dialogFragment).isNotNull();
-          Dialog dialog = dialogFragment.getDialog();
-          assertThat(dialog).isNotNull();
+    scenario.onActivity(activity -> {
+      activity.getSupportFragmentManager().executePendingTransactions();
+      DialogFragment dialogFragment =
+          (DialogFragment)
+              activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
+      assertThat(dialogFragment).isNotNull();
+      Dialog dialog = dialogFragment.getDialog();
+      assertThat(dialog).isNotNull();
 
-          // And: It starts in the correct QR view state.
-          ScrollView textScrollView = dialog.findViewById(R.id.private_key_text_scrollview);
-          ImageView qrCodeImageView = dialog.findViewById(R.id.private_key_qr_code_imageview);
-          assertThat(textScrollView).isNotNull();
-          assertThat(qrCodeImageView).isNotNull();
-          assertThat(textScrollView.getVisibility()).isEqualTo(View.GONE);
-          assertThat(qrCodeImageView.getVisibility()).isEqualTo(View.VISIBLE);
-        });
+      // And: It starts in the correct QR view state.
+      ScrollView textScrollView = dialog.findViewById(R.id.private_key_text_scrollview);
+      ImageView qrCodeImageView = dialog.findViewById(R.id.private_key_qr_code_imageview);
+      assertThat(textScrollView).isNotNull();
+      assertThat(qrCodeImageView).isNotNull();
+      assertThat(textScrollView.getVisibility()).isEqualTo(View.GONE);
+      assertThat(qrCodeImageView.getVisibility()).isEqualTo(View.VISIBLE);
+    });
   }
 
   private void triggerExportChoiceAndClick(int buttonId) {
-    scenario.onActivity(
-        activity -> {
-          activity.findViewById(R.id.btn_generate_exportable_key).performClick();
-          ShadowLooper.idleMainLooper();
-          confirmCredential(activity);
-          AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
-          assertThat(choiceDialog).isNotNull();
-          choiceDialog.getButton(buttonId).performClick();
-        });
+    scenario.onActivity(activity -> {
+      activity.findViewById(R.id.btn_generate_exportable_key).performClick();
+      ShadowLooper.idleMainLooper();
+      confirmCredential(activity);
+      AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
+      assertThat(choiceDialog).isNotNull();
+      choiceDialog.getButton(buttonId).performClick();
+    });
     ShadowLooper.idleMainLooper();
   }
 
   private DialogFragment getViewerDialogFragment() {
     AtomicReference<DialogFragment> fragmentRef = new AtomicReference<>();
-    scenario.onActivity(
-        activity -> {
-          activity.getSupportFragmentManager().executePendingTransactions();
-          fragmentRef.set(
-              (DialogFragment)
-                  activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer"));
-        });
+    scenario.onActivity(activity -> {
+      activity.getSupportFragmentManager().executePendingTransactions();
+      fragmentRef.set(
+          (DialogFragment)
+              activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer"));
+    });
     return fragmentRef.get();
   }
 
@@ -762,16 +807,15 @@ public class CrumblesManageExternalKeysActivityTest {
     launchActivity();
 
     // When: The user generates a key and cancels the export format choice dialog.
-    scenario.onActivity(
-        activity -> {
-          activity.findViewById(R.id.btn_generate_exportable_key).performClick();
-          ShadowLooper.idleMainLooper();
-          confirmCredential(activity);
-          AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
-          assertThat(choiceDialog).isNotNull();
-          choiceDialog.cancel();
-          ShadowLooper.idleMainLooper();
-        });
+    scenario.onActivity(activity -> {
+      activity.findViewById(R.id.btn_generate_exportable_key).performClick();
+      ShadowLooper.idleMainLooper();
+      confirmCredential(activity);
+      AlertDialog choiceDialog = getLatestAppCompatAlertDialog();
+      assertThat(choiceDialog).isNotNull();
+      choiceDialog.cancel();
+      ShadowLooper.idleMainLooper();
+    });
 
     // Then: The private key buffer is zeroed, candidate is rolled back, and toast is shown.
     assertThat(privateKeyBytes).isEqualTo(new byte[privateKeyBytes.length]);
@@ -831,18 +875,16 @@ public class CrumblesManageExternalKeysActivityTest {
         .isEqualTo(appContext.getString(R.string.toast_new_external_key_generated_successfully));
 
     // And: The UI status text and clear button are updated to reflect the active key.
-    scenario.onActivity(
-        activity -> {
-          TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
-          String expectedKeyHash =
-              CrumblesLogsEncryptor.getPublicKeyHash(testExternalKeyPair.getPublic());
-          assertThat(tvStatus.getText().toString())
-              .isEqualTo(
-                  appContext.getString(
-                      R.string.status_external_key_active_formatted, expectedKeyHash));
-          Button clearBtn = activity.findViewById(R.id.btn_clear_active_external_key);
-          assertThat(clearBtn.getVisibility()).isEqualTo(View.VISIBLE);
-        });
+    scenario.onActivity(activity -> {
+      TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
+      String expectedKeyHash =
+          CrumblesLogsEncryptor.getPublicKeyHash(testExternalKeyPair.getPublic());
+      assertThat(tvStatus.getText().toString())
+          .isEqualTo(
+              appContext.getString(R.string.status_external_key_active_formatted, expectedKeyHash));
+      Button clearBtn = activity.findViewById(R.id.btn_clear_active_external_key);
+      assertThat(clearBtn.getVisibility()).isEqualTo(View.VISIBLE);
+    });
   }
 
   @Test
@@ -857,11 +899,10 @@ public class CrumblesManageExternalKeysActivityTest {
     triggerExportChoiceAndClick(AlertDialog.BUTTON_POSITIVE);
     DialogFragment dialogFragment = getViewerDialogFragment();
     assertThat(dialogFragment).isNotNull();
-    scenario.onActivity(
-        activity -> {
-          TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
-          tvStatus.setText("temporary_pending_state");
-        });
+    scenario.onActivity(activity -> {
+      TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
+      tvStatus.setText("temporary_pending_state");
+    });
     dialogFragment.dismiss();
     ShadowLooper.idleMainLooper();
 
@@ -871,16 +912,14 @@ public class CrumblesManageExternalKeysActivityTest {
     assertThat(ShadowToast.getTextOfLatestToast())
         .isEqualTo(appContext.getString(R.string.toast_key_export_cancelled_active_key_preserved));
 
-    scenario.onActivity(
-        activity -> {
-          TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
-          String expectedKeyHash =
-              CrumblesLogsEncryptor.getPublicKeyHash(testExternalKeyPair.getPublic());
-          assertThat(tvStatus.getText().toString())
-              .isEqualTo(
-                  appContext.getString(
-                      R.string.status_external_key_active_formatted, expectedKeyHash));
-        });
+    scenario.onActivity(activity -> {
+      TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
+      String expectedKeyHash =
+          CrumblesLogsEncryptor.getPublicKeyHash(testExternalKeyPair.getPublic());
+      assertThat(tvStatus.getText().toString())
+          .isEqualTo(
+              appContext.getString(R.string.status_external_key_active_formatted, expectedKeyHash));
+    });
 
     // And: A subsequent custody confirmation does nothing because candidate key was cleared.
     scenario.onActivity(CrumblesManageExternalKeysActivity::onKeyCustodyConfirmed);
@@ -1281,8 +1320,7 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void processScannedPublicKey_whenSignedBatchIsReEncrypted_signsItAgain()
-      throws Exception {
+  public void processScannedPublicKey_whenSignedBatchIsReEncrypted_signsItAgain() throws Exception {
     Security.addProvider(new FakeAndroidKeyStoreProvider());
     FakeAndroidKeyStoreSpi.keystoreEntries.clear();
     try {
@@ -1290,19 +1328,18 @@ public class CrumblesManageExternalKeysActivityTest {
       LogBatch signedOriginal =
           new CrumblesBatchSigner(appContext).sign(LogBatch.getDefaultInstance());
       when(mockLogsEncryptor.deserializeFile(any())).thenReturn(signedOriginal);
-      when(mockLogsEncryptor.encryptLogs(any(), any(), any()))
-          .thenAnswer(
-              invocation -> {
-                Context context = invocation.getArgument(0);
-                return LogBatch.newBuilder()
-                    .setMetadata(
-                        LogMetadata.newBuilder()
-                            .setBlobSize(3)
-                            .setDevice(
-                                DeviceId.newBuilder()
-                                    .setDeviceId(CrumblesDeviceIdManager.getDeviceId(context))))
-                    .build();
-              });
+      when(mockLogsEncryptor.encryptLogsForSigningAgain(any(), any(), any(), any(), any()))
+          .thenAnswer(invocation -> {
+            Context context = invocation.getArgument(0);
+            return LogBatch.newBuilder()
+                .setMetadata(
+                    LogMetadata.newBuilder()
+                        .setBlobSize(3)
+                        .setDevice(
+                            DeviceId.newBuilder()
+                                .setDeviceId(CrumblesDeviceIdManager.getDeviceId(context))))
+                .build();
+          });
       launchActivity();
       processScannedKey(CrumblesLogsEncryptor.publicKeyToBase64(testPublicKey));
       getLatestAppCompatAlertDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick();
@@ -1352,7 +1389,8 @@ public class CrumblesManageExternalKeysActivityTest {
     ArgumentCaptor<LogBatch> writtenBatch = ArgumentCaptor.forClass(LogBatch.class);
     verify(mockLogsEncryptor).serializeBytes(writtenBatch.capture(), any(), any());
     assertThat(writtenBatch.getValue().hasSignature()).isFalse();
-    verify(mockLogsEncryptor, never()).encryptLogs(any(), any(), any());
+    verify(mockLogsEncryptor, never())
+        .encryptLogsForSigningAgain(any(), any(), any(), any(), any());
     verify(mockLogsEncryptor).encryptLogsAttributedTo(any(), any(), eq(testPublicKey));
     verify(mockAuditLogger)
         .logEvent(
@@ -1380,7 +1418,8 @@ public class CrumblesManageExternalKeysActivityTest {
 
       chooseReEncrypt();
 
-      verify(mockLogsEncryptor, never()).encryptLogs(any(), any(), any());
+      verify(mockLogsEncryptor, never())
+          .encryptLogsForSigningAgain(any(), any(), any(), any(), any());
       verify(mockLogsEncryptor).encryptLogsAttributedTo(any(), any(), eq(testPublicKey));
       expect
           .that(FakeAndroidKeyStoreSpi.keystoreEntries)
@@ -1403,7 +1442,8 @@ public class CrumblesManageExternalKeysActivityTest {
       givenPendingBatchDecryptingTo(new byte[] {1, 2, 3});
       when(mockLogsEncryptor.deserializeFile(any()))
           .thenReturn(new CrumblesBatchSigner(appContext).sign(LogBatch.getDefaultInstance()));
-      when(mockLogsEncryptor.encryptLogs(any(), any(), any())).thenReturn(null);
+      when(mockLogsEncryptor.encryptLogsForSigningAgain(any(), any(), any(), any(), any()))
+          .thenReturn(null);
       launchActivity();
       processScannedKey(CrumblesLogsEncryptor.publicKeyToBase64(testPublicKey));
       getLatestAppCompatAlertDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick();
@@ -1442,17 +1482,19 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void processScannedPublicKey_whenUnsignedVersion2BatchIsReEncrypted_keepsItsSealedId()
-      throws Exception {
+  public void
+      processScannedPublicKey_whenUnsignedVersion2BatchIsReEncrypted_keepsItsSealedIdAndTime()
+          throws Exception {
     givenPendingBatchDecryptingTo(new byte[] {1, 2, 3});
-    // A format version 2 batch seals its device ID, which may not be this device's current one.
+    // A format version 2 batch seals the time it was written and its device ID, which may not be
+    // this device's current one.
+    LogMetadata sealedMetadata =
+        LogMetadata.newBuilder()
+            .setTimestamp(Timestamp.newBuilder().setSeconds(1_600_000_000L))
+            .setDevice(DeviceId.newBuilder().setDeviceId("sealed-device"))
+            .build();
     when(mockLogsEncryptor.decryptLogBatch(any()))
-        .thenReturn(
-            new DecryptedLogBatch(
-                LogMetadata.newBuilder()
-                    .setDevice(DeviceId.newBuilder().setDeviceId("sealed-device"))
-                    .build(),
-                new byte[] {1, 2, 3}));
+        .thenReturn(new DecryptedLogBatch(sealedMetadata, new byte[] {1, 2, 3}));
     launchActivity();
     processScannedKey(CrumblesLogsEncryptor.publicKeyToBase64(testPublicKey));
     getLatestAppCompatAlertDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick();
@@ -1461,9 +1503,9 @@ public class CrumblesManageExternalKeysActivityTest {
 
     chooseReEncrypt();
 
-    verify(mockLogsEncryptor)
-        .encryptLogsAttributedTo(eq("sealed-device"), any(), eq(testPublicKey));
-    verify(mockLogsEncryptor, never()).encryptLogs(any(), any(), any());
+    verify(mockLogsEncryptor).encryptLogsAttributedTo(eq(sealedMetadata), any(), eq(testPublicKey));
+    verify(mockLogsEncryptor, never())
+        .encryptLogsForSigningAgain(any(), any(), any(), any(), any());
   }
 
   @Test
@@ -1538,7 +1580,7 @@ public class CrumblesManageExternalKeysActivityTest {
     new File(logsDir, "pending_batch.bin").createNewFile();
     when(mockLogsEncryptor.decryptLogBatch(any())).thenReturn(decrypted(plaintext));
     when(mockLogsEncryptor.deserializeFile(any())).thenReturn(LogBatch.getDefaultInstance());
-    when(mockLogsEncryptor.encryptLogs(any(), any(), any()))
+    when(mockLogsEncryptor.encryptLogsForSigningAgain(any(), any(), any(), any(), any()))
         .thenReturn(LogBatch.getDefaultInstance());
     when(mockLogsEncryptor.encryptLogsAttributedTo(any(), any(), any()))
         .thenReturn(LogBatch.getDefaultInstance());
@@ -1568,7 +1610,10 @@ public class CrumblesManageExternalKeysActivityTest {
   @Test
   public void onReEncryptDialog_whenUploadAsIsChosen_wipesDecryptedLogs() throws Exception {
     byte[] plaintext = {1, 2, 3};
-    startKeystoreKeyChangeWithPendingBatchDecryptingTo(plaintext);
+    givenPendingBatchDecryptingTo(plaintext);
+    launchActivity();
+    clickAndConfirmClearActiveKey();
+    assertThat(pendingLogChoices().get(1)).isEqualTo("Upload As-Is");
 
     getLatestAppCompatAlertDialog().getListView().performItemClick(null, 1, 1);
     ShadowLooper.idleMainLooper();
@@ -1581,7 +1626,7 @@ public class CrumblesManageExternalKeysActivityTest {
     byte[] plaintext = {1, 2, 3};
     startKeystoreKeyChangeWithPendingBatchDecryptingTo(plaintext);
 
-    getLatestAppCompatAlertDialog().getListView().performItemClick(null, 2, 2);
+    getLatestAppCompatAlertDialog().getListView().performItemClick(null, 1, 1);
     ShadowLooper.idleMainLooper();
 
     assertThat(plaintext).isEqualTo(new byte[plaintext.length]);
@@ -1612,15 +1657,14 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenAnotherPendingLogFailsToDecrypt_wipesDecryptedLogs()
+  public void onClearActiveKey_whenAnotherPendingLogFailsToDecrypt_wipesDecryptedLogs()
       throws Exception {
     byte[] plaintext = {1, 2, 3};
     givenPendingBatchesDecryptingToThenThrowing(
         plaintext, new CrumblesKeysException("Keys did not match"));
     launchActivity();
 
-    clickGenerateKeystoreKey();
-    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+    clickAndConfirmClearActiveKey();
 
     assertThat(
             getLatestAppCompatAlertDialog()
@@ -1677,12 +1721,11 @@ public class CrumblesManageExternalKeysActivityTest {
       throws Exception {
     givenPendingBatchDecryptingTo(plaintext);
     launchActivity();
-    clickGenerateKeystoreKey();
-    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+    clickAndConfirmKeystoreKey();
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenUploadAsIsCopiesAllLogs_marksThemSentAndChangesKey()
+  public void onClearActiveKey_whenUploadAsIsCopiesAllLogs_keepsThemQueuedAndChangesKey()
       throws Exception {
     File logFile = createPendingLogFile("test_log_asis.bin");
     Robolectric.buildContentProvider(FakeFolderProvider.class).create(FOLDER_AUTHORITY);
@@ -1691,15 +1734,15 @@ public class CrumblesManageExternalKeysActivityTest {
 
     returnFromFolderPicker(Activity.RESULT_OK, new Intent().setData(FOLDER_URI));
 
-    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockPublicKeyManager).saveActiveExternalPublicKey(isNull());
     verify(mockAuditLogger)
         .logEvent(
             "LOGS_COPIED_BEFORE_KEY_CHANGE",
             "1 pending log file(s) copied to a chosen folder before key rotation.");
     File copiedFile = new File(appContext.getCacheDir(), "test_log_asis.bin");
-    expect.that(Files.readString(copiedFile.toPath())).isEqualTo(LOG_CONTENT);
-    expect.that(new File(logFile.getParentFile(), "test_log_asis_sent.bin").exists()).isTrue();
-    expect.that(logFile.exists()).isFalse();
+    expect.that(new String(Files.readAllBytes(copiedFile.toPath()), UTF_8)).isEqualTo(LOG_CONTENT);
+    expect.that(new File(logFile.getParentFile(), "test_log_asis_sent.bin").exists()).isFalse();
+    expect.that(new String(Files.readAllBytes(logFile.toPath()), UTF_8)).isEqualTo(LOG_CONTENT);
     expect
         .that(
             ShadowToast.showedToast(
@@ -1708,24 +1751,22 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenUploadAsIs_recordsTheOutgoingKey() throws Exception {
+  public void onClearActiveKey_whenUploadAsIsCopiesToUploadFolder_marksThemSentForInternalKey()
+      throws Exception {
     File logFile = createPendingLogFile("test_log_asis.bin");
-    AtomicReference<PublicKey> internalKey = new AtomicReference<>(testPublicKey);
-    when(mockLogsEncryptor.getPublicKey()).thenAnswer(invocation -> internalKey.get());
-    KeyPair newKeyPair = generateTestRsaKeyPair();
-    when(mockLogsEncryptor.generateKeyPair())
-        .thenAnswer(
-            invocation -> {
-              internalKey.set(newKeyPair.getPublic());
-              return newKeyPair;
-            });
+    appContext
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, FOLDER_URI.toString())
+        .commit();
+    when(mockLogsEncryptor.getPublicKey()).thenReturn(testPublicKey);
     Robolectric.buildContentProvider(FakeFolderProvider.class).create(FOLDER_AUTHORITY);
     launchActivity();
     chooseUploadAsIs();
 
     returnFromFolderPicker(Activity.RESULT_OK, new Intent().setData(FOLDER_URI));
 
-    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockPublicKeyManager).saveActiveExternalPublicKey(isNull());
     expect.that(logFile.exists()).isFalse();
     expect
         .that(
@@ -1737,14 +1778,54 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenUploadFolderNotChosen_keepsKeyAndLogs() throws Exception {
+  public void onClearActiveKey_whenNoKeyOnDeviceDecryptsPendingLogs_canKeepThemQueued()
+      throws Exception {
+    File firstLogFile = createPendingLogFile("external_key_log_1.bin");
+    File secondLogFile = createPendingLogFile("external_key_log_2.bin");
+    doAnswer(invocation ->
+            new BulkDecryptPartition(
+                ImmutableList.of(),
+                ImmutableList.of(),
+                ImmutableList.copyOf(invocation.<List<LogBatch>>getArgument(0))))
+        .when(mockLogsEncryptor)
+        .partitionForKeyChange(any(), any());
+    launchActivity();
+    clickAndConfirmClearActiveKey();
+    Button keepQueuedButton =
+        getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE);
+
+    keepQueuedButton.performClick();
+    ShadowLooper.idleMainLooper();
+
+    expect
+        .that(keepQueuedButton.getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+    verify(mockLogsEncryptor, never()).decryptLogBatch(any());
+    verify(mockPublicKeyManager).saveActiveExternalPublicKey(isNull());
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "2 of 2 pending log file(s) could not be decrypted on this device; all were kept"
+                + " queued for upload before key rotation.");
+    scenario.onActivity(
+        activity -> expect.that(shadowOf(activity).getNextStartedActivityForResult()).isNull());
+    expect
+        .that(new String(Files.readAllBytes(firstLogFile.toPath()), UTF_8))
+        .isEqualTo(LOG_CONTENT);
+    expect
+        .that(new String(Files.readAllBytes(secondLogFile.toPath()), UTF_8))
+        .isEqualTo(LOG_CONTENT);
+  }
+
+  @Test
+  public void onClearActiveKey_whenUploadFolderNotChosen_keepsKeyAndLogs() throws Exception {
     File logFile = createPendingLogFile("test_log_no_folder.bin");
     launchActivity();
     chooseUploadAsIs();
 
     returnFromFolderPicker(Activity.RESULT_CANCELED, /* result= */ null);
 
-    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
     expect
         .that(ShadowToast.getTextOfLatestToast())
         .isEqualTo(appContext.getString(R.string.toast_upload_folder_not_chosen));
@@ -1752,9 +1833,84 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
+  public void onClearActiveKey_whenUserStopsWaitingForTheCopy_asksBeforeChangingKey()
+      throws Exception {
+    File logFile = createPendingLogFile("test_log_stopped.bin");
+    Robolectric.buildContentProvider(FakeFolderProvider.class).create(FOLDER_AUTHORITY);
+    launchActivity();
+    chooseUploadAsIs();
+    List<Runnable> copyTasks = new ArrayList<>();
+    scenario.onActivity(activity -> activity.setKeyGenerationExecutorForTest(copyTasks::add));
+    returnFromFolderPicker(Activity.RESULT_OK, new Intent().setData(FOLDER_URI));
+    AlertDialog progressDialog = getLatestAppCompatAlertDialog();
+    Button stopWaiting = progressDialog.getButton(DialogInterface.BUTTON_NEGATIVE);
+
+    stopWaiting.performClick();
+    boolean showingUntilTheCopyEnds = progressDialog.isShowing();
+    copyTasks.forEach(Runnable::run);
+    ShadowLooper.idleMainLooper();
+
+    expect
+        .that(stopWaiting.getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_stop_waiting));
+    expect.that(stopWaiting.isEnabled()).isFalse();
+    expect.that(showingUntilTheCopyEnds).isTrue();
+    expect.that(progressDialog.isShowing()).isFalse();
+    expect.that(logFile.exists()).isTrue();
+    expect
+        .that(latestDialogMessage())
+        .isEqualTo(appContext.getString(R.string.dialog_logs_not_copied_message));
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
+  }
+
+  @Test
+  public void onClearActiveKey_whenTheFolderStallsACopy_copiesNoMoreAndAsksBeforeChangingKey()
+      throws Exception {
+    // More than a pipe holds, so that the copy blocks once nothing drains the pipe.
+    File stalledLog = createPendingLogFile("test_log_stalled.bin");
+    Files.write(stalledLog.toPath(), new byte[1 << 20]);
+    assertThat(stalledLog.setLastModified(1_000)).isTrue();
+    File nextLog = createPendingLogFile("test_log_next.bin");
+    assertThat(nextLog.setLastModified(2_000)).isTrue();
+    File pipe = new File(appContext.getCacheDir(), stalledLog.getName());
+    assertThat(new ProcessBuilder("mkfifo", pipe.getPath()).start().waitFor()).isEqualTo(0);
+    Robolectric.buildContentProvider(FakeFolderProvider.class).create(FOLDER_AUTHORITY);
+    ExecutorService copyThread = Executors.newSingleThreadExecutor();
+    // Holding the pipe open, but reading nothing, stalls the copy into it.
+    try (RandomAccessFile idleReader = new RandomAccessFile(pipe, "rw")) {
+      launchActivity();
+      chooseUploadAsIs();
+      scenario.onActivity(activity -> activity.setKeyGenerationExecutorForTest(copyThread));
+      returnFromFolderPicker(Activity.RESULT_OK, new Intent().setData(FOLDER_URI));
+      // Ends once the copy, submitted before it, has.
+      Future<?> copied = copyThread.submit(() -> {});
+
+      for (int attempt = 0; attempt < 100 && !copied.isDone(); attempt++) {
+        ShadowSystemClock.advanceBy(Duration.ofHours(1));
+        Uninterruptibles.sleepUninterruptibly(50, MILLISECONDS);
+      }
+      ShadowLooper.idleMainLooper();
+
+      expect.that(new File(appContext.getCacheDir(), nextLog.getName()).exists()).isFalse();
+      expect.that(nextLog.exists()).isTrue();
+      expect
+          .that(latestDialogMessage())
+          .isEqualTo(appContext.getString(R.string.dialog_logs_not_copied_message));
+      verify(mockAuditLogger)
+          .logEvent(
+              "LOGS_COPY_BEFORE_KEY_CHANGE_FAILED",
+              "2 of 2 pending log file(s) could not be copied before key rotation; kept on"
+                  + " device.");
+    } finally {
+      copyThread.shutdownNow();
+    }
+  }
+
+  @Test
   public void
       onGenerateKeystoreKey_whenPendingLogsExist_andUserSelectsDiscard_discardsLogsAndProceeds()
           throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
     // Given: A pending log file exists.
     File logsDir =
         new File(
@@ -1775,8 +1931,8 @@ public class CrumblesManageExternalKeysActivityTest {
     AlertDialog reEncryptDialog = getLatestAppCompatAlertDialog();
     assertThat(reEncryptDialog).isNotNull();
 
-    // When: User clicks "Discard Logs" (item 2).
-    reEncryptDialog.getListView().performItemClick(null, 2, 2);
+    // When: User clicks "Discard Logs", item 1 as the change deletes the outgoing built-in key.
+    reEncryptDialog.getListView().performItemClick(null, 1, 1);
     ShadowLooper.idleMainLooper();
 
     // Then: Key pair generation proceeds and log file is deleted.
@@ -1790,22 +1946,66 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenDecryptionFailsAndCopyFails_asksBeforeChangingKey()
+  public void onGenerateKeystoreKey_withTheBuiltInKeyActive_offersNoUploadAsIs() throws Exception {
+    var unused = createPendingLogFile("built_in_key_log.bin");
+    launchActivity();
+
+    clickAndConfirmKeystoreKey();
+
+    assertThat(pendingLogChoices()).containsExactly("Re-encrypt", "Discard Logs").inOrder();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_withAnExternalKeySelected_offersNoUploadAsIs()
       throws Exception {
-    File logFile = createPendingLogFile("corrupt_log.bin");
+    var unused = createPendingLogFile("built_in_key_log.bin");
+    when(mockPublicKeyManager.isExternalKeySelected()).thenReturn(true);
+    launchActivity();
+
+    clickAndConfirmKeystoreKey();
+
+    assertThat(pendingLogChoices()).containsExactly("Re-encrypt", "Discard Logs").inOrder();
+  }
+
+  /** Returns the choices of the dialog that asks what to do with the pending logs, in order. */
+  private ImmutableList<String> pendingLogChoices() {
+    ListAdapter options = getLatestAppCompatAlertDialog().getListView().getAdapter();
+    ImmutableList.Builder<String> choices = ImmutableList.builder();
+    for (int i = 0; i < options.getCount(); i++) {
+      choices.add(options.getItem(i).toString());
+    }
+    return choices.build();
+  }
+
+  @Test
+  public void onClearActiveKey_whenDecryptionFails_saysTheLogsStayReadableWithTheirKey()
+      throws Exception {
+    assertThat(createPendingLogFile("corrupt_log.bin").exists()).isTrue();
     when(mockLogsEncryptor.deserializeFile(any())).thenThrow(new RuntimeException("Corrupt file"));
     launchActivity();
-    scenario.onActivity(
-        activity -> activity.findViewById(R.id.btn_generate_keystore_key).performClick());
-    ShadowLooper.idleMainLooper();
-    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
-    // Picks "Upload As-Is" in the decryption warning.
-    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
-    ShadowLooper.idleMainLooper();
+
+    clickAndConfirmClearActiveKey();
+
+    TextView message = getLatestAppCompatAlertDialog().findViewById(android.R.id.message);
+    assertThat(message.getText().toString())
+        .isEqualTo(
+            "This device cannot decrypt 1 pending log file (of 1):\n"
+                + "• corrupt_log.bin: Corrupt file\n\n"
+                + "Changing the key leaves it encrypted to the key it was written with, so"
+                + " whoever holds that key's private key can still read it. Keep all pending"
+                + " logs queued for upload to your destination, discard them, or cancel the key"
+                + " change?");
+  }
+
+  @Test
+  public void onClearActiveKey_whenCopyFails_asksBeforeChangingKey() throws Exception {
+    File logFile = createPendingLogFile("test_log_unreachable.bin");
+    launchActivity();
+    chooseUploadAsIs();
 
     returnFromFolderPicker(Activity.RESULT_OK, new Intent().setData(UNREACHABLE_FOLDER_URI));
 
-    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
     verify(mockAuditLogger)
         .logEvent(
             "LOGS_COPY_BEFORE_KEY_CHANGE_FAILED",
@@ -1818,7 +2018,7 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenCopyFailsAndUserConfirms_changesKeyAndKeepsLogs()
+  public void onClearActiveKey_whenCopyFailsAndUserConfirms_changesKeyAndKeepsLogs()
       throws Exception {
     File logFile = createPendingLogFile("test_log_not_copied.bin");
     launchActivity();
@@ -1828,20 +2028,19 @@ public class CrumblesManageExternalKeysActivityTest {
     getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
     ShadowLooper.idleMainLooper();
 
-    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockPublicKeyManager).saveActiveExternalPublicKey(isNull());
     assertThat(logFile.exists()).isTrue();
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenChosenLocationIsNotAFolder_keepsKeyAndLogs()
-      throws Exception {
+  public void onClearActiveKey_whenChosenLocationIsNotAFolder_keepsKeyAndLogs() throws Exception {
     File logFile = createPendingLogFile("test_log_not_a_folder.bin");
     launchActivity();
     chooseUploadAsIs();
 
     returnFromFolderPicker(Activity.RESULT_OK, new Intent().setData(NOT_A_FOLDER_URI));
 
-    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
     verify(mockAuditLogger)
         .logEvent(
             "LOGS_COPY_BEFORE_KEY_CHANGE_FAILED",
@@ -1850,12 +2049,11 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenNoFolderPickerInstalled_asksBeforeChangingKey()
+  public void onClearActiveKey_whenNoFolderPickerInstalled_asksBeforeChangingKey()
       throws Exception {
     File logFile = createPendingLogFile("test_log_no_picker.bin");
     launchActivity();
-    clickGenerateKeystoreKey();
-    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+    clickAndConfirmClearActiveKey();
     shadowOf((Application) appContext).checkActivities(true);
 
     getLatestAppCompatAlertDialog()
@@ -1863,7 +2061,7 @@ public class CrumblesManageExternalKeysActivityTest {
         .performItemClick(/* view= */ null, /* position= */ 1, /* id= */ 1);
     ShadowLooper.idleMainLooper();
 
-    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
     verify(mockAuditLogger)
         .logEvent(
             "LOGS_COPY_BEFORE_KEY_CHANGE_FAILED",
@@ -1872,28 +2070,26 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
-  public void onGenerateKeystoreKey_whenRecreatedWhileFolderPickerOpen_keepsKeyAndLogs()
+  public void onClearActiveKey_whenRecreatedWhileFolderPickerOpen_keepsKeyAndLogs()
       throws Exception {
     File logFile = createPendingLogFile("test_log_recreated.bin");
     Robolectric.buildContentProvider(FakeFolderProvider.class).create(FOLDER_AUTHORITY);
     launchActivity();
     chooseUploadAsIs();
     AtomicReference<Intent> pickerIntentRef = new AtomicReference<>();
-    scenario.onActivity(
-        activity ->
-            pickerIntentRef.set(shadowOf(activity).getNextStartedActivityForResult().intent));
+    scenario.onActivity(activity ->
+        pickerIntentRef.set(shadowOf(activity).getNextStartedActivityForResult().intent));
 
     scenario.recreate();
-    scenario.onActivity(
-        activity -> {
-          activity.setPublicKeyManagerForTest(mockPublicKeyManager);
-          shadowOf(activity)
-              .receiveResult(
-                  pickerIntentRef.get(), Activity.RESULT_OK, new Intent().setData(FOLDER_URI));
-        });
+    scenario.onActivity(activity -> {
+      activity.setPublicKeyManagerForTest(mockPublicKeyManager);
+      shadowOf(activity)
+          .receiveResult(
+              pickerIntentRef.get(), Activity.RESULT_OK, new Intent().setData(FOLDER_URI));
+    });
     ShadowLooper.idleMainLooper();
 
-    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
     expect.that(logFile.exists()).isTrue();
   }
 
@@ -1974,6 +2170,700 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
+  public void onGenerateKeystoreKey_whenAPendingLogIsUnreadable_offersNoUploadAsIs()
+      throws Exception {
+    startKeystoreKeyChangeWithUnreadableFile(
+        createPendingLogFile("unreadable.bin"), new byte[] {1, 2, 3});
+
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+    expect
+        .that(warning.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_discard_unreadable_logs));
+    expect
+        .that(warning.getButton(AlertDialog.BUTTON_NEUTRAL).getText().toString())
+        .isEqualTo("Discard Logs");
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenAPendingLogIsUnreadable_reEncryptsTheOthersAndDiscardsIt()
+      throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    File unreadableFile = createPendingLogFile("unreadable.bin");
+    startKeystoreKeyChangeWithUnreadableFile(unreadableFile, plaintext);
+
+    chooseDiscardUnreadableLogs();
+
+    InOrder inOrder = inOrder(mockLogsEncryptor);
+    inOrder.verify(mockLogsEncryptor).generateKeyPair();
+    inOrder.verify(mockLogsEncryptor, times(2)).encryptLogsAttributedTo(any(), any(), isNull());
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+    expect.that(unreadableFile.exists()).isFalse();
+    expect.that(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onDecryptionWarning_whenNoPendingLogIsReadable_discardsThemAndChangesTheKey()
+      throws Exception {
+    File logFile = createPendingLogFile("corrupt_log.bin");
+    when(mockLogsEncryptor.deserializeFile(any())).thenThrow(new RuntimeException("Corrupt file"));
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    assertThat(logFile.exists()).isFalse();
+  }
+
+  @Test
+  public void onDecryptionWarning_whenUnreadableLogsDiscardedAfterStop_keepsTheKey()
+      throws Exception {
+    startKeystoreKeyChangeWithUnreadableFile(
+        createPendingLogFile("unreadable.bin"), new byte[] {1, 2, 3});
+    scenario.moveToState(Lifecycle.State.CREATED);
+    scenario.moveToState(Lifecycle.State.RESUMED);
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verify(mockAuditLogger)
+        .logEvent(
+            "KEY_CHANGE_REFUSED",
+            "Key unchanged: decrypted logs were cleared before key change completed.");
+  }
+
+  @Test
+  public void onDecryptionWarning_whenStoppedWhileDiscarding_wipesDecryptedLogsAndKeepsTheKey()
+      throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    startKeystoreKeyChangeWithUnreadableFile(createPendingLogFile("unreadable.bin"), plaintext);
+    List<Runnable> tasks = new ArrayList<>();
+    scenario.onActivity(activity -> activity.setKeyGenerationExecutorForTest(tasks::add));
+    chooseDiscardUnreadableLogs();
+    scenario.moveToState(Lifecycle.State.CREATED);
+
+    tasks.forEach(Runnable::run);
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor, never()).generateKeyPair();
+    assertThat(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onDecryptionWarning_whenDiscardLogsChosen_discardsAllWithoutReEncrypting()
+      throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    startKeystoreKeyChangeWithUnreadableFile(createPendingLogFile("unreadable.bin"), plaintext);
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_NEUTRAL).performClick();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockLogsEncryptor, never()).encryptLogsAttributedTo(any(), any(), any());
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "3 pending log file(s) discarded prior to key rotation.");
+    assertThat(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onDecryptionWarning_whenDiscardLogsChosen_discardsTheLogsCollectedBeforeTheUnlock()
+      throws Exception {
+    File batchesCollectedBeforeUnlock =
+        new File(
+            appContext.createDeviceProtectedStorageContext().getFilesDir(), "logs_before_unlock");
+    // A directory in place of the batch keeps it waiting: it cannot be read to be saved.
+    File waitingBatch = new File(batchesCollectedBeforeUnlock, "0000000000000000000.bin");
+    assertThat(waitingBatch.mkdirs()).isTrue();
+    File sealedChain = new File(batchesCollectedBeforeUnlock, "0000000000000000000.chain");
+    assertThat(sealedChain.createNewFile()).isTrue();
+    startKeystoreKeyChangeWithUnreadableFile(
+        createPendingLogFile("unreadable.bin"), new byte[] {1, 2, 3});
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_NEUTRAL).performClick();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "4 pending log file(s) discarded prior to key rotation.");
+    expect.that(waitingBatch.exists()).isFalse();
+    expect.that(sealedChain.exists()).isFalse();
+  }
+
+  @Test
+  public void onDecryptionWarning_whenCancelClicked_wipesDecryptedLogs() throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    startKeystoreKeyChangeWithUnreadableFile(createPendingLogFile("unreadable.bin"), plaintext);
+
+    getLatestAppCompatAlertDialog().getButton(DialogInterface.BUTTON_NEGATIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor, never()).generateKeyPair();
+    assertThat(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onDecryptionWarning_whenDismissedWithBack_wipesDecryptedLogs() throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    startKeystoreKeyChangeWithUnreadableFile(createPendingLogFile("unreadable.bin"), plaintext);
+
+    getLatestAppCompatAlertDialog().cancel();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor, never()).generateKeyPair();
+    assertThat(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  /**
+   * Starts a Keystore key change while two pending batches decrypt to {@code plaintext} and {@code
+   * unreadableFile} cannot be read, which opens the decryption warning.
+   */
+  private void startKeystoreKeyChangeWithUnreadableFile(File unreadableFile, byte[] plaintext)
+      throws Exception {
+    givenPendingBatchDecryptingTo(plaintext);
+    assertThat(createPendingLogFile("second_batch.bin").exists()).isTrue();
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenAnswer(invocation -> {
+          if (invocation.getArgument(0).equals(unreadableFile.toPath())) {
+            throw new RuntimeException("Corrupt file");
+          }
+          return LogBatch.newBuilder().build();
+        });
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+  }
+
+  /** Picks "Discard Unreadable Logs" in the warning that some pending logs failed to decrypt. */
+  private void chooseDiscardUnreadableLogs() {
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenOnlyExternalKeyBatchesFail_offersToKeepThemQueued()
+      throws Exception {
+    assertThat(createPendingLogFile("external_key_batch.bin").exists()).isTrue();
+    startKeystoreKeyChangeWithExternalKeySelected(new byte[] {1, 2, 3});
+
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+
+    expect
+        .that(warning.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+    expect
+        .that(latestDialogMessage())
+        .endsWith(
+            appContext.getString(R.string.dialog_message_logs_kept_before_keystore_key_change));
+  }
+
+  @Test
+  public void onDecryptionWarning_whenKeepQueuedChosen_keepsExternalKeyBatchesAndReEncryptsOthers()
+      throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    File externalKeyBatch = createPendingLogFile("external_key_batch.bin");
+    startKeystoreKeyChangeWithExternalKeySelected(plaintext);
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    InOrder inOrder = inOrder(mockLogsEncryptor);
+    inOrder.verify(mockLogsEncryptor).generateKeyPair();
+    inOrder.verify(mockLogsEncryptor).encryptLogsAttributedTo(any(), any(), isNull());
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "1 of 2 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    verify(mockAuditLogger, never()).logEvent(eq("LOGS_DISCARDED"), any());
+    expect
+        .that(new String(Files.readAllBytes(externalKeyBatch.toPath()), UTF_8))
+        .isEqualTo(LOG_CONTENT);
+    expect.that(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onDecryptionWarning_whenDiscardUnreadableChosen_keepsExternalKeyBatchesQueued()
+      throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    File replacedKeyBatch = createPendingLogFile("replaced_key_batch.bin");
+    File externalKeyBatch = createPendingLogFile("external_key_batch.bin");
+    startKeystoreKeyChangeWithExternalKeySelected(plaintext);
+    String warningMessage = latestDialogMessage();
+
+    chooseDiscardUnreadableLogs();
+
+    expect
+        .that(warningMessage)
+        .endsWith(
+            appContext
+                .getResources()
+                .getQuantityString(
+                    R.plurals.dialog_message_some_logs_kept_before_keystore_key_change, 1, 1));
+    verify(mockLogsEncryptor).encryptLogsAttributedTo(any(), any(), isNull());
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "1 of 3 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    expect.that(replacedKeyBatch.exists()).isFalse();
+    expect
+        .that(new String(Files.readAllBytes(externalKeyBatch.toPath()), UTF_8))
+        .isEqualTo(LOG_CONTENT);
+    expect.that(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onDecryptionWarning_withoutExternalKey_discardsBatchesThatNoKeyDecrypts()
+      throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    givenBatchesForBuiltInAndExternalKeys(plaintext);
+    assertThat(createPendingLogFile("built_in_key_batch.bin").exists()).isTrue();
+    // With no external key ever set, a batch without a batch-wrapped key is for a built-in key.
+    File olderKeyBatch = createPendingLogFile("older_key_batch.bin");
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockLogsEncryptor).encryptLogsAttributedTo(any(), any(), isNull());
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+    verify(mockAuditLogger, never())
+        .logEvent(
+            eq(CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE),
+            any());
+    expect.that(olderKeyBatch.exists()).isFalse();
+    expect.that(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_afterAnExternalKeyWasCleared_offersToKeepItsBatchesQueued()
+      throws Exception {
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    Security.insertProviderAt(new FakeAndroidKeyStoreProvider(), 1);
+    FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+    ReflectionHelpers.setStaticField(CrumblesDataStoreHolder.class, "instance", null);
+    try {
+      // Clearing an external key keeps it saved, as batches written while it was active can wait.
+      CrumblesDataStoreHolder.getInstance(appContext)
+          .updateDataAsync(prefs ->
+              prefs.toBuilder()
+                  .putExternalPublicKeys("cleared_key", EncryptedPayload.getDefaultInstance())
+                  .build())
+          .get();
+      givenBatchesForBuiltInAndExternalKeys(new byte[] {1, 2, 3});
+      assertThat(createPendingLogFile("built_in_key_batch.bin").exists()).isTrue();
+      assertThat(createPendingLogFile("external_key_batch.bin").exists()).isTrue();
+      launchActivity();
+      clickAndConfirmKeystoreKey();
+
+      Button positiveButton =
+          getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE);
+
+      assertThat(positiveButton.getText().toString())
+          .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+    } finally {
+      if (scenario != null) {
+        scenario.close();
+        scenario = null;
+      }
+      ReflectionHelpers.setStaticField(CrumblesDataStoreHolder.class, "instance", null);
+      FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+      Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    }
+  }
+
+  @Test
+  public void onClearActiveKey_withoutBuiltInKey_keepsExternalKeyBatchesQueued() throws Exception {
+    givenBatchesForBuiltInAndExternalKeys(new byte[0]);
+    File firstBatch = createPendingLogFile("external_key_batch_1.bin");
+    File secondBatch = createPendingLogFile("external_key_batch_2.bin");
+    when(mockPublicKeyManager.isExternalKeySelected()).thenReturn(true);
+    launchActivity();
+    clickClearActiveKey();
+    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+    String warningMessage = latestDialogMessage();
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    expect
+        .that(warningMessage)
+        .startsWith("This device cannot decrypt 2 pending log files (of 2):");
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "2 of 2 pending log file(s) could not be decrypted on this device; all were kept"
+                + " queued for upload before key rotation.");
+    expect.that(new String(Files.readAllBytes(firstBatch.toPath()), UTF_8)).isEqualTo(LOG_CONTENT);
+    expect
+        .that(new String(Files.readAllBytes(secondBatch.toPath()), UTF_8))
+        .isEqualTo(LOG_CONTENT);
+  }
+
+  /**
+   * Makes the pending files whose names contain "built_in" batches for the built-in key, which
+   * decrypt to {@code plaintext}, those whose names contain "replaced_key" batches for a built-in
+   * key that was replaced, and the others batches without a batch-wrapped key, as for an external
+   * key. Only batches for a built-in key carry one, and this device decrypts only those for the
+   * current built-in key.
+   */
+  private void givenBatchesForBuiltInAndExternalKeys(byte[] plaintext) throws Exception {
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenAnswer(invocation -> {
+          String path = invocation.getArgument(0).toString();
+          LogKey.Builder key = LogKey.newBuilder();
+          if (path.contains("built_in")) {
+            key.setBatchWrapKeyId(CURRENT_BATCH_WRAP_KEY_ID);
+          } else if (path.contains("replaced_key")) {
+            key.setBatchWrapKeyId(REPLACED_BATCH_WRAP_KEY_ID);
+          }
+          return LogBatch.newBuilder().setKey(key).build();
+        });
+    when(mockLogsEncryptor.decryptLogBatch(any()))
+        .thenAnswer(invocation -> {
+          LogBatch logBatch = invocation.getArgument(0);
+          if (!logBatch.getKey().getBatchWrapKeyId().equals(CURRENT_BATCH_WRAP_KEY_ID)) {
+            throw new CrumblesLogsDecryptionException("Keys did not match");
+          }
+          return decrypted(plaintext);
+        });
+    when(mockLogsEncryptor.encryptLogsAttributedTo(any(), any(), any()))
+        .thenReturn(LogBatch.getDefaultInstance());
+  }
+
+  /**
+   * Starts generating a new Keystore key while an external key is selected, with a pending batch
+   * for the built-in key that decrypts to {@code plaintext} besides the pending files created
+   * before.
+   */
+  private void startKeystoreKeyChangeWithExternalKeySelected(byte[] plaintext) throws Exception {
+    givenBatchesForBuiltInAndExternalKeys(plaintext);
+    assertThat(createPendingLogFile("built_in_key_batch.bin").exists()).isTrue();
+    when(mockPublicKeyManager.isExternalKeySelected()).thenReturn(true);
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+  }
+
+  @Test
+  public void
+      onGenerateKeystoreKey_withExternalKeyActive_doesNotTryBuiltInKeyOnExternalKeySizeBatches()
+          throws Exception {
+    File externalKeyBatch = createPendingLogFile("external_key_batch.bin");
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenReturn(
+            batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 256));
+    doAnswer(
+            invocation -> {
+              List<LogBatch> batches = invocation.getArgument(0);
+              Predicate<LogBatch> mayBeForAnExternalKey = invocation.getArgument(1);
+              ImmutableList<LogBatch> undecryptable =
+                  batches.stream().filter(mayBeForAnExternalKey).collect(toImmutableList());
+              ImmutableList<LogBatch> rsaOnly =
+                  batches.stream()
+                      .filter(mayBeForAnExternalKey.negate())
+                      .collect(toImmutableList());
+              return new BulkDecryptPartition(ImmutableList.of(), rsaOnly, undecryptable);
+            })
+        .when(mockLogsEncryptor)
+        .partitionForKeyChange(any(), any());
+    givenExternalKeyActive();
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+    String positiveLabel = warning.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString();
+    warning.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor, never()).decryptLogBatch(any());
+    verify(mockAuditLogger, never()).logEvent(eq("LOGS_DISCARDED"), any());
+    expect
+        .that(positiveLabel)
+        .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+    expect
+        .that(new String(Files.readAllBytes(externalKeyBatch.toPath()), UTF_8))
+        .isEqualTo(LOG_CONTENT);
+  }
+
+  @Test
+  public void
+      onGenerateKeystoreKey_withExternalKeyActive_triesBuiltInKeyOnPkcs1AndUnmatchedSizeBatches()
+          throws Exception {
+    byte[] plaintext = {1, 2, 3};
+    var unusedPkcs1Batch = createPendingLogFile("pkcs1_batch.bin");
+    var unusedUnmatchedSizeBatch = createPendingLogFile("unmatched_size_batch.bin");
+    when(mockLogsEncryptor.decryptLogBatch(any())).thenReturn(decrypted(plaintext));
+    when(mockLogsEncryptor.encryptLogsAttributedTo(any(), any(), any()))
+        .thenReturn(LogBatch.getDefaultInstance());
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenAnswer(invocation ->
+            invocation.getArgument(0).toString().contains("pkcs1")
+                ? batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC, 256)
+                : batchWithoutBatchWrapKeyId(
+                    KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 384));
+    doAnswer(
+            invocation -> {
+              List<LogBatch> batches = invocation.getArgument(0);
+              Predicate<LogBatch> mayBeForAnExternalKey = invocation.getArgument(1);
+              ImmutableList<LogBatch> undecryptable =
+                  batches.stream().filter(mayBeForAnExternalKey).collect(toImmutableList());
+              ImmutableList<LogBatch> rsaOnly =
+                  batches.stream()
+                      .filter(mayBeForAnExternalKey.negate())
+                      .collect(toImmutableList());
+              return new BulkDecryptPartition(ImmutableList.of(), rsaOnly, undecryptable);
+            })
+        .when(mockLogsEncryptor)
+        .partitionForKeyChange(any(), any());
+    givenExternalKeyActive();
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    chooseReEncrypt();
+
+    verify(mockLogsEncryptor, times(2)).decryptLogBatch(any());
+    verify(mockLogsEncryptor, times(2)).encryptLogsAttributedTo(any(), any(), isNull());
+    verify(mockAuditLogger, never())
+        .logEvent(
+            eq(CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE),
+            any());
+    expect.that(plaintext).isEqualTo(new byte[plaintext.length]);
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenItsPromptIsCancelled_keepsBatchOfExternalKeySizeQueued()
+      throws Exception {
+    File batch = createPendingLogFile("batch_without_key_id.bin");
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenReturn(
+            batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 256));
+    when(mockLogsEncryptor.isKeystoreKeyBoundToEachOperation()).thenReturn(true);
+    when(mockLogsEncryptor.createUnwrapCipher(any()))
+        .thenReturn(Cipher.getInstance("AES/CBC/NoPadding"));
+    givenExternalKeyActive();
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+    ShadowBiometricPrompt.authenticateCurrentSessionWithError(
+        BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED, "Authentication canceled");
+    ShadowLooper.idleMainLooper();
+
+    Button positiveButton = getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE);
+    String positiveButtonLabel = positiveButton.getText().toString();
+    positiveButton.performClick();
+    ShadowLooper.idleMainLooper();
+
+    expect
+        .that(positiveButtonLabel)
+        .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "1 of 1 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    verify(mockAuditLogger, never()).logEvent(eq("LOGS_DISCARDED"), any());
+    expect.that(new String(Files.readAllBytes(batch.toPath()), UTF_8)).isEqualTo(LOG_CONTENT);
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_whenItsPromptIsCancelled_offersToDiscardUnmatchedSizeBatch()
+      throws Exception {
+    File batch = createPendingLogFile("batch_other_size.bin");
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenReturn(
+            batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 384));
+    when(mockLogsEncryptor.isKeystoreKeyBoundToEachOperation()).thenReturn(true);
+    when(mockLogsEncryptor.createUnwrapCipher(any()))
+        .thenReturn(Cipher.getInstance("AES/CBC/NoPadding"));
+    givenExternalKeyActive();
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+    ShadowBiometricPrompt.authenticateCurrentSessionWithError(
+        BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED, "Authentication canceled");
+    ShadowLooper.idleMainLooper();
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+    verify(mockAuditLogger, never())
+        .logEvent(
+            eq(CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE),
+            any());
+    expect.that(batch.exists()).isFalse();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_withUnusableBuiltInKey_keepsBatchOfExternalKeySizeQueued()
+      throws Exception {
+    File batch = createPendingLogFile("batch_without_key_id.bin");
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenReturn(
+            batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 256));
+    when(mockLogsEncryptor.decryptLogBatch(any()))
+        .thenThrow(new CrumblesKeysException("Private key not available in Keystore."));
+    givenExternalKeyActive();
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    Button positiveButton = getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE);
+    String positiveButtonLabel = positiveButton.getText().toString();
+    positiveButton.performClick();
+    ShadowLooper.idleMainLooper();
+
+    expect
+        .that(positiveButtonLabel)
+        .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "1 of 1 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    verify(mockAuditLogger, never()).logEvent(eq("LOGS_DISCARDED"), any());
+    expect.that(new String(Files.readAllBytes(batch.toPath()), UTF_8)).isEqualTo(LOG_CONTENT);
+  }
+
+  @Test
+  public void
+      onGenerateKeystoreKey_withUnusableBuiltInKey_offersToDiscardBatchNotMatchingExternalKeySize()
+          throws Exception {
+    File batch = createPendingLogFile("batch_other_size.bin");
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenReturn(
+            batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 384));
+    when(mockLogsEncryptor.decryptLogBatch(any()))
+        .thenThrow(new CrumblesKeysException("Private key not available in Keystore."));
+    givenExternalKeyActive();
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+    verify(mockAuditLogger, never())
+        .logEvent(
+            eq(CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE),
+            any());
+    expect.that(batch.exists()).isFalse();
+  }
+
+  @Test
+  public void onDecryptionWarning_keepsOnlyBatchesWithoutKeyIdThatASavedExternalKeyMayRead()
+      throws Exception {
+    File olderKeyBatch = createPendingLogFile("older_key_batch.bin");
+    File pkcs1Batch = createPendingLogFile("pkcs1_batch.bin");
+    File externalKeyBatch = createPendingLogFile("external_key_batch.bin");
+    // The only saved external key wraps keys to 256 bytes, with RSA-OAEP as every external key.
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenAnswer(invocation -> {
+          String path = invocation.getArgument(0).toString();
+          if (path.contains("older_key")) {
+            return batchWithoutBatchWrapKeyId(
+                KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 384);
+          }
+          if (path.contains("pkcs1")) {
+            return batchWithoutBatchWrapKeyId(
+                KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC, 256);
+          }
+          return batchWithoutBatchWrapKeyId(
+              KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 256);
+        });
+    when(mockLogsEncryptor.decryptLogBatch(any()))
+        .thenThrow(new CrumblesLogsDecryptionException("Keys did not match"));
+    givenExternalKeyActive();
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "2 pending log file(s) discarded prior to key rotation.");
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "1 of 3 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    expect.that(olderKeyBatch.exists()).isFalse();
+    expect.that(pkcs1Batch.exists()).isFalse();
+    expect
+        .that(new String(Files.readAllBytes(externalKeyBatch.toPath()), UTF_8))
+        .isEqualTo(LOG_CONTENT);
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_withExternalKeyActive_reEncryptsBatchWithoutBatchKeys()
+      throws Exception {
+    Security.insertProviderAt(new FakeAndroidKeyStoreProvider(), 1);
+    try {
+      CrumblesLogsEncryptor realEncryptor = new CrumblesLogsEncryptor();
+      realEncryptor.generateKeyPair();
+      CrumblesBatchKeyStore.deleteKeys();
+      File batch = createPendingLogFile("built_in_key_batch.bin");
+      var unused =
+          realEncryptor.serializeBytes(
+              realEncryptor.encryptLogs(new byte[] {1}, null),
+              batch.getParentFile(),
+              batch.getName());
+      givenExternalKeyActive();
+      CrumblesMain.setLogsEncryptorInstanceForTest(realEncryptor);
+      launchActivity();
+      clickAndConfirmKeystoreKey();
+      ShadowLooper.idleMainLooper();
+      FakeAndroidKeyStoreSpi.authorizeLatestPendingCipher();
+      ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
+      ShadowLooper.idleMainLooper();
+
+      chooseReEncrypt();
+
+      LogBatch reEncryptedBatch = realEncryptor.deserializeFile(batch.toPath());
+      Cipher unwrapCipher = realEncryptor.createUnwrapCipher(reEncryptedBatch);
+      FakeAndroidKeyStoreSpi.authorizeLatestPendingCipher();
+      expect
+          .that(realEncryptor.decryptLogs(reEncryptedBatch, unwrapCipher))
+          .isEqualTo(new byte[] {1});
+      verify(mockAuditLogger, never())
+          .logEvent(
+              eq(CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE),
+              any());
+    } finally {
+      CrumblesBatchKeyStore.deleteKeys();
+      FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+      Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    }
+  }
+
+  /** Makes {@code testPublicKey}, whose modulus has 256 bytes, the only saved external key. */
+  private void givenExternalKeyActive() throws CrumblesKeysException {
+    when(mockPublicKeyManager.isExternalKeySelected()).thenReturn(true);
+    when(mockPublicKeyManager.getSavedExternalPublicKeys())
+        .thenReturn(ImmutableList.of(testPublicKey));
+  }
+
+  /**
+   * Returns a batch as earlier versions wrote for an external key, or for a built-in key without
+   * batch-unwrap keys: with no batch-wrap key id, and a symmetric key wrapped with {@code
+   * keyEncryptionType} to {@code wrappedKeyBytes} bytes.
+   */
+  private static LogBatch batchWithoutBatchWrapKeyId(
+      KeyEncryptionType keyEncryptionType, int wrappedKeyBytes) {
+    return LogBatch.newBuilder()
+        .setKey(
+            LogKey.newBuilder()
+                .setKeyEncryptionType(keyEncryptionType)
+                .setEncryptedSymmetricKey(ByteString.copyFrom(new byte[wrappedKeyBytes])))
+        .build();
+  }
+
+  @Test
   public void onGenerateKeystoreKey_whenDecryptionPromptIsCancelled_keepsKeyAndRecordsFailure()
       throws Exception {
     // Given: A pending log file exists, and the time window of the key is closed.
@@ -2011,15 +2901,33 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
+  public void onGenerateKeystoreKey_whenAPromptOfItsOwnIsCancelled_asksAboutTheLogsLeft()
+      throws Exception {
+    var unusedFirstFile = createPendingLogFile("own_prompt_first.bin");
+    var unusedSecondFile = createPendingLogFile("own_prompt_second.bin");
+    when(mockLogsEncryptor.isKeystoreKeyBoundToEachOperation()).thenReturn(true);
+    when(mockLogsEncryptor.createUnwrapCipher(any()))
+        .thenReturn(Cipher.getInstance("AES/CBC/NoPadding"));
+    launchActivity();
+    clickAndConfirmKeystoreKey();
+
+    ShadowBiometricPrompt.authenticateCurrentSessionWithError(
+        BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED, "Authentication canceled");
+    ShadowLooper.idleMainLooper();
+
+    verify(mockAuditLogger, never()).logEvent(eq("KEY_CHANGE_AUTH_FAILED"), anyString());
+    expect.that(latestDialogMessage()).startsWith("Failed to decrypt 2 out of 2");
+  }
+
+  @Test
   public void onActivityResult_whenCredentialConfirmedWithoutPendingChange_keepsKeys()
       throws Exception {
     launchActivity();
 
-    scenario.onActivity(
-        activity -> {
-          activity.onSaveInstanceState(new Bundle());
-          activity.findViewById(R.id.btn_clear_active_external_key).performClick();
-        });
+    scenario.onActivity(activity -> {
+      activity.onSaveInstanceState(new Bundle());
+      activity.findViewById(R.id.btn_clear_active_external_key).performClick();
+    });
     ShadowLooper.idleMainLooper();
 
     verify(mockPublicKeyManager, never()).saveActiveExternalPublicKey(any());
@@ -2042,12 +2950,11 @@ public class CrumblesManageExternalKeysActivityTest {
     launchActivity();
 
     // When: getPendingLogFiles is called.
-    scenario.onActivity(
-        activity -> {
-          ImmutableList<File> pending = activity.getPendingLogFiles();
-          // Then: Returns empty list because logsPath is a file, not a directory.
-          assertThat(pending).isEmpty();
-        });
+    scenario.onActivity(activity -> {
+      ImmutableList<File> pending = activity.getPendingLogFiles();
+      // Then: Returns empty list because logsPath is a file, not a directory.
+      assertThat(pending).isEmpty();
+    });
 
     logsPath.delete();
   }
@@ -2063,8 +2970,7 @@ public class CrumblesManageExternalKeysActivityTest {
     File validFile = new File(logsDir, "valid_log.bin");
     File txtFile = new File(logsDir, "log.txt");
     File sentFile = new File(logsDir, "sent_log" + CrumblesConstants.SENT_SUFFIX);
-    File processingFile =
-        new File(logsDir, "processing_log" + CrumblesConstants.PROCESSING_SUFFIX);
+    File processingFile = new File(logsDir, "processing_log" + CrumblesConstants.PROCESSING_SUFFIX);
     validFile.createNewFile();
     txtFile.createNewFile();
     sentFile.createNewFile();
@@ -2073,14 +2979,13 @@ public class CrumblesManageExternalKeysActivityTest {
     launchActivity();
 
     // When: getPendingLogFiles is called.
-    scenario.onActivity(
-        activity -> {
-          ImmutableList<File> pending = activity.getPendingLogFiles();
-          // Then: Only valid_log.bin is included; .txt, .sent.bin, and .processing.bin are
-          // filtered out.
-          assertThat(pending).hasSize(1);
-          assertThat(pending.get(0).getName()).isEqualTo("valid_log.bin");
-        });
+    scenario.onActivity(activity -> {
+      ImmutableList<File> pending = activity.getPendingLogFiles();
+      // Then: Only valid_log.bin is included; .txt, .sent.bin, and .processing.bin are
+      // filtered out.
+      assertThat(pending).hasSize(1);
+      assertThat(pending.get(0).getName()).isEqualTo("valid_log.bin");
+    });
 
     validFile.delete();
     txtFile.delete();
@@ -2272,15 +3177,12 @@ public class CrumblesManageExternalKeysActivityTest {
     Intent scanResult =
         new Intent().putExtra(CrumblesConstants.SCAN_RESULT_EXTRA, THEATRE_TICKET_QR_PAYLOAD);
 
-    scenario.onActivity(
-        activity -> {
-          activity.findViewById(R.id.btn_import_external_public_key_qr).performClick();
-          ShadowActivity shadowActivity = shadowOf(activity);
-          shadowActivity.receiveResult(
-              shadowActivity.getNextStartedActivityForResult().intent,
-              Activity.RESULT_OK,
-              scanResult);
-        });
+    scenario.onActivity(activity -> {
+      activity.findViewById(R.id.btn_import_external_public_key_qr).performClick();
+      ShadowActivity shadowActivity = shadowOf(activity);
+      shadowActivity.receiveResult(
+          shadowActivity.getNextStartedActivityForResult().intent, Activity.RESULT_OK, scanResult);
+    });
     ShadowLooper.idleMainLooper();
 
     expect
@@ -2614,18 +3516,27 @@ public class CrumblesManageExternalKeysActivityTest {
     ShadowLooper.idleMainLooper();
   }
 
+  /** Starts clearing the external key, a change that keeps the built-in key. */
+  private void clickAndConfirmClearActiveKey() {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    clickClearActiveKey();
+    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+  }
+
   /** Confirms the device credential prompt that every key change opens first. */
   private static void confirmCredential(Activity activity) {
     answerCredentialPrompt(activity, Activity.RESULT_OK);
   }
 
   private static void answerCredentialPrompt(Activity activity, int resultCode) {
-    Fragment promptFragment =
-        ((AppCompatActivity) activity)
-            .getSupportFragmentManager()
-            .findFragmentByTag("androidx.biometric.internal.BiometricFragment");
-    if (promptFragment != null) {
-      ((LifecycleRegistry) promptFragment.getLifecycle()).setCurrentState(Lifecycle.State.STARTED);
+    // androidx.biometric delivers the result to its prompt fragment only once the fragment is
+    // started, which it is not in an activity that was only created. Versions of the library tag
+    // the fragment differently, so it is found by its class name.
+    for (Fragment fragment :
+        ((AppCompatActivity) activity).getSupportFragmentManager().getFragments()) {
+      if (fragment.getClass().getSimpleName().equals("BiometricFragment")) {
+        ((LifecycleRegistry) fragment.getLifecycle()).setCurrentState(Lifecycle.State.STARTED);
+      }
     }
     if (resultCode == Activity.RESULT_OK) {
       ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
@@ -2661,14 +3572,13 @@ public class CrumblesManageExternalKeysActivityTest {
 
   /** Feeds a Base64 public key through the QR scan result handler. */
   private void processScannedKey(String scannedKeyBase64) {
-    scenario.onActivity(
-        activity -> {
-          try {
-            activity.processScannedPublicKeyInternal(scannedKeyBase64);
-          } catch (CrumblesKeysException e) {
-            throw new AssertionError("Processing a valid scanned key should not fail.", e);
-          }
-        });
+    scenario.onActivity(activity -> {
+      try {
+        activity.processScannedPublicKeyInternal(scannedKeyBase64);
+      } catch (CrumblesKeysException e) {
+        throw new AssertionError("Processing a valid scanned key should not fail.", e);
+      }
+    });
     ShadowLooper.idleMainLooper();
   }
 
@@ -2679,25 +3589,24 @@ public class CrumblesManageExternalKeysActivityTest {
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
     launchActivity();
 
-    scenario.onActivity(
-        activity -> {
-          activity.updateStatusUi();
-          TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
-          Button clearBtn = activity.findViewById(R.id.btn_clear_active_external_key);
-          expect
-              .that(tvStatus.getText().toString())
-              .isEqualTo(appContext.getString(R.string.status_external_key_unreadable));
-          expect.that(clearBtn.getVisibility()).isEqualTo(View.VISIBLE);
-          expect
-              .that(clearBtn.getText().toString())
-              .isEqualTo(appContext.getString(R.string.btn_choose_key_clear_sentinel));
+    scenario.onActivity(activity -> {
+      activity.updateStatusUi();
+      TextView tvStatus = activity.findViewById(R.id.tv_current_external_key_status);
+      Button clearBtn = activity.findViewById(R.id.btn_clear_active_external_key);
+      expect
+          .that(tvStatus.getText().toString())
+          .isEqualTo(appContext.getString(R.string.status_external_key_unreadable));
+      expect.that(clearBtn.getVisibility()).isEqualTo(View.VISIBLE);
+      expect
+          .that(clearBtn.getText().toString())
+          .isEqualTo(appContext.getString(R.string.btn_choose_key_clear_sentinel));
 
-          when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
-          activity.updateStatusUi();
-          expect
-              .that(clearBtn.getText().toString())
-              .isEqualTo(appContext.getString(R.string.generate_keystore_key_pair_button));
-        });
+      when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+      activity.updateStatusUi();
+      expect
+          .that(clearBtn.getText().toString())
+          .isEqualTo(appContext.getString(R.string.generate_keystore_key_pair_button));
+    });
   }
 
   private ActivityController<CrumblesManageExternalKeysActivity> createCreatedActivity(
@@ -2754,32 +3663,29 @@ public class CrumblesManageExternalKeysActivityTest {
   public void onStop_dismissesPrivateKeyViewerAndWipesKey() {
     launchActivity();
     AtomicReference<TextView> keyTextView = new AtomicReference<>();
-    scenario.onActivity(
-        activity -> {
-          activity.showPrivateKeyViewer(new byte[] {4, 5, 6}, /* showQrInitially= */ false);
-          activity.getSupportFragmentManager().executePendingTransactions();
-        });
+    scenario.onActivity(activity -> {
+      activity.showPrivateKeyViewer(new byte[] {4, 5, 6}, /* showQrInitially= */ false);
+      activity.getSupportFragmentManager().executePendingTransactions();
+    });
     ShadowLooper.idleMainLooper();
-    scenario.onActivity(
-        activity -> {
-          DialogFragment viewer =
-              (DialogFragment)
-                  activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
-          expect.that(viewer).isNotNull();
-          expect.that(viewer.requireDialog().isShowing()).isTrue();
-          keyTextView.set(viewer.requireDialog().findViewById(R.id.private_key_text_view));
-          expect.that(keyTextView.get().getText().toString()).isNotEmpty();
-        });
+    scenario.onActivity(activity -> {
+      DialogFragment viewer =
+          (DialogFragment)
+              activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer");
+      expect.that(viewer).isNotNull();
+      expect.that(viewer.requireDialog().isShowing()).isTrue();
+      keyTextView.set(viewer.requireDialog().findViewById(R.id.private_key_text_view));
+      expect.that(keyTextView.get().getText().toString()).isNotEmpty();
+    });
 
     scenario.moveToState(Lifecycle.State.CREATED);
     ShadowLooper.idleMainLooper();
 
     expect.that(keyTextView.get().getText().toString()).isEmpty();
-    scenario.onActivity(
-        activity ->
-            expect
-                .that(activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer"))
-                .isNull());
+    scenario.onActivity(activity ->
+        expect
+            .that(activity.getSupportFragmentManager().findFragmentByTag("private_key_viewer"))
+            .isNull());
   }
 
   @Test
@@ -2844,6 +3750,51 @@ public class CrumblesManageExternalKeysActivityTest {
 
     expect.that(dialog.isShowing()).isFalse();
     expect.that(plaintext).isEqualTo(new byte[] {0, 0, 0});
+    verifyKeyChangeAbandoned();
+  }
+
+  @Test
+  public void onStop_whileDecryptionWarningIsShown_dismissesItAndKeepsKeyAndLogs()
+      throws Exception {
+    File logFile = createPendingLogFile("corrupt_log.bin");
+    when(mockLogsEncryptor.deserializeFile(any())).thenThrow(new RuntimeException("Corrupt file"));
+    launchActivity();
+    clickGenerateKeystoreKey();
+    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+    AlertDialog warningDialog = getLatestAppCompatAlertDialog();
+
+    scenario.moveToState(Lifecycle.State.CREATED);
+    scenario.moveToState(Lifecycle.State.RESUMED);
+    scenario.moveToState(Lifecycle.State.CREATED);
+
+    expect.that(warningDialog.isShowing()).isFalse();
+    expect.that(logFile.exists()).isTrue();
+    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verifyKeyChangeAbandoned();
+  }
+
+  @Test
+  public void onStop_whileAskingToChangeKeyWithLogsNotCopied_dismissesTheQuestionAndKeepsKey()
+      throws Exception {
+    File logFile = createPendingLogFile("test_log_not_copied.bin");
+    launchActivity();
+    chooseUploadAsIs();
+    returnFromFolderPicker(Activity.RESULT_OK, new Intent().setData(UNREACHABLE_FOLDER_URI));
+    AlertDialog notCopiedDialog = getLatestAppCompatAlertDialog();
+
+    scenario.moveToState(Lifecycle.State.CREATED);
+
+    expect.that(notCopiedDialog.isShowing()).isFalse();
+    expect.that(logFile.exists()).isTrue();
+    verify(mockLogsEncryptor, never()).generateKeyPair();
+    verifyKeyChangeAbandoned();
+  }
+
+  private void verifyKeyChangeAbandoned() {
+    verify(mockAuditLogger)
+        .logEvent(
+            "KEY_CHANGE_ABANDONED",
+            "Key unchanged because the screen was left before the change was confirmed.");
   }
 
   @Test
@@ -2868,10 +3819,9 @@ public class CrumblesManageExternalKeysActivityTest {
 
     scenario.onActivity(CrumblesManageExternalKeysActivity::updateStatusUi);
 
-    scenario.onActivity(
-        activity ->
-            assertThat(statusText(activity))
-                .isEqualTo(appContext.getString(R.string.status_no_external_key)));
+    scenario.onActivity(activity ->
+        assertThat(statusText(activity))
+            .isEqualTo(appContext.getString(R.string.status_no_external_key)));
   }
 
   @Test
@@ -2978,7 +3928,9 @@ public class CrumblesManageExternalKeysActivityTest {
     expect.that(getLatestAppCompatAlertDialog()).isSameInstanceAs(progressDialog);
   }
 
+  /** Starts generating a new Keystore key while one exists, a change that deletes it. */
   private void clickAndConfirmKeystoreKey() {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
     clickGenerateKeystoreKey();
     scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
   }
@@ -3027,6 +3979,173 @@ public class CrumblesManageExternalKeysActivityTest {
   }
 
   @Test
+  public void onGenerateKeystoreKey_awayFromAnExternalKey_failsItsBatchesWithoutAPrompt()
+      throws Exception {
+    Security.insertProviderAt(new FakeAndroidKeyStoreProvider(), 1);
+    try {
+      CrumblesLogsEncryptor realEncryptor = new CrumblesLogsEncryptor();
+      PublicKey previousBuiltInKey = realEncryptor.generateKeyPair().getPublic();
+      File logsDir = createPendingLogFile("external_1.bin").getParentFile();
+      for (String name : ImmutableList.of("external_1.bin", "external_2.bin", "external_3.bin")) {
+        var unused =
+            realEncryptor.serializeBytes(
+                realEncryptor.encryptLogs(new byte[] {1}, testPublicKey), logsDir, name);
+      }
+      givenExternalKeyActive();
+      CrumblesMain.setLogsEncryptorInstanceForTest(realEncryptor);
+      launchActivity();
+
+      clickAndConfirmKeystoreKey();
+      ShadowLooper.idleMainLooper();
+      BiometricPrompt prompt = ShadowBiometricPrompt.getCurrentPrompt();
+      String warningMessage = latestDialogMessage();
+      Button positiveButton =
+          getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE);
+      String positiveButtonText = positiveButton.getText().toString();
+
+      positiveButton.performClick();
+      ShadowLooper.idleMainLooper();
+
+      expect.that(prompt).isNull();
+      expect.that(warningMessage).startsWith("Failed to decrypt 3 out of 3");
+      expect
+          .that(positiveButtonText)
+          .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+      expect.that(realEncryptor.getPublicKey()).isNotEqualTo(previousBuiltInKey);
+      for (String name : ImmutableList.of("external_1.bin", "external_2.bin", "external_3.bin")) {
+        expect.that(new File(logsDir, name).exists()).isTrue();
+      }
+    } finally {
+      CrumblesBatchKeyStore.deleteKeys();
+      FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+      Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    }
+  }
+
+  @Test
+  public void
+      onGenerateKeystoreKey_awayFrom3072BitExternalKey_with3072BitBuiltIn_failsWithoutPrompt()
+          throws Exception {
+    Security.insertProviderAt(new FakeAndroidKeyStoreProvider(), 1);
+    FakeAndroidKeyStoreSpi.isStrongBoxSupported = false;
+    try {
+      CrumblesLogsEncryptor realEncryptor = new CrumblesLogsEncryptor();
+      PublicKey previousBuiltInKey = realEncryptor.generateKeyPair().getPublic();
+      PublicKey externalKey = realEncryptor.generateCandidateExternalKeyPair().getPublic();
+      File logsDir = createPendingLogFile("external_1.bin").getParentFile();
+      for (String name : ImmutableList.of("external_1.bin", "external_2.bin", "external_3.bin")) {
+        var unused =
+            realEncryptor.serializeBytes(
+                realEncryptor.encryptLogs(new byte[] {1}, externalKey), logsDir, name);
+      }
+      when(mockPublicKeyManager.isExternalKeySelected()).thenReturn(true);
+      when(mockPublicKeyManager.getSavedExternalPublicKeys())
+          .thenReturn(ImmutableList.of(externalKey));
+      CrumblesMain.setLogsEncryptorInstanceForTest(realEncryptor);
+      launchActivity();
+
+      clickAndConfirmKeystoreKey();
+      ShadowLooper.idleMainLooper();
+      BiometricPrompt prompt = ShadowBiometricPrompt.getCurrentPrompt();
+      String warningMessage = latestDialogMessage();
+      Button positiveButton =
+          getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE);
+      String positiveButtonText = positiveButton.getText().toString();
+
+      positiveButton.performClick();
+      ShadowLooper.idleMainLooper();
+
+      expect.that(prompt).isNull();
+      expect.that(warningMessage).startsWith("Failed to decrypt 3 out of 3");
+      expect
+          .that(positiveButtonText)
+          .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+      expect.that(realEncryptor.getPublicKey()).isNotEqualTo(previousBuiltInKey);
+      verify(mockAuditLogger, never()).logEvent(eq("LOGS_DISCARDED"), any());
+      for (String name : ImmutableList.of("external_1.bin", "external_2.bin", "external_3.bin")) {
+        expect.that(new File(logsDir, name).exists()).isTrue();
+      }
+    } finally {
+      FakeAndroidKeyStoreSpi.isStrongBoxSupported = true;
+      CrumblesBatchKeyStore.deleteKeys();
+      FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+      Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    }
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_with3072BitKeysAndCancelledPrompt_keepsExternalBatchesQueued()
+      throws Exception {
+    Security.insertProviderAt(new FakeAndroidKeyStoreProvider(), 1);
+    FakeAndroidKeyStoreSpi.isStrongBoxSupported = false;
+    try {
+      CrumblesLogsEncryptor realEncryptor = new CrumblesLogsEncryptor();
+      realEncryptor.generateKeyPair();
+      CrumblesBatchKeyStore.deleteKeys();
+      PublicKey externalKey = realEncryptor.generateCandidateExternalKeyPair().getPublic();
+      File logsDir = createPendingLogFile("built_in.bin").getParentFile();
+      var unusedBuiltIn =
+          realEncryptor.serializeBytes(
+              realEncryptor.encryptLogs(new byte[] {9}, /* publicKey= */ null),
+              logsDir,
+              "built_in.bin");
+      for (String name : ImmutableList.of("external_1.bin", "external_2.bin", "external_3.bin")) {
+        var unused =
+            realEncryptor.serializeBytes(
+                realEncryptor.encryptLogs(new byte[] {1}, externalKey), logsDir, name);
+      }
+      when(mockPublicKeyManager.isExternalKeySelected()).thenReturn(true);
+      when(mockPublicKeyManager.getSavedExternalPublicKeys())
+          .thenReturn(ImmutableList.of(externalKey));
+      CrumblesMain.setLogsEncryptorInstanceForTest(realEncryptor);
+      launchActivity();
+
+      clickAndConfirmKeystoreKey();
+      ShadowLooper.idleMainLooper();
+      BiometricPrompt prompt = ShadowBiometricPrompt.getCurrentPrompt();
+      assertThat(prompt).isNotNull();
+      String promptDescription = String.valueOf(prompt.getDescription());
+      ShadowBiometricPrompt.authenticateCurrentSessionWithError(
+          BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED, "Authentication canceled");
+      ShadowLooper.idleMainLooper();
+      String warningMessage = latestDialogMessage();
+      String positiveButtonText =
+          getLatestAppCompatAlertDialog()
+              .getButton(AlertDialog.BUTTON_POSITIVE)
+              .getText()
+              .toString();
+
+      chooseDiscardUnreadableLogs();
+
+      expect
+          .that(promptDescription)
+          .isEqualTo("This log file needs its own authentication. Cancel to skip it.");
+      expect.that(warningMessage).startsWith("Failed to decrypt 4 out of 4");
+      expect
+          .that(positiveButtonText)
+          .isEqualTo(appContext.getString(R.string.dialog_button_discard_unreadable_logs));
+      verify(mockAuditLogger)
+          .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+      verify(mockAuditLogger)
+          .logEvent(
+              CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+              "3 of 4 pending log file(s) could not be decrypted on this device and may be"
+                  + " encrypted to an external key or, if an older version of the app wrote them,"
+                  + " to the replaced built-in key; they were kept queued for upload before key"
+                  + " rotation.");
+      expect.that(new File(logsDir, "built_in.bin").exists()).isFalse();
+      for (String name : ImmutableList.of("external_1.bin", "external_2.bin", "external_3.bin")) {
+        expect.that(new File(logsDir, name).exists()).isTrue();
+      }
+    } finally {
+      FakeAndroidKeyStoreSpi.isStrongBoxSupported = true;
+      CrumblesBatchKeyStore.deleteKeys();
+      FakeAndroidKeyStoreSpi.keystoreEntries.clear();
+      Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    }
+  }
+
+  @Test
   public void onGenerateKeystoreKey_whenNewLogsArriveDuringTheChange_recordsTheRefusal()
       throws Exception {
     givenPendingBatchDecryptingTo(new byte[] {1, 2, 3});
@@ -3050,7 +4169,7 @@ public class CrumblesManageExternalKeysActivityTest {
     launchActivity();
     clickAndConfirmKeystoreKey();
     File arrived1 = createPendingLogFile("arrived1.bin");
-    getLatestAppCompatAlertDialog().getListView().performItemClick(null, 2, 2);
+    getLatestAppCompatAlertDialog().getListView().performItemClick(null, 1, 1);
     ShadowLooper.idleMainLooper();
     String retryToast = appContext.getString(R.string.toast_pending_logs_changed_retry);
     assertThat(ShadowToast.getTextOfLatestToast()).isEqualTo(retryToast);
@@ -3307,10 +4426,9 @@ public class CrumblesManageExternalKeysActivityTest {
     givenPendingBatchDecryptingTo(plaintext);
     launchActivity();
     AtomicInteger storageChecks = new AtomicInteger();
-    scenario.onActivity(
-        activity ->
-            activity.setUsableSpaceSupplierForTest(
-                () -> storageChecks.getAndIncrement() == 0 ? 10_000_000L : 1024L));
+    scenario.onActivity(activity ->
+        activity.setUsableSpaceSupplierForTest(
+            () -> storageChecks.getAndIncrement() == 0 ? 10_000_000L : 1024L));
 
     clickAndConfirmKeystoreKey();
     chooseReEncrypt();
@@ -3357,5 +4475,221 @@ public class CrumblesManageExternalKeysActivityTest {
     int privateFlags =
         ReflectionHelpers.getField(activity.getWindow().getAttributes(), "privateFlags");
     return (privateFlags & hideOverlays) == hideOverlays;
+  }
+
+  /**
+   * Creates a waiting Direct Boot batch {@code fileName} (and its empty chain file) under {@code
+   * logs_before_unlock/} containing valid serialized {@link LogBatch} bytes (unless {@code content}
+   * is deliberately corrupt), so {@code saveLogsCollectedBeforeUnlock} only keeps it waiting when
+   * saving fails or stops on an earlier batch.
+   */
+  private File createWaitingBeforeUnlockBatch(String fileName, byte[] content) throws IOException {
+    File batchesDir =
+        new File(
+            appContext.createDeviceProtectedStorageContext().getFilesDir(), "logs_before_unlock");
+    @SuppressWarnings("unused")
+    var unusedCreated = batchesDir.mkdirs();
+    File batchFile = new File(batchesDir, fileName);
+    Files.write(batchFile.toPath(), content);
+    File chainFile = new File(batchesDir, fileName.replace(".bin", ".chain"));
+    Files.write(chainFile.toPath(), "".getBytes(UTF_8));
+    return batchFile;
+  }
+
+  @Test
+  public void
+      onGenerateKeystoreKey_withWaitingBuiltInKeyBatchWithEmptyWrapKeyId_discardsItWithoutExternalKeys()
+          throws Exception {
+    LogBatch builtInWaitingBatch =
+        LogBatch.newBuilder()
+            .setKey(LogKey.newBuilder().setBatchWrapKeyId(ByteString.EMPTY))
+            .build();
+    File waitingBatch =
+        createWaitingBeforeUnlockBatch(
+            "0000000000000000000.bin", builtInWaitingBatch.toByteArray());
+    File waitingChain = new File(waitingBatch.getParentFile(), "0000000000000000000.chain");
+    doThrow(new CrumblesLogsEncryptionException("Quota full"))
+        .when(mockLogsEncryptor)
+        .serializeBytes(any(), any(), any());
+    when(mockLogsEncryptor.deserializeFile(waitingBatch.toPath())).thenReturn(builtInWaitingBatch);
+    launchActivity();
+
+    clickAndConfirmKeystoreKey();
+
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+    expect.that(latestDialogMessage()).contains("Failed to decrypt 1 out of 1 pending log file(s)");
+    expect
+        .that(warning.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_discard_unreadable_logs));
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+    verify(mockAuditLogger, never())
+        .logEvent(eq(CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST), anyString());
+    verify(mockAuditLogger, never())
+        .logEvent(
+            eq(CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE),
+            anyString());
+    expect.that(waitingBatch.exists()).isFalse();
+    expect.that(waitingChain.exists()).isFalse();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_withCorruptWaitingBatch_countsItAsUnreadableAndKeepsExternal()
+      throws Exception {
+    givenExternalKeyActive();
+    LogBatch externalBatch =
+        batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 256);
+    File externalWaiting =
+        createWaitingBeforeUnlockBatch("0000000000000000000.bin", externalBatch.toByteArray());
+    File corruptWaiting =
+        createWaitingBeforeUnlockBatch("0000000000000000001.bin", "corrupt".getBytes(UTF_8));
+    doThrow(new CrumblesLogsEncryptionException("Quota full"))
+        .when(mockLogsEncryptor)
+        .serializeBytes(any(), any(), any());
+    when(mockLogsEncryptor.deserializeFile(any()))
+        .thenAnswer(invocation -> {
+          if (invocation.getArgument(0).equals(corruptWaiting.toPath())) {
+            throw new RuntimeException("Corrupt waiting batch");
+          }
+          return externalBatch;
+        });
+    launchActivity();
+
+    clickAndConfirmKeystoreKey();
+
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+    expect.that(latestDialogMessage()).contains("Failed to decrypt 2 out of 2 pending log file(s)");
+    expect
+        .that(warning.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_discard_unreadable_logs));
+
+    chooseDiscardUnreadableLogs();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockAuditLogger)
+        .logEvent("LOGS_DISCARDED", "1 pending log file(s) discarded prior to key rotation.");
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "1 of 2 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    verify(mockAuditLogger, never())
+        .logEvent(eq(CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST), anyString());
+    expect.that(corruptWaiting.exists()).isFalse();
+    expect.that(externalWaiting.exists()).isTrue();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_withWaitingExternalKeyBatch_keepsItQueuedWithoutLogsLost()
+      throws Exception {
+    givenExternalKeyActive();
+    LogBatch externalBatch =
+        batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 256);
+    File externalWaiting =
+        createWaitingBeforeUnlockBatch("0000000000000000000.bin", externalBatch.toByteArray());
+    doThrow(new CrumblesLogsEncryptionException("Quota full"))
+        .when(mockLogsEncryptor)
+        .serializeBytes(any(), any(), any());
+    when(mockLogsEncryptor.deserializeFile(externalWaiting.toPath())).thenReturn(externalBatch);
+    launchActivity();
+
+    clickAndConfirmKeystoreKey();
+
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+    expect.that(latestDialogMessage()).contains("Failed to decrypt 1 out of 1 pending log file(s)");
+    expect
+        .that(warning.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+
+    warning.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "1 of 1 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    verify(mockAuditLogger, never())
+        .logEvent(eq(CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST), anyString());
+    expect.that(externalWaiting.exists()).isTrue();
+  }
+
+  @Test
+  public void onGenerateKeystoreKey_withPendingAndWaitingExternalBatches_includesBothInTotalCount()
+      throws Exception {
+    givenExternalKeyActive();
+    File pendingExternal = createPendingLogFile("external_pending.bin");
+    LogBatch externalBatch =
+        batchWithoutBatchWrapKeyId(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256, 256);
+    File waitingExternal =
+        createWaitingBeforeUnlockBatch("0000000000000000000.bin", externalBatch.toByteArray());
+    doThrow(new CrumblesLogsEncryptionException("Quota full"))
+        .when(mockLogsEncryptor)
+        .serializeBytes(any(), any(), any());
+    when(mockLogsEncryptor.deserializeFile(any())).thenReturn(externalBatch);
+    when(mockLogsEncryptor.decryptLogBatch(any()))
+        .thenThrow(new CrumblesLogsDecryptionException("Keys did not match"));
+    launchActivity();
+
+    clickAndConfirmKeystoreKey();
+
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+    expect.that(latestDialogMessage()).contains("Failed to decrypt 2 out of 2 pending log file(s)");
+    warning.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockAuditLogger)
+        .logEvent(
+            CrumblesManageExternalKeysActivity.AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+            "2 of 2 pending log file(s) could not be decrypted on this device and may be encrypted"
+                + " to an external key or, if an older version of the app wrote them, to the"
+                + " replaced built-in key; they were kept queued for upload before key rotation.");
+    verify(mockAuditLogger, never())
+        .logEvent(eq(CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST), anyString());
+    expect.that(pendingExternal.exists()).isTrue();
+    expect.that(waitingExternal.exists()).isTrue();
+  }
+
+  @Test
+  public void
+      onGenerateKeystoreKey_withoutExistingKeystoreKey_keepsWaitingBuiltInBatchWithoutLogsLost()
+          throws Exception {
+    givenExternalKeyActive();
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(false);
+    LogBatch builtInWaitingBatch =
+        LogBatch.newBuilder()
+            .setKey(LogKey.newBuilder().setBatchWrapKeyId(ByteString.EMPTY))
+            .build();
+    File waitingBatch =
+        createWaitingBeforeUnlockBatch(
+            "0000000000000000000.bin", builtInWaitingBatch.toByteArray());
+    doThrow(new CrumblesLogsEncryptionException("Quota full"))
+        .when(mockLogsEncryptor)
+        .serializeBytes(any(), any(), any());
+    when(mockLogsEncryptor.deserializeFile(waitingBatch.toPath())).thenReturn(builtInWaitingBatch);
+    launchActivity();
+
+    clickGenerateKeystoreKey();
+    scenario.onActivity(CrumblesManageExternalKeysActivityTest::confirmCredential);
+    AlertDialog warning = getLatestAppCompatAlertDialog();
+    expect
+        .that(warning.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString())
+        .isEqualTo(appContext.getString(R.string.dialog_button_keep_queued_for_upload));
+
+    warning.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor).generateKeyPair();
+    verify(mockAuditLogger, never())
+        .logEvent(eq(CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST), anyString());
+    expect.that(waitingBatch.exists()).isTrue();
   }
 }

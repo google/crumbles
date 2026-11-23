@@ -27,6 +27,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
+import com.google.common.collect.ImmutableList;
 import com.google.common.truth.Expect;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedInputStream;
@@ -86,6 +87,7 @@ public final class CrumblesBatchSignerTest {
   public void setUp() {
     FakeAndroidKeyStoreSpi.keystoreEntries.clear();
     FakeAndroidKeyStoreSpi.certificateLookupFailure = null;
+    FakeAndroidKeyStoreSpi.isCertificateChainNull = false;
     context = ApplicationProvider.getApplicationContext();
     context
         .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
@@ -131,10 +133,56 @@ public final class CrumblesBatchSignerTest {
   @Test
   public void sign_ofVersion2Batch_leavesTheSealedAttestationChainOutOfTheSignature()
       throws Exception {
-    LogBatch signed = new CrumblesBatchSigner(context).sign(VERSION_2_BATCH);
+    CrumblesBatchSigner signer = new CrumblesBatchSigner(context);
+    ImmutableList<ByteString> sealedChain = signer.attestationChainToSeal();
+
+    LogBatch signed = signer.sign(VERSION_2_BATCH, sealedChain);
 
     expect.that(signed.getSignature().getAttestationChainList()).isEmpty();
     expect.that(verifies(signed)).isTrue();
+  }
+
+  @Test
+  public void sign_afterRefusingAVersion2BatchThatSealsNoChain_reusesSequenceNumber()
+      throws Exception {
+    CrumblesBatchSigner signer = new CrumblesBatchSigner(context);
+    assertThrows(
+        CrumblesKeysException.class,
+        () -> signer.sign(VERSION_2_BATCH, /* sealedChain= */ ImmutableList.of()));
+
+    LogBatch signed = signer.sign(BATCH);
+
+    assertThat(signed.getSequenceNumber()).isEqualTo(1);
+  }
+
+  @Test
+  public void sign_ofVersion2BatchSealingAnotherChain_throws() {
+    ImmutableList<ByteString> replacedChain =
+        ImmutableList.of(ByteString.copyFromUtf8("certificate of a replaced key"));
+
+    assertThrows(
+        CrumblesKeysException.class,
+        () -> new CrumblesBatchSigner(context).sign(VERSION_2_BATCH, replacedChain));
+  }
+
+  @Test
+  public void attestationChainToSeal_isTheChainThatSignaturesComeWith() throws Exception {
+    CrumblesBatchSigner signer = new CrumblesBatchSigner(context);
+
+    ImmutableList<ByteString> chain = signer.attestationChainToSeal();
+
+    expect.that(chain).isNotEmpty();
+    expect
+        .that(chain)
+        .containsExactlyElementsIn(signer.sign(BATCH).getSignature().getAttestationChainList())
+        .inOrder();
+  }
+
+  @Test
+  public void attestationChainToSeal_whenTheChainCannotBeRead_isEmpty() {
+    FakeAndroidKeyStoreSpi.isCertificateChainNull = true;
+
+    assertThat(new CrumblesBatchSigner(context).attestationChainToSeal()).isEmpty();
   }
 
   @Test
@@ -193,13 +241,26 @@ public final class CrumblesBatchSignerTest {
   @Test
   public void signAgain_ofVersion2Batch_leavesTheSealedAttestationChainOutOfTheSignature()
       throws Exception {
-    LogBatch original = new CrumblesBatchSigner(context).sign(VERSION_2_BATCH);
+    CrumblesBatchSigner signer = new CrumblesBatchSigner(context);
+    ImmutableList<ByteString> sealedChain = signer.attestationChainToSeal();
+    LogBatch original = signer.sign(VERSION_2_BATCH, sealedChain);
     LogBatch reEncrypted = RE_ENCRYPTED_BATCH.toBuilder().setMetadata(VERSION_2_METADATA).build();
 
-    LogBatch signedAgain = new CrumblesBatchSigner(context).signAgain(original, reEncrypted);
+    LogBatch signedAgain = signer.signAgain(original, reEncrypted, sealedChain);
 
     expect.that(signedAgain.getSignature().getAttestationChainList()).isEmpty();
     expect.that(verifies(signedAgain)).isTrue();
+  }
+
+  @Test
+  public void signAgain_ofVersion2BatchThatSealsNoChain_throws() throws Exception {
+    CrumblesBatchSigner signer = new CrumblesBatchSigner(context);
+    LogBatch original = signer.sign(VERSION_2_BATCH, signer.attestationChainToSeal());
+    LogBatch reEncrypted = RE_ENCRYPTED_BATCH.toBuilder().setMetadata(VERSION_2_METADATA).build();
+
+    assertThrows(
+        CrumblesKeysException.class,
+        () -> signer.signAgain(original, reEncrypted, /* sealedChain= */ ImmutableList.of()));
   }
 
   @Test

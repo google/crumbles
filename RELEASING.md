@@ -6,8 +6,14 @@ This document describes how to cut an official Crumbles release so that:
    SHA-256 metadata before building.
 2. Users, helpline operators, and partner organizations have a published
    **signing certificate SHA-256 fingerprint** in every GitHub release note to
-   compare against both a downloaded APK and the in-app footer described in
+   compare against a downloaded APK, and against the installed APK copied off
+   the phone as described in
    **[HOW_TO.md](HOW_TO.md#verifying-a-provisioning-qr-code-before-you-scan-it)**.
+
+> **Note:** The `./gradlew` steps below need JDK 17 or newer and the Android
+> SDK with the Android 15 (API level 35) platform, which Gradle finds through
+> the `ANDROID_HOME` environment variable or `sdk.dir` in `local.properties`
+> (see [Building from Source](HOW_TO.md#building-from-source-developers)).
 
 ---
 
@@ -18,11 +24,13 @@ Before cutting a release tag (and whenever dependencies or plugins change in
 verification metadata on a machine with network access:
 
 ```bash
-./gradlew --write-verification-metadata sha256 help
+./gradlew --write-verification-metadata sha256 build
 ```
 
 This creates or updates `gradle/verification-metadata.xml` with `<sha256>`
-checksums for every resolved dependency and Gradle plugin.
+checksums for every resolved dependency and Gradle plugin. Running `build`
+rather than `help` also records the artifacts that plugins resolve only while
+they build, such as `protoc` and AAPT2.
 
 1. Review the diff in `gradle/verification-metadata.xml` to ensure that every
    new or changed checksum corresponds to an expected dependency update.
@@ -120,7 +128,54 @@ include the following verification block in **every GitHub release note**:
 Publishing the signing certificate SHA-256 in every release note ensures that
 users following **[Verify your download](README.md#verify-your-download)** or
 **[Verifying a provisioning QR code before you scan it][verify-qr]** have a
-published reference value to check both before installation and at any later
-time inside the app.
+published reference value to check before installation, and at any later time
+against the installed APK copied off the phone. The footer that Crumbles shows
+is drawn by the installed app itself, so it is no check on its own.
+
+`setup_device.sh`, `setup_device.command`, and `setup_device.bat` install the
+downloaded APK only if `apksigner` finds that every signer of it is the
+certificate given with `--expected-cert-sha256`, in
+`CRUMBLES_EXPECTED_CERT_SHA256`, or typed in when the script asks for it. Also
+give the fingerprint to partner organizations through a channel other than the
+GitHub release, so that whoever could replace the release could not also
+replace the fingerprint.
+
+---
+
+## 5. Verify That the Release Was Built From Its Tag
+
+Gradle archive tasks keep no file timestamps and write their entries in a fixed
+order, and the APK holds no dependency metadata block (see `build.gradle.kts`),
+so anyone can rebuild the release and compare it with the published APK:
+
+1. Check that the published APK is signed with the release certificate:
+
+   ```bash
+   apksigner verify --print-certs CrumblesApp.apk
+   ```
+
+   The `Signer #1 certificate SHA-256 digest` must match the fingerprint
+   published for the release.
+
+2. From the release tag, build the unsigned release APK with the JDK and
+   Android SDK Build-Tools versions that the release used:
+
+   ```bash
+   ./gradlew clean assembleRelease
+   ```
+
+3. Compare it with the published APK:
+
+   ```bash
+   diffoscope CrumblesApp.apk build/outputs/apk/release/crumbles-release-unsigned.apk
+   ```
+
+   Most systems package `diffoscope`: `sudo apt install diffoscope` on Debian
+   and Ubuntu, `brew install diffoscope` on macOS, or `pipx install diffoscope`
+   elsewhere. https://try.diffoscope.org/ also compares two files online.
+
+   The only difference must be the signature, in the APK Signing Block of
+   `CrumblesApp.apk`. Any other difference means that the published APK was not
+   built from the tag.
 
 [verify-qr]: HOW_TO.md#verifying-a-provisioning-qr-code-before-you-scan-it

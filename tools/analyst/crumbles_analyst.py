@@ -61,7 +61,10 @@ key ("Verified"), or with that of a custom ROM such as CalyxOS ("SelfSigned").
 The report shows the state and the verified boot key. Anyone can sign a custom
 ROM, so a custom ROM requires --boot-key, which can be repeated; when
 --boot-key is given, every device's verified boot key (whether SelfSigned or
-Verified) must be one of the given keys.
+Verified) must be one of the given keys. The report also shows the attested OS
+version and patch levels, and --min-patch-level sets the oldest patch levels
+allowed. It shows the SHA-256 of each signing key too: note it when a phone is
+enrolled, and give it with --signer, which can be repeated, to trust no other.
 
 Google revokes attestation keys that leaked, as anyone who has one can attest
 anything, and lists them at https://android.googleapis.com/attestation/status.
@@ -218,6 +221,8 @@ _SIGNING_CURVE = "secp256r1"
 # The problem of a signed batch whose attestation chain is missing, or sealed
 # with logs that no key decrypts.
 _NO_CHAIN = "no attestation certificates"
+# The problem of decrypted logs that do not end with an activity log trailer.
+_NO_TRAILER = "no activity log trailer"
 # Protobuf field tags hold the field number above a 3-bit wire type. These are
 # the wire types of batch files, and the sizes of the fixed-size ones.
 _FIELD_NUMBER_SHIFT = 3
@@ -225,8 +230,6 @@ _WIRE_TYPE_MASK = 0b111
 _VARINT = 0
 _LENGTH_DELIMITED = 2
 _FIXED_SIZES = {1: 8, 5: 4}  # I64 and I32, by wire type.
-# How many hex digits of the SHA-256 of a signing key identify it in reports.
-_FINGERPRINT_DIGITS = 16
 # The Android key attestation extension of the signing key's certificate. It
 # holds a KeyDescription: a SEQUENCE whose fields are read by position.
 _ATTESTATION_OID = x509.ObjectIdentifier("1.3.6.1.4.1.11129.2.1.17")
@@ -254,6 +257,16 @@ _SELF_SIGNED = "SelfSigned"
 _BOOT_STATES = {b"\x00": "Verified", b"\x01": _SELF_SIGNED}
 # The SecurityLevel values (ENUMERATED contents) of keys in secure hardware.
 _SECURITY_LEVELS = {b"\x01": "TEE", b"\x02": "StrongBox"}
+# The identifier octets of osVersion, osPatchLevel, vendorPatchLevel and
+# bootPatchLevel, which are [705], [706], [718] and [719] EXPLICIT.
+_VERSION_TAGS = (
+    b"\xbf\x85\x41",
+    b"\xbf\x85\x42",
+    b"\xbf\x85\x4e",
+    b"\xbf\x85\x4f",
+)
+# Real attestation chains have 3 or 4 certificates.
+_MAX_CHAIN_CERTIFICATES = 10
 
 
 def _message_classes() -> dict[str, type[message.Message]]:
@@ -356,14 +369,19 @@ class Signer:
   Attributes:
     key: The DER SubjectPublicKeyInfo of the key.
     security_level: Where the key lives: "TEE" or "StrongBox".
-    app_certificates: The SHA-256 digests of the certificates that sign the
-      app that made the key, as its attestation names them.
-    boot_state: How verified boot checked the OS that made the key:
-      "Verified" with the device maker's key, or "SelfSigned" with a key that
-      the user installed, such as that of a custom ROM.
-    boot_key: The verified boot key of the attestation: a digest of the key
-      that the OS is signed with.
+    app_certificates: The SHA-256 digests of the certificates that sign the app
+      that made the key, as its attestation names them.
+    boot_state: How verified boot checked the OS that made the key: "Verified"
+      with the device maker's key, or "SelfSigned" with a key that the user
+      installed, such as that of a custom ROM.
+    boot_key: The verified boot key of the attestation: a digest of the key that
+      the OS is signed with.
     device_id: The device ID from the key's attestation challenge.
+    os_version: The attested OS version, such as 150000, or None.
+    os_patch_level: The attested OS patch level, as YYYYMM, or None.
+    vendor_patch_level: The attested vendor patch level, or None.
+    boot_patch_level: The attested boot patch level, or None.
+    chain: The attestation certificates of the key, leaf first.
   """
 
   key: bytes
@@ -372,6 +390,13 @@ class Signer:
   boot_state: str
   boot_key: bytes
   device_id: bytes
+  os_version: int | None = None
+  os_patch_level: int | None = None
+  vendor_patch_level: int | None = None
+  boot_patch_level: int | None = None
+  chain: tuple[x509.Certificate, ...] = dataclasses.field(
+      default=(), compare=False
+  )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -463,6 +488,8 @@ def load_attestation_status(status_data: bytes) -> dict[str, str]:
         normalized_serial = f"{int(serial, 16):x}"
       except ValueError:
         continue
+      if not entry["status"]:  # It would clear what another list says.
+        raise ValueError(f"no status for certificate {serial}")
       reason = entry.get("reason")
       statuses[normalized_serial] = (
           f"{entry['status']} ({reason})" if reason else entry["status"])
@@ -687,7 +714,12 @@ _TAMPER_EVENTS = frozenset([
     "AUDIT_LOG_KEY_REPLACED",
     "AUDIT_RECORDS_DROPPED",
     "COLLECTION_PAUSED_SECONDARY_USER",
+    "DESTINATION_CHANGED_WITHOUT_HANDOVER",
     "DESTINATION_HANDOVER_NOT_SEALED",
+    # A storage app took the notice, which it can keep on the phone unsynced.
+    "DESTINATION_HANDOVER_UPLOADED_OFFLINE",
+    "DESTINATION_HANDOVER_UPLOADED_UNCONFIRMED",
+    "DESTINATION_HANDOVER_UPLOAD_FAILED",
     "DEVICE_ADMIN_DISABLED",
     "FINAL_BATCH_FAILED",
     "KEYSTORE_KEY_INVALIDATED",
@@ -753,6 +785,11 @@ _PAUSE_BATCH_PREFIXES = (
     b"Crumbles: Collection paused: secondary or guest user present",
     b"Collection paused: secondary or guest user present",
 )
+# How the logs collected before the first unlock, which have no trailer, start.
+_BEFORE_UNLOCK_PREFIXES = (
+    b"Crumbles: security logs collected before the first unlock",
+    b"Crumbles: security logs that the platform kept from before the device",
+)
 
 
 def _message_mentions(record_msg: object, terms: tuple[str, ...]) -> bool:
@@ -780,7 +817,7 @@ def parse_trailer(plaintext: bytes) -> Trailer:
   """
   start = plaintext.rfind(_SINCE_PREFIX)
   if start < 0:
-    raise BatchError("no activity log trailer")
+    raise BatchError(_NO_TRAILER)
   trailer_match = _TRAILER.fullmatch(plaintext, start)
   if not trailer_match:
     raise BatchError("malformed activity log trailer")
@@ -990,7 +1027,6 @@ def _is_rkp_chain(chain: Sequence[x509.Certificate]) -> bool:
 def _check_chain(
     chain: Sequence[x509.Certificate],
     root_keys: Collection[str],
-    batch_time: datetime.datetime | None = None,
 ) -> None:
   """Checks that each certificate is signed by the next, up to a trusted root.
 
@@ -998,23 +1034,14 @@ def _check_chain(
     chain: Attestation certificates, leaf first.
     root_keys: The SHA-256 hashes, in hex, of the SubjectPublicKeyInfo of the
       trusted roots.
-    batch_time: The time the batch was written.
 
   Raises:
     BatchError: If a certificate is not signed by the next one, if it is signed
       by the attested key of an app (whose certificate holds an attestation
       extension) rather than by a device or Google certificate, if an issuer is
-      not a valid CA or was not valid when the attested key was created, if the
-      leaf certificate was not valid at batch_time, or if the last certificate
-      does not hold a self-signed trusted root key.
+      not a valid CA or was not valid when the attested key was created, or if
+      the last certificate does not hold a self-signed trusted root key.
   """
-  if batch_time is not None:
-    batch_dt = batch_time.replace(tzinfo=None)
-    if (chain[0].not_valid_before > batch_dt or
-        chain[0].not_valid_after < batch_dt):
-      raise BatchError(
-          "attestation certificate 0 was not valid at the batch time")
-
   for i, (certificate, issuer) in enumerate(zip(chain, chain[1:])):
     if not _issued_by(certificate, issuer):
       raise BatchError(f"attestation certificate {i + 1} did not sign {i}")
@@ -1243,7 +1270,8 @@ def _check_attestation(
 
   Returns:
     The signer: the key, where it lives, the certificates that sign the app
-    that made it, and how verified boot checked the OS.
+    that made it, how verified boot checked the OS, and the OS version and
+    patch levels.
 
   Raises:
     BatchError: If the attestation is missing or malformed, or if it does not
@@ -1261,6 +1289,10 @@ def _check_attestation(
         tag == _ORIGIN_TAG and _first_contents(contents) == _ORIGIN_GENERATED
         for tag, contents in hardware_enforced
     )
+    versions = dict.fromkeys(_VERSION_TAGS)
+    for tag, contents in hardware_enforced:
+      if tag in versions:
+        versions[tag] = int.from_bytes(_first_contents(contents), "big")
   except (IndexError, ValueError):
     raise BatchError("malformed key attestation") from None
   if not origin_ok:
@@ -1286,13 +1318,21 @@ def _check_attestation(
     raise BatchError("the key was made while the bootloader was unlocked")
   if boot_state not in _BOOT_STATES:
     raise BatchError("the key was made by an OS that verified boot rejected")
+  os_version, os_patch_level, vendor_patch_level, boot_patch_level = (
+      versions.values()
+  )
   return Signer(
       key=_public_key_der(certificate),
       security_level=_SECURITY_LEVELS[fields[_KEYMINT_SECURITY_LEVEL]],
       app_certificates=tuple(app_certificates),
       boot_state=_BOOT_STATES[boot_state],
       boot_key=boot_key,
-      device_id=challenge)
+      device_id=challenge,
+      os_version=os_version,
+      os_patch_level=os_patch_level,
+      vendor_patch_level=vendor_patch_level,
+      boot_patch_level=boot_patch_level,
+  )
 
 
 _CERT_PARSE_ERRORS = (
@@ -1339,7 +1379,6 @@ def check_signature(
     device_id: bytes,
     root_keys: Collection[str] = GOOGLE_ROOT_KEYS,
     certificate_statuses: Mapping[str, str] = _NO_STATUSES,
-    batch_time: datetime.datetime | None = None,
     attestation_chain: Sequence[bytes] = (),
 ) -> Signer:
   """Checks the signature of a batch and the attestation of its key.
@@ -1353,7 +1392,6 @@ def check_signature(
       trusted attestation roots.
     certificate_statuses: The status of each revoked or suspended attestation
       certificate, by serial number in lower case hex.
-    batch_time: The time the batch was written.
     attestation_chain: The attestation chain sealed in a format version 2 batch,
       the only one that counts for such a batch. Batches of earlier formats
       carry their chain in their signature instead.
@@ -1376,9 +1414,14 @@ def check_signature(
     raise BatchError(
         "format version 2 batch with attestation certificates in clear"
     )
+  chain_der = _vouching_chain(batch, attestation_chain)
+  if len(chain_der) > _MAX_CHAIN_CERTIFICATES:
+    raise BatchError(
+        f"more than {_MAX_CHAIN_CERTIFICATES} attestation certificates"
+    )
   try:
     chain = []
-    for certificate_der in _vouching_chain(batch, attestation_chain):
+    for certificate_der in chain_der:
       certificate = x509.load_der_x509_certificate(certificate_der)
       _ = certificate.extensions
       chain.append(certificate)
@@ -1397,12 +1440,13 @@ def check_signature(
     signed_bytes = _signed_bytes(data)
     key.verify(
         batch.signature.signature, signed_bytes, ec.ECDSA(hashes.SHA256()))
-    _check_chain(chain, root_keys, batch_time)
+    _check_chain(chain, root_keys)
     for i, certificate in enumerate(chain):
       status = certificate_statuses.get(f"{certificate.serial_number:x}")
       if status:
         raise BatchError(f"attestation certificate {i} is {status}")
-    return _check_attestation(chain[0], device_id)
+    signer = _check_attestation(chain[0], device_id)
+    return dataclasses.replace(signer, chain=tuple(chain))
   except _CERT_PARSE_ERRORS as e:
     raise BatchError(f"malformed attestation: {e}") from None
   except exceptions.InvalidSignature:
@@ -1528,6 +1572,8 @@ def check_batches(
     certificate_statuses: Mapping[str, str] = _NO_STATUSES,
     allow_unsigned: bool = False,
     allow_pkcs1: bool = False,
+    min_patch_level: int = 0,
+    signer_keys: frozenset[bytes] = frozenset(),
 ) -> list[Result]:
   """Decrypts batch files, and checks their trailers and signatures.
 
@@ -1545,6 +1591,10 @@ def check_batches(
       certificate, by serial number in lower case hex.
     allow_unsigned: Whether to allow unsigned batches to advance trailer chains.
     allow_pkcs1: Whether to allow legacy PKCS1v1.5 encryption.
+    min_patch_level: The oldest OS, vendor and boot patch level, as YYYYMM, that
+      a signing key may be attested with, or 0 to accept any.
+    signer_keys: The SHA-256 digests of the SubjectPublicKeyInfo of the keys
+      that may sign batches, or none to accept any.
 
   Returns:
     A Result for each path, grouped by device and ordered.
@@ -1587,7 +1637,9 @@ def check_batches(
   for device_results in groups.values():
     signed = [r for r in device_results if r.signer is not None]
     signed.sort(key=lambda r: (r.batch.sequence_number, *_time_key(r)))
-    signed = _check_sequences(signed, app_certificates, boot_keys)
+    signed = _check_sequences(
+        signed, app_certificates, boot_keys, min_patch_level, signer_keys
+    )
 
     if not allow_unsigned:
       unverified = [r for r in device_results if r.signer is None]
@@ -1797,33 +1849,46 @@ def _check_batch(
         metadata.device.device_id,
         root_keys,
         certificate_statuses,
-        batch_time,
         attestation_chain=sealed_chain,
     )
   except BatchError as e:
     problems.append(str(e))
 
   notices = []
-  if batch.HasField("signature"):
-    try:
-      chain = [
-          x509.load_der_x509_certificate(cert_der)
-          for cert_der in _vouching_chain(batch, sealed_chain)
-      ]
-      if not _is_rkp_chain(chain):
-        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        for i, cert in enumerate(chain):
-          if cert.not_valid_after < now:
-            notices.append(
-                f"attestation certificate {i} is expired at analysis time")
-    except _CERT_PARSE_ERRORS:
-      pass
+  if (
+      signer is not None
+      and (plaintext or b"").startswith(_BEFORE_UNLOCK_PREFIXES)
+      and _NO_TRAILER in problems
+  ):
+    problems.remove(_NO_TRAILER)
+    notices.append("collected before the first unlock: no activity log records")
+  if signer is not None:
+    # The app chooses the validity of the leaf, and the device clock the time.
+    leaf = signer.chain[0]
+    if batch_time is not None and not (
+        leaf.not_valid_before
+        <= batch_time.replace(tzinfo=None)
+        <= leaf.not_valid_after
+    ):
+      notices.append(
+          "the batch time is outside the validity of attestation certificate"
+          " 0: the device clock may have been changed"
+      )
+    if not _is_rkp_chain(signer.chain):
+      now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+      for i, cert in enumerate(signer.chain):
+        if cert.not_valid_after < now:
+          notices.append(
+              f"attestation certificate {i} is expired at analysis time"
+          )
 
   trailer_problems, trailer_notices = _trailer_findings(
       trailer, signer is not None
   )
   problems.extend(trailer_problems)
   notices.extend(trailer_notices)
+  # The ciphertext can be large, and the checks no longer need it.
+  batch.data.ClearField("log_blob")
 
   return Result(
       path=path,
@@ -1873,6 +1938,9 @@ def _check_trailer_chain(
         allow_unsigned and not result.batch.HasField("signature")
     )
     if result.trailer is None or not chain_linked:
+      if result.signer_trusted and result.plaintext is None:
+        # Its activity records, which no key decrypts, are unknown.
+        previous = last_seq = None
       checked.append(result)
       continue
     problems = []
@@ -1914,19 +1982,25 @@ def _check_sequences(
     results: Sequence[Result],
     app_certificates: frozenset[bytes],
     boot_keys: frozenset[bytes],
+    min_patch_level: int = 0,
+    signer_keys: frozenset[bytes] = frozenset(),
 ) -> list[Result]:
   """Checks the signers and sequence numbers of each device's signed batches.
 
   Args:
     results: The Results of signed batch files.
-    app_certificates: The SHA-256 digests of the certificates that the app
-      that made a signing key may be signed with, or none to accept any.
+    app_certificates: The SHA-256 digests of the certificates that the app that
+      made a signing key may be signed with, or none to accept any.
     boot_keys: The verified boot keys that may make signing keys, or none to
       accept any Verified OS.
+    min_patch_level: The oldest OS, vendor and boot patch level, as YYYYMM, that
+      a signing key may be attested with, or 0 to accept any.
+    signer_keys: The SHA-256 digests of the SubjectPublicKeyInfo of the keys
+      that may sign batches, or none to accept any.
 
   Returns:
     The Results, in the same order, with signer changes, gaps, repeats, and
-    apps or verified boot keys failing policy added to their problems.
+    signers failing policy added to their problems.
   """
   if not results:
     return []
@@ -1952,6 +2026,19 @@ def _check_sequences(
       probs.append(
           "signed with none of the verified boot keys of --boot-key"
       )
+    if signer_keys and hashlib.sha256(signer.key).digest() not in signer_keys:
+      probs.append("signed with none of the keys of --signer")
+    levels = (
+        ("OS", signer.os_patch_level),
+        ("vendor", signer.vendor_patch_level),
+        ("boot", signer.boot_patch_level),
+    )
+    for name, level in levels if min_patch_level else ():
+      if level is None:
+        probs.append(f"the key has no attested {name} patch level")
+      # Vendor and boot patch levels are YYYYMMDD: their YYYYMM counts.
+      elif (level // 100 if level > 999999 else level) < min_patch_level:
+        probs.append(f"the key's {name} patch level is below --min-patch-level")
     if not probs and result.batch.sequence_number >= 1:
       if first is None:
         first = result
@@ -2107,8 +2194,8 @@ def _describe(result: Result) -> list[str]:
     fingerprint = hashlib.sha256(result.signer.key).hexdigest()
     lines.append(
         f"  batch {result.batch.sequence_number}, signed by "
-        f"{result.signer.security_level} key "
-        f"{fingerprint[:_FINGERPRINT_DIGITS]}")
+        f"{result.signer.security_level} key {fingerprint}"
+    )
     # As the Crumbles main screen and the release notes show them.
     lines.extend(
         f"  app signing certificate (SHA-256): {digest.hex(':').upper()}"
@@ -2116,6 +2203,19 @@ def _describe(result: Result) -> list[str]:
     lines.append(
         f"  bootloader locked, verified boot state {result.signer.boot_state}"
         f", verified boot key {result.signer.boot_key.hex()}")
+    versions = {
+        "OS version": result.signer.os_version,
+        "OS patch level": result.signer.os_patch_level,
+        "vendor patch level": result.signer.vendor_patch_level,
+        "boot patch level": result.signer.boot_patch_level,
+    }
+    lines.append(
+        "  attested "
+        + ", ".join(
+            f"{name} {'unknown' if value is None else value}"
+            for name, value in versions.items()
+        )
+    )
   if result.out_path:
     lines.append(f"  written to {result.out_path}")
 
@@ -2188,6 +2288,13 @@ def _sha256_digest(text: str) -> bytes:
   return bytes.fromhex(hex_digits)
 
 
+def _parse_patch_level(text: str) -> int:
+  """Reads a patch level as YYYYMM, such as 202501, for argparse."""
+  if not re.fullmatch(r"[0-9]{4}(0[1-9]|1[0-2])", text):
+    raise argparse.ArgumentTypeError(f"not a patch level as YYYYMM: {text}")
+  return int(text)
+
+
 def _check_devices(
     results: Sequence[Result], devices: Collection[str]
 ) -> list[Result]:
@@ -2254,6 +2361,22 @@ def main(
       help="verified boot key that may make signing keys, in hex; required "
            "for custom ROMs and checked for all boot states when given; can "
            "be repeated")
+  parser.add_argument(
+      "--signer",
+      action="append",
+      default=[],
+      type=_sha256_digest,
+      help=(
+          "SHA-256 digest of a key that may sign batches, as the report "
+          "shows it; can be repeated"
+      ),
+  )
+  parser.add_argument(
+      "--min-patch-level",
+      type=_parse_patch_level,
+      default=0,
+      help="oldest OS, vendor and boot patch level of signing keys, as YYYYMM",
+  )
   parser.add_argument("--allow-pkcs1", action="store_true",
                       help="allow legacy RSA-PKCS1v1.5 key wrap")
   parser.add_argument("--allow-unsigned", action="store_true",
@@ -2313,6 +2436,8 @@ def main(
       certificate_statuses,
       args.allow_unsigned,
       args.allow_pkcs1,
+      min_patch_level=args.min_patch_level,
+      signer_keys=frozenset(args.signer),
   )
   if not results:
     print("WARNING: No batches found.", file=sys.stderr)

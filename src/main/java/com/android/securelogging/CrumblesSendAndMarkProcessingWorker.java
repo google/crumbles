@@ -41,10 +41,10 @@ import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.google.common.base.Enums;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import java.io.File;
+import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.security.PublicKey;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -82,6 +82,9 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
 
   /** Preferences key holding the {@link UploadIssue} that was last reported to the user. */
   private static final String PREF_LAST_REPORTED_UPLOAD_ISSUE = "lastReportedUploadIssue";
+
+  /** Preferences file holding, by batch name, how many uploads of each pending batch failed. */
+  static final String FAILED_UPLOADS_PREFS = "CrumblesFailedUploads";
 
   /**
    * Problems that defer or interrupt uploads. Each problem is logged once until it changes or an
@@ -161,13 +164,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
   @NonNull
   @Override
   public Result doWork() {
-    STOP_CHECK.set(this::isStopped);
-    Result result;
-    try {
-      result = uploadPendingBatches(getApplicationContext());
-    } finally {
-      STOP_CHECK.remove();
-    }
+    Result result = uploadPendingBatches(getApplicationContext(), this::isStopped);
     // A problem that outlasts a few backed-off retries, such as a missing key, waits for the next
     // period instead of waking the device again.
     if (result.equals(Result.retry()) && getRunAttemptCount() + 1 >= MAX_RUN_ATTEMPTS) {
@@ -175,6 +172,20 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
       return Result.failure();
     }
     return result;
+  }
+
+  /**
+   * Uploads the pending batches as {@link #uploadPendingBatches(Context)} does, but uploads no
+   * further batch once {@code stopCheck} is true.
+   */
+  static Result uploadPendingBatches(Context context, BooleanSupplier stopCheck) {
+    BooleanSupplier outer = STOP_CHECK.get();
+    STOP_CHECK.set(stopCheck);
+    try {
+      return uploadPendingBatches(context);
+    } finally {
+      STOP_CHECK.set(outer);
+    }
   }
 
   /**
@@ -186,6 +197,8 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
    */
   static Result uploadPendingBatches(Context context) {
     Log.d(TAG, "Uploading pending batches");
+    // Batches collected before the unlock that still wait are uploaded with the others.
+    CrumblesDeviceAdminReceiver.saveLogsCollectedBeforeUnlock(context);
 
     Optional<PublicKey> activeKey = CrumblesDeviceAdminReceiver.resolveActiveEncryptionKey(context);
     boolean keyIsAvailable = activeKey.isPresent();
@@ -211,13 +224,14 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     synchronized (UPLOAD_LOCK) {
       // Recover any stale processing files from interrupted runs to prevent log loss
       recoverStaleProcessingFiles(context, directory);
-      unprocessedBinFiles = getUnprocessedBinFiles(directory);
+      forgetFailedUploadsOfGoneBatches(context, directory);
+      unprocessedBinFiles = getUnprocessedBinFiles(context, directory);
     }
 
     if (unprocessedBinFiles.length == 0) {
       CrumblesDeviceAdminReceiver.drainStagedBatches(context, activeKey.get());
       synchronized (UPLOAD_LOCK) {
-        unprocessedBinFiles = getUnprocessedBinFiles(directory);
+        unprocessedBinFiles = getUnprocessedBinFiles(context, directory);
       }
       if (unprocessedBinFiles.length == 0) {
         Log.d(TAG, "No unprocessed .bin files found.");
@@ -231,7 +245,12 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     return new CrumblesLogStaging(context).isEmpty() ? result : Result.retry();
   }
 
-  private static File[] getUnprocessedBinFiles(File directory) {
+  /**
+   * Returns the pending batches in the order to upload them: those whose uploads failed less often
+   * first, so that a batch that keeps failing cannot hold back the others, and then the oldest
+   * first.
+   */
+  private static File[] getUnprocessedBinFiles(Context context, File directory) {
     File[] unprocessedBinFiles =
         directory.listFiles(
             (dir, name) ->
@@ -241,10 +260,47 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     if (unprocessedBinFiles == null) {
       return new File[0];
     }
+    SharedPreferences failedUploads = failedUploads(context);
     Arrays.sort(
         unprocessedBinFiles,
-        Comparator.comparingLong(File::lastModified).thenComparing(File::getName));
+        Comparator.comparingInt((File file) -> failedUploads.getInt(file.getName(), 0))
+            .thenComparingLong(File::lastModified)
+            .thenComparing(File::getName));
     return unprocessedBinFiles;
+  }
+
+  /** Returns the number of failed uploads of each pending batch, by batch name. */
+  private static SharedPreferences failedUploads(Context context) {
+    return context.getSharedPreferences(FAILED_UPLOADS_PREFS, Context.MODE_PRIVATE);
+  }
+
+  /**
+   * Counts a failed upload of the batch named {@code batchName}, or an upload of it that a killed
+   * run left unfinished. A count, unlike the write time, survives the process and a clock set back.
+   */
+  @GuardedBy("UPLOAD_LOCK")
+  private static void countFailedUpload(Context context, String batchName) {
+    SharedPreferences failedUploads = failedUploads(context);
+    failedUploads.edit().putInt(batchName, failedUploads.getInt(batchName, 0) + 1).apply();
+  }
+
+  /** Forgets the failed uploads of batches that are no longer pending: uploaded or deleted. */
+  @GuardedBy("UPLOAD_LOCK")
+  private static void forgetFailedUploadsOfGoneBatches(Context context, File directory) {
+    SharedPreferences failedUploads = failedUploads(context);
+    SharedPreferences.Editor editor = failedUploads.edit();
+    for (String batchName : failedUploads.getAll().keySet()) {
+      String processingName =
+          (batchName.endsWith(".bin")
+                  ? batchName.substring(0, batchName.length() - ".bin".length())
+                  : batchName)
+              + CrumblesConstants.PROCESSING_SUFFIX;
+      if (!new File(directory, batchName).exists()
+          && !new File(directory, processingName).exists()) {
+        editor.remove(batchName);
+      }
+    }
+    editor.apply();
   }
 
   @GuardedBy("UPLOAD_LOCK")
@@ -266,6 +322,8 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
       File restoredFile = new File(directory, baseName + ".bin");
       if (processingFile.renameTo(restoredFile)) {
         recoveredCount++;
+        // The run that held it ended before marking it, maybe killed by the upload it was in.
+        countFailedUpload(context, restoredFile.getName());
       } else {
         Log.e(TAG, "Failed to recover stale processing file: " + processingName);
       }
@@ -293,7 +351,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
       }
       // The key can change while the batches upload, so the drain resolves it again.
       CrumblesDeviceAdminReceiver.drainStagedBatchesToCurrentKey(context);
-      File[] newlyDrainedFiles = getUnprocessedBinFiles(directory);
+      File[] newlyDrainedFiles = getUnprocessedBinFiles(context, directory);
       if (newlyDrainedFiles.length > 0) {
         result = uploadFiles(context, uploader, newlyDrainedFiles, directory);
       }
@@ -316,9 +374,11 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
         uploadedCount++;
       } else {
         hasFailures = true;
-        // The next batches would fail the same way, after a failure in transit only once their
-        // deadline passed.
-        if (uploader.rejectedServerKey() || uploader.transportFailed()) {
+        // After a failure in transit, the next batches would fail the same way, each only once its
+        // deadline passed. A batch cut off while its body was being sent, such as a large one on a
+        // slow link, says nothing about the smaller batches behind it.
+        if (uploader.rejectedServerKey()
+            || (uploader.transportFailed() && !uploader.failedMidBody())) {
           break;
         }
       }
@@ -342,9 +402,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     }
 
     if (uploader.rejectedServerKey()) {
-      // Uploads resume on their own if the server presents the pinned key again. Until then, the
-      // user has to check the server, so this is not reported as a failure that a retry will fix.
-      reportUploadIssue(context, UploadIssue.SERVER_KEY_CHANGED);
+      reportServerKeyRejected(context);
       return Result.retry();
     }
     if (hasFailures && wipeGeneration == CrumblesUploadAndWipeWorker.currentWipeGeneration()) {
@@ -373,8 +431,17 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
 
   @Nullable
   static RemoteStorageUploader resolveStorageUploader(Context context) {
-    UserKeyPreferences userPrefs = readUserPreferences(context);
-    RemoteStorageConfig storageConfig = userPrefs.getRemoteStorageConfig();
+    return resolveStorageUploader(context, readUploadDestination(context));
+  }
+
+  /**
+   * Returns an uploader for {@code destination}, which may have been read before a later change of
+   * the saved destination, or {@code null} after reporting why it cannot be used.
+   */
+  @Nullable
+  static RemoteStorageUploader resolveStorageUploader(
+      Context context, UploadDestination destination) {
+    RemoteStorageConfig storageConfig = destination.config();
     if (storageConfig.getStorageType().equals(StorageType.STORAGE_TYPE_WEBDAV)) {
       EncryptedPayload encryptedServerUrl = storageConfig.getWebdavServerUrl();
       WebDavCredentials credentials = storageConfig.getWebdavCredentials();
@@ -417,7 +484,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
         wipe(password);
       }
     }
-    DocumentFile targetDir = resolveDriveDestination(context, userPrefs);
+    DocumentFile targetDir = resolveDriveDestination(context, destination.folderUri());
     if (targetDir == null) {
       return null;
     }
@@ -462,19 +529,33 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
   }
 
   /**
-   * Returns whether an upload destination is set: a Google Drive folder, or a WebDAV server URL
-   * with both credentials. Unlike {@link #resolveStorageUploader}, it decrypts nothing and reports
-   * nothing to the user.
+   * An upload destination as saved at one moment: its settings, and the folder they or the legacy
+   * preference name, if any.
    */
-  static boolean isUploadDestinationConfigured(Context context) {
-    RemoteStorageConfig storageConfig = readUserPreferences(context).getRemoteStorageConfig();
-    if (storageConfig.getStorageType().equals(StorageType.STORAGE_TYPE_WEBDAV)) {
-      return isWebDavConfigComplete(storageConfig);
+  record UploadDestination(RemoteStorageConfig config, @Nullable String folderUri) {
+    /**
+     * Returns whether this names a folder, or a WebDAV server URL with both credentials. Unlike
+     * {@link CrumblesSendAndMarkProcessingWorker#resolveStorageUploader}, it decrypts nothing and
+     * reports nothing to the user.
+     */
+    boolean isConfigured() {
+      return config.getStorageType().equals(StorageType.STORAGE_TYPE_WEBDAV)
+          ? isWebDavConfigComplete(config)
+          : folderUri != null;
     }
-    return !storageConfig.getUploadDestinationUri().isEmpty()
-        || context
-            .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
-            .contains(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI);
+  }
+
+  /** Returns the upload destination saved now. */
+  static UploadDestination readUploadDestination(Context context) {
+    RemoteStorageConfig storageConfig = readUserPreferences(context).getRemoteStorageConfig();
+    String folderUri = storageConfig.getUploadDestinationUri();
+    if (folderUri.isEmpty()) {
+      folderUri =
+          context
+              .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+              .getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, /* defValue= */ null);
+    }
+    return new UploadDestination(storageConfig, folderUri);
   }
 
   /**
@@ -488,14 +569,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
   }
 
   @Nullable
-  private static DocumentFile resolveDriveDestination(
-      Context context, UserKeyPreferences userPrefs) {
-    String uriString = userPrefs.getRemoteStorageConfig().getUploadDestinationUri();
-    if (uriString.isEmpty()) {
-      SharedPreferences legacyPrefs =
-          context.getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE);
-      uriString = legacyPrefs.getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, null);
-    }
+  private static DocumentFile resolveDriveDestination(Context context, @Nullable String uriString) {
     if (uriString == null) {
       Log.w(TAG, "Upload destination URI not configured. Logs will remain safely on device.");
       reportUploadIssue(context, UploadIssue.DESTINATION_NOT_CONFIGURED);
@@ -518,12 +592,23 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     }
 
     DocumentFile targetDir = DocumentFile.fromTreeUri(context, treeUri);
-    if (targetDir == null || !targetDir.isDirectory() || !targetDir.canWrite()) {
+    if (targetDir == null || !isWritableFolder(targetDir)) {
       Log.e(TAG, "Target directory is invalid or not writable: " + uriString);
       reportUploadIssue(context, UploadIssue.DESTINATION_INACCESSIBLE);
       return null;
     }
     return targetDir;
+  }
+
+  /** Returns whether its provider tells in time that {@code folder} is a writable folder. */
+  private static boolean isWritableFolder(DocumentFile folder) {
+    try {
+      return CrumblesTransferDeadline.callProvider(
+          folder.getUri(), () -> folder.isDirectory() && folder.canWrite());
+    } catch (IOException e) {
+      Log.e(TAG, "The provider of the upload folder did not answer in time", e);
+      return false;
+    }
   }
 
   static boolean uploadSingleFile(
@@ -584,15 +669,15 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     if (uploadSuccess) {
       File sentFile = new File(directory, baseName + CrumblesConstants.SENT_SUFFIX);
       if (processingFile.renameTo(sentFile)) {
-        // CrumblesDeleteSentFilesWorker keeps the batch for a while, counted from this time. If
-        // this fails, the batch keeps its write time, as before.
-        sentFile.setLastModified(Instant.now().toEpochMilli());
-        // Only WebDAV copies expire by age; SAF copies stay until the storage quota reclaims them.
+        // The renames keep the time the batch was written, by which the storage quota orders
+        // batches. Only WebDAV copies expire by age, counted from the upload time recorded here;
+        // SAF copies stay until the storage quota reclaims them.
         if (uploader.getStorageType() == StorageType.STORAGE_TYPE_WEBDAV) {
           CrumblesDeleteSentFilesWorker.recordSentFile(context, sentFile.getName());
         } else {
           CrumblesDeleteSentFilesWorker.recordSafCopy(context, sentFile.getName(), keyFingerprint);
         }
+        failedUploads(context).edit().remove(originalName).apply();
         Log.d(TAG, "Successfully uploaded and marked as sent: " + sentFile.getName());
         return true;
       }
@@ -603,6 +688,9 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
     File originalFile = new File(directory, originalName);
     if (processingFile.renameTo(originalFile)) {
       Log.w(TAG, "Reverted processing file back to original for retry: " + originalName);
+      // Later runs try the batches that failed less often first, so that this one, if it keeps
+      // failing, does not come first in every run.
+      countFailedUpload(context, originalName);
     } else {
       Log.e(TAG, "Failed to revert processing file to original: " + processingFile.getName());
     }
@@ -634,6 +722,15 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
   }
 
   /**
+   * Reports that the WebDAV server presented a public key other than the pinned one. Uploads resume
+   * on their own if the server presents the pinned key again. Until then, the user has to check the
+   * server, so this is not reported as a failure that a retry will fix.
+   */
+  static void reportServerKeyRejected(Context context) {
+    reportUploadIssue(context, UploadIssue.SERVER_KEY_CHANGED);
+  }
+
+  /**
    * Notifies the user of {@code issue}, again on every run that it lasts so that dismissing the
    * notification does not hide it, and logs it unless it is the issue that was reported last, so
    * that retries hitting the same problem do not flood the activity log.
@@ -659,8 +756,7 @@ public class CrumblesSendAndMarkProcessingWorker extends Worker {
         context
             .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
             .getString(PREF_LAST_REPORTED_UPLOAD_ISSUE, /* defValue= */ "");
-    return Enums.getIfPresent(UploadIssue.class, issue)
-        .toJavaUtil()
+    return Optional.ofNullable(Enums.getIfPresent(UploadIssue.class, issue).orNull())
         .map(reported -> context.getString(reported.notificationContentResId));
   }
 

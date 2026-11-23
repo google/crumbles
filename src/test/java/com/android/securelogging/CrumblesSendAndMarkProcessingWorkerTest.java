@@ -19,6 +19,8 @@ package com.android.securelogging;
 import static com.android.securelogging.CrumblesSendAndMarkProcessingWorker.uploadSingleFile;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
@@ -40,6 +42,7 @@ import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
@@ -55,8 +58,10 @@ import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.google.common.truth.Expect;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsParameters;
@@ -78,9 +83,14 @@ import java.time.Instant;
 import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -103,6 +113,7 @@ import org.robolectric.RobolectricTestRunner;
 import org.robolectric.Shadows;
 import org.robolectric.shadows.ShadowLog;
 import org.robolectric.shadows.ShadowNotificationManager;
+import org.robolectric.shadows.ShadowSystemClock;
 import org.robolectric.util.ReflectionHelpers.ClassParameter;
 
 /** Unit tests for {@link CrumblesSendAndMarkProcessingWorker}. */
@@ -152,6 +163,11 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     private boolean isInvalidDirectory;
     @Nullable Runnable onOpenFile;
 
+    /** Makes queries wait until {@link #release} opens, like a provider that never answers. */
+    boolean holdsQueries;
+
+    final CountDownLatch release = new CountDownLatch(1);
+
     public void setShouldFailStreaming(boolean fail) {
       this.shouldFailStreaming = fail;
     }
@@ -175,6 +191,13 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     @Override
     public Cursor query(
         Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+      if (holdsQueries) {
+        try {
+          release.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
       if (isInvalidDirectory) {
         return null;
       }
@@ -221,6 +244,11 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
         }
         Bundle res = new Bundle();
         res.putParcelable("uri", Uri.parse("content://" + DRIVE_AUTHORITY + "/document/" + name));
+        return res;
+      }
+      if (Objects.equals(method, "android:isChildDocument")) {
+        Bundle res = new Bundle();
+        res.putBoolean("result", true);
         return res;
       }
       return null;
@@ -279,7 +307,7 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
       throws IOException {
     String fileName = namePrefix + timestamp + suffix;
     File file = new File(testDirectory, fileName);
-    Files.writeString(file.toPath(), content);
+    Files.write(file.toPath(), content.getBytes(UTF_8));
     assertTrue("File should exist after creation: " + file.getAbsolutePath(), file.exists());
     return file;
   }
@@ -296,6 +324,15 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
         .build()
         .startWork()
         .get();
+  }
+
+  /** Moves the clock past the transfer deadlines until {@code run} ends, and returns its result. */
+  private static Result awaitPastDeadline(Future<Result> run) throws Exception {
+    for (int attempt = 0; attempt < 100 && !run.isDone(); attempt++) {
+      ShadowSystemClock.advanceBy(Duration.ofHours(1));
+      Uninterruptibles.sleepUninterruptibly(50, MILLISECONDS);
+    }
+    return run.get(/* timeout= */ 1, SECONDS);
   }
 
   private void configureDestination(Uri uri, boolean grantPermission) {
@@ -372,6 +409,19 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
   }
 
   /**
+   * Starts a WebDAV server on this device whose uploads {@code handler} answers, each on a thread
+   * of its own, so that a held upload does not hold the next.
+   */
+  private static HttpServer startWebDavServer(HttpHandler handler) throws IOException {
+    HttpServer server =
+        HttpServer.create(new InetSocketAddress("localhost", /* port= */ 0), /* backlog= */ 0);
+    server.createContext("/webdav", handler);
+    server.setExecutor(Executors.newCachedThreadPool());
+    server.start();
+    return server;
+  }
+
+  /**
    * Stores a WebDAV destination at {@code serverUrl} whose pinned server key decrypts to {@code
    * pinnedKeySha256}, with credentials that decrypt successfully.
    */
@@ -403,8 +453,7 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
    * Starts a localhost WebDAV server over TLS that presents {@link #serverCertificate}, answers
    * every request with 201 and records whether any request reached it in {@code requestReceived}.
    */
-  private static HttpsServer startHttpsWebDavServer(AtomicBoolean requestReceived)
-      throws IOException {
+  static HttpsServer startHttpsWebDavServer(AtomicBoolean requestReceived) throws IOException {
     return startHttpsWebDavServer(requestReceived, new AtomicInteger());
   }
 
@@ -438,11 +487,12 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
    * Security provider whose default {@link TrustManagerFactory} trusts {@link #testRootCertificate}
    * alone, so that it stands in for the platform's CA store.
    */
-  private static final class TestRootTrustProvider extends Provider {
+  static final class TestRootTrustProvider extends Provider {
     static final String NAME = "CrumblesTestRootTrust";
 
+    @SuppressWarnings("deprecation") // Android lacks Provider(String, String, String).
     TestRootTrustProvider() {
-      super(NAME, "1.0", "Trusts only the test root CA");
+      super(NAME, 1.0, "Trusts only the test root CA");
       TrustManager testRootTrustManager =
           new HandshakeCertificates.Builder()
               .addTrustedCertificate(testRootCertificate.certificate())
@@ -841,6 +891,36 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
   }
 
   @Test
+  public void doWork_whenFolderProviderNeverAnswers_reportsTheFolderInaccessibleAtTheDeadline()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    String heldAuthority = "com.android.securelogging.test.held";
+    FakeGoogleDriveContentProvider heldProvider =
+        Robolectric.setupContentProvider(FakeGoogleDriveContentProvider.class, heldAuthority);
+    heldProvider.holdsQueries = true;
+    configureDestination(
+        Uri.parse("content://" + heldAuthority + "/tree/valid_drive"), /* grantPermission= */ true);
+    File fileToProcess =
+        createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+    ExecutorService workerThread = Executors.newSingleThreadExecutor();
+    try {
+      Future<Result> run = workerThread.submit(this::runWorker);
+
+      Result result = awaitPastDeadline(run);
+
+      expect.that(result).isEqualTo(Result.retry());
+      expect.that(fileToProcess.exists()).isTrue();
+      verify(mockAuditLogger)
+          .logEvent(
+              eq("UPLOAD_DESTINATION_INVALID"),
+              eq("Upload deferred: destination folder is inaccessible or unwritable."));
+    } finally {
+      heldProvider.release.countDown();
+      workerThread.shutdownNow();
+    }
+  }
+
+  @Test
   public void doWork_whenUploadSucceeds_streamsFileAndMarksSentWithoutNotifying()
       throws IOException, ExecutionException, InterruptedException {
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
@@ -887,13 +967,13 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
   }
 
   @Test
-  public void doWork_whenUploadSucceeds_stampsSentBatchWithUploadTime()
+  public void doWork_whenUploadSucceeds_keepsTheTimeTheBatchWasWritten()
       throws IOException, ExecutionException, InterruptedException {
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
     configureDestination(VALID_DRIVE_URI, /* grantPermission= */ true);
     File fileToProcess =
         createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
-    Instant writtenAt = Instant.now().minus(Duration.ofDays(30));
+    Instant writtenAt = Instant.parse("2026-01-02T03:04:05Z");
     assertTrue(fileToProcess.setLastModified(writtenAt.toEpochMilli()));
 
     runWorker();
@@ -901,8 +981,7 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     File sentFile =
         new File(
             testDirectory, fileToProcess.getName().replace(".bin", CrumblesConstants.SENT_SUFFIX));
-    assertThat(Instant.ofEpochMilli(sentFile.lastModified()))
-        .isGreaterThan(writtenAt.plus(Duration.ofDays(29)));
+    assertThat(Instant.ofEpochMilli(sentFile.lastModified())).isEqualTo(writtenAt);
     // SAF copies never expire by age, so their upload time is not recorded.
     assertThat(hasRecordedUploadTime(sentFile)).isFalse();
   }
@@ -1033,8 +1112,8 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
 
       runWorker();
 
-      verify(mockLogsEncryptor).encryptLogs(any(), any(), eq(mockReplacementKey));
-      verify(mockLogsEncryptor, never()).encryptLogs(any(), any(), eq(mockPublicKey));
+      verify(mockLogsEncryptor).encryptLogs(any(), any(), eq(mockReplacementKey), any(), any());
+      verify(mockLogsEncryptor, never()).encryptLogs(any(), any(), eq(mockPublicKey), any(), any());
     } finally {
       server.stop(0);
     }
@@ -1474,6 +1553,306 @@ public class CrumblesSendAndMarkProcessingWorkerTest {
     } finally {
       server.stop(0);
     }
+  }
+
+  @Test
+  public void doWork_whenABatchFailsInTransit_uploadsTheNewerBatchOnTheNextRun() throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+    long now = InstantSource.system().instant().toEpochMilli();
+    File failingFile = createFile("log_", now - 2000, ".bin", "dropped");
+    assertTrue(failingFile.setLastModified(now - 2000));
+    File newerFile = createFile("log_", now - 1000, ".bin", "newer");
+    assertTrue(newerFile.setLastModified(now - 1000));
+    HttpServer server =
+        HttpServer.create(new InetSocketAddress("localhost", /* port= */ 0), /* backlog= */ 0);
+    server.createContext(
+        "/webdav",
+        exchange -> {
+          if (!exchange.getRequestURI().getPath().endsWith(failingFile.getName())) {
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_CREATED, /* responseLength= */ -1);
+          }
+          // Closing the exchange before any response closes the connection.
+          exchange.close();
+        });
+    server.start();
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      runWorker();
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.retry());
+      expect.that(failingFile.exists()).isTrue();
+      expect
+          .that(
+              new File(
+                      testDirectory,
+                      newerFile.getName().replace(".bin", CrumblesConstants.SENT_SUFFIX))
+                  .exists())
+          .isTrue();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenTheClockWasSetBack_stillRetriesTheFailedBatchAfterTheOthers()
+      throws Exception {
+    givenWebDavPassword();
+    long now = InstantSource.system().instant().toEpochMilli();
+    File failingFile = createFile("log_", now - 2000, ".bin", "dropped");
+    assertTrue(failingFile.setLastModified(now - 2000));
+    // Written a day ahead of the clock, as when the clock was set back since.
+    File newerFile = createFile("log_", now - 1000, ".bin", "newer");
+    assertTrue(newerFile.setLastModified(now + Duration.ofDays(1).toMillis()));
+    HttpServer server =
+        startWebDavServer(exchange -> {
+          if (!exchange.getRequestURI().getPath().endsWith(failingFile.getName())) {
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_CREATED, -1);
+          }
+          // Closing the exchange before any response closes the connection.
+          exchange.close();
+        });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      runWorker();
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.retry());
+      expect.that(failingFile.exists()).isTrue();
+      expect.that(sentCopyOf(newerFile).exists()).isTrue();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenARunWasKilledMidUpload_retriesItsBatchAfterTheNewerOnes()
+      throws Exception {
+    givenWebDavPassword();
+    long now = InstantSource.system().instant().toEpochMilli();
+    // The upload of a batch too large for the link can be what killed the run.
+    File interruptedFile =
+        createFile("log_", now - 2000, CrumblesConstants.PROCESSING_SUFFIX, "interrupted");
+    assertTrue(interruptedFile.setLastModified(now - 2000));
+    File newerFile = createFile("log_", now - 1000, ".bin", "newer");
+    assertTrue(newerFile.setLastModified(now - 1000));
+    List<String> uploadedNames = Collections.synchronizedList(new ArrayList<>());
+    HttpServer server =
+        startWebDavServer(exchange -> {
+          String path = exchange.getRequestURI().getPath();
+          uploadedNames.add(path.substring(path.lastIndexOf('/') + 1));
+          exchange.sendResponseHeaders(HttpURLConnection.HTTP_CREATED, -1);
+          exchange.close();
+        });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.success());
+      expect
+          .that(uploadedNames)
+          .containsExactly(newerFile.getName(), "log_" + (now - 2000) + ".bin")
+          .inOrder();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenALargeBatchIsCutOffMidBody_stillUploadsTheSmallerBatchBehindIt()
+      throws Exception {
+    givenWebDavPassword();
+    long now = InstantSource.system().instant().toEpochMilli();
+    // More than the socket buffers hold, so that the upload blocks once the server stops reading.
+    File largeFile = createFile("log_", now - 2000, ".bin", "");
+    Files.write(largeFile.toPath(), new byte[32 << 20]);
+    assertTrue(largeFile.setLastModified(now - 2000));
+    File smallFile = createFile("log_", now - 1000, ".bin", "small");
+    assertTrue(smallFile.setLastModified(now - 1000));
+    CountDownLatch largeUploadStarted = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    HttpServer server =
+        startWebDavServer(exchange -> {
+          if (exchange.getRequestURI().getPath().endsWith(largeFile.getName())) {
+            // Reads none of the body, like a link too slow for it.
+            largeUploadStarted.countDown();
+            try {
+              release.await(10, SECONDS);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+            }
+          } else {
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_CREATED, -1);
+          }
+          exchange.close();
+        });
+    ExecutorService workerThread = Executors.newSingleThreadExecutor();
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      Future<Result> run = workerThread.submit(this::runWorker);
+      assertThat(largeUploadStarted.await(10, SECONDS)).isTrue();
+      // Lets the upload fill the socket buffers before the clock moves past its last progress.
+      Uninterruptibles.sleepUninterruptibly(500, MILLISECONDS);
+
+      ShadowSystemClock.advanceBy(Duration.ofSeconds(61));
+      Result result = run.get(/* timeout= */ 10, SECONDS);
+
+      expect.that(result).isEqualTo(Result.retry());
+      expect.that(largeFile.exists()).isTrue();
+      expect.that(sentCopyOf(smallFile).exists()).isTrue();
+    } finally {
+      release.countDown();
+      workerThread.shutdownNow();
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenAFailedBatchUploads_forgetsItsFailures() throws Exception {
+    givenWebDavPassword();
+    AtomicBoolean refuses = new AtomicBoolean(true);
+    HttpServer server =
+        startWebDavServer(exchange -> {
+          exchange.sendResponseHeaders(
+              refuses.get()
+                  ? HttpURLConnection.HTTP_INTERNAL_ERROR
+                  : HttpURLConnection.HTTP_CREATED,
+              -1);
+          exchange.close();
+        });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      File file =
+          createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+      runWorker();
+      assertThat(failedUploads().getInt(file.getName(), 0)).isEqualTo(1);
+      refuses.set(false);
+
+      runWorker();
+
+      assertThat(failedUploads().contains(file.getName())).isFalse();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_forgetsTheFailedUploadsOfBatchesThatAreGone() throws Exception {
+    givenWebDavPassword();
+    HttpServer server =
+        startWebDavServer(exchange -> {
+          exchange.sendResponseHeaders(HttpURLConnection.HTTP_INTERNAL_ERROR, -1);
+          exchange.close();
+        });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      File file =
+          createFile("log_", InstantSource.system().instant().toEpochMilli(), ".bin", "content");
+      runWorker();
+      assertThat(failedUploads().getInt(file.getName(), 0)).isEqualTo(1);
+      assertTrue(file.delete());
+
+      runWorker();
+
+      assertThat(failedUploads().contains(file.getName())).isFalse();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void doWork_whenBatchesFailMultipleTimes_uploadsTheLeastFailedOneFirst() throws Exception {
+    givenWebDavPassword();
+    long now = InstantSource.system().instant().toEpochMilli();
+    File olderFailedTwice = createFile("log_", now - 2000, ".bin", "older");
+    assertTrue(olderFailedTwice.setLastModified(now - 2000));
+    AtomicBoolean refuseAll = new AtomicBoolean(true);
+    List<String> uploadedNames = Collections.synchronizedList(new ArrayList<>());
+    HttpServer server =
+        startWebDavServer(exchange -> {
+          if (refuseAll.get()) {
+            exchange.sendResponseHeaders(
+                HttpURLConnection.HTTP_INTERNAL_ERROR, /* responseLength= */ -1);
+          } else {
+            String path = exchange.getRequestURI().getPath();
+            uploadedNames.add(path.substring(path.lastIndexOf('/') + 1));
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_CREATED, /* responseLength= */ -1);
+          }
+          exchange.close();
+        });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+      runWorker();
+      File newerFailedOnce = createFile("log_", now - 1000, ".bin", "newer");
+      assertTrue(newerFailedOnce.setLastModified(now - 1000));
+      runWorker();
+      refuseAll.set(false);
+
+      Result result = runWorker();
+
+      expect.that(result).isEqualTo(Result.success());
+      expect
+          .that(uploadedNames)
+          .containsExactly(newerFailedOnce.getName(), olderFailedTwice.getName())
+          .inOrder();
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  public void uploadPendingBatches_onceTheStopCheckIsTrue_uploadsNoFurtherBatch() throws Exception {
+    givenWebDavPassword();
+    long now = InstantSource.system().instant().toEpochMilli();
+    createFile("log_", now - 2000, ".bin", "first");
+    createFile("log_", now - 1000, ".bin", "second");
+    List<String> uploadedNames = Collections.synchronizedList(new ArrayList<>());
+    HttpServer server =
+        startWebDavServer(exchange -> {
+          uploadedNames.add(exchange.getRequestURI().getPath());
+          exchange.sendResponseHeaders(HttpURLConnection.HTTP_CREATED, -1);
+          exchange.close();
+        });
+    try {
+      configureWebDav("http://localhost:" + server.getAddress().getPort() + "/webdav");
+
+      Result stopped =
+          CrumblesSendAndMarkProcessingWorker.uploadPendingBatches(
+              context, () -> !uploadedNames.isEmpty());
+      int uploadedBeforeStop = uploadedNames.size();
+      Result resumed = CrumblesSendAndMarkProcessingWorker.uploadPendingBatches(context);
+
+      expect.that(stopped).isEqualTo(Result.retry());
+      expect.that(uploadedBeforeStop).isEqualTo(1);
+      expect.that(resumed).isEqualTo(Result.success());
+      expect.that(uploadedNames).hasSize(2);
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  /** Makes the stored WebDAV password decrypt, as {@link #configureWebDav} does the rest. */
+  private void givenWebDavPassword() throws CrumblesKeysException {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptDataStoreEntry(
+            ENCRYPTED_WEBDAV_PASSWORD, CrumblesConstants.WEBDAV_PASSWORD_ENTRY_ID))
+        .thenReturn("pass".getBytes(UTF_8));
+  }
+
+  private File sentCopyOf(File pendingFile) {
+    return new File(
+        testDirectory, pendingFile.getName().replace(".bin", CrumblesConstants.SENT_SUFFIX));
+  }
+
+  private SharedPreferences failedUploads() {
+    return context.getSharedPreferences(
+        CrumblesSendAndMarkProcessingWorker.FAILED_UPLOADS_PREFS, Context.MODE_PRIVATE);
   }
 
   @Test

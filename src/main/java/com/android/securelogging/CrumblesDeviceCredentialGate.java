@@ -17,12 +17,12 @@
 package com.android.securelogging;
 
 import android.app.KeyguardManager;
-import android.support.v4.app.FragmentActivity;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 import androidx.biometric.BiometricManager.Authenticators;
 import androidx.biometric.BiometricPrompt;
 import androidx.biometric.BiometricPrompt.PromptInfo;
+import androidx.fragment.app.FragmentActivity;
 
 /** Prompts for strong authentication via {@link BiometricPrompt}, rejecting Class 2 unlock. */
 public final class CrumblesDeviceCredentialGate {

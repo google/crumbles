@@ -90,12 +90,32 @@ public class CrumblesAuditLogViewerPresenter implements CrumblesAuditLogViewerCo
 
   @Override
   public void onDeviceCredentialConfirmed() {
-    chainCheckExecutor.execute(
-        () -> {
-          int unsealedCount = sealBeforeClear.getAsInt();
-          appAuditLogger.clearAllLogs(unsealedCount);
-          viewExecutor.execute(this::loadAuditLogs);
-        });
+    chainCheckExecutor.execute(this::sealThenClear);
+  }
+
+  /**
+   * Seals the unshipped records into a log batch, then clears the logs unless that failed. The
+   * clear keeps the records that are unshipped by then, such as those logged while the batch was
+   * written, so that the next batch ships them.
+   */
+  private void sealThenClear() {
+    int unsealedCount = sealBeforeClear.getAsInt();
+    if (unsealedCount > 0) {
+      // Clearing would erase records that no batch carries yet, with no copy left anywhere.
+      appAuditLogger.logEvent(
+          AUDIT_EVENT_CLEAR_REFUSED,
+          "Activity log kept because "
+              + unsealedCount
+              + " unshipped record(s) could not be sealed into a log batch first.");
+      viewExecutor.execute(
+          () -> {
+            view.showClearRefused();
+            loadAuditLogs();
+          });
+      return;
+    }
+    appAuditLogger.clearShippedLogs();
+    viewExecutor.execute(this::loadAuditLogs);
   }
 
   @Override

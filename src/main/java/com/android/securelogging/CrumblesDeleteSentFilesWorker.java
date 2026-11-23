@@ -16,6 +16,8 @@
 
 package com.android.securelogging;
 
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.database.Cursor;
@@ -33,13 +35,16 @@ import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
-import com.google.common.base.Strings;
+import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableListMultimap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ListMultimap;
+import com.google.common.collect.Multiset;
 import com.google.common.io.ByteStreams;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.channels.ClosedChannelException;
 import java.nio.file.Files;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
@@ -52,6 +57,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * A {@link Worker} that deletes files with the "_sent.bin" suffix from the app's private directory
@@ -82,6 +88,33 @@ public class CrumblesDeleteSentFilesWorker extends Worker {
    * the destination can still be sent again.
    */
   static final Duration SENT_FILE_RETENTION = Duration.ofDays(7);
+
+  /**
+   * Names of the copies sent to a SAF folder that the daily re-check has found there since their
+   * upload. The storage quota records deleting any other one as a loss.
+   */
+  private static final String VERIFIED_PREFS = "CrumblesSentVerified";
+
+  /**
+   * Most documents named like a kept copy that the re-check reads back, each within its own
+   * transfer deadline, so that duplicates cannot hold the worker past its time limit.
+   */
+  private static final int MAX_DOCUMENTS_PER_NAME = 2;
+
+  /** How the re-check of one kept copy ended. */
+  private enum CheckOutcome {
+    /** The folder has a copy with the same bytes. */
+    VERIFIED,
+    /** The folder lacks the copy, which is back in the upload queue. */
+    RESENT,
+    /**
+     * The copy stays unverified: the folder cannot be listed, the copy cannot be read, or the
+     * folder lacks it and it is not resent.
+     */
+    UNVERIFIED,
+    /** Reading back a document hit the transfer deadline, so the copy stays unverified. */
+    STALLED
+  }
 
   public CrumblesDeleteSentFilesWorker(
       @NonNull Context context, @NonNull WorkerParameters workerParams) {
@@ -240,19 +273,49 @@ public class CrumblesDeleteSentFilesWorker extends Worker {
     if (uri.isEmpty()) {
       return;
     }
+    Uri treeUri = Uri.parse(uri);
+    ImmutableSet<String> originalNames =
+        Arrays.stream(sentBinFiles)
+            .map(CrumblesDeleteSentFilesWorker::originalName)
+            .collect(toImmutableSet());
     Optional<ListMultimap<String, DocumentFile>> remoteFiles;
     try {
-      remoteFiles = listRemoteFilesByName(ctx, Uri.parse(uri));
-    } catch (RuntimeException e) {
+      // The cursor reads from the provider too, so the whole listing gets the deadline of a call.
+      remoteFiles =
+          CrumblesTransferDeadline.callProvider(
+              treeUri, () -> listRemoteFilesByName(ctx, treeUri, originalNames));
+    } catch (IOException | RuntimeException e) {
+      // Binder passes on what the provider throws, such as SecurityException once access ends.
       Log.e(TAG, "Failed to list folder, keeping everything.", e);
-      return;
+      remoteFiles = Optional.empty();
     }
     if (remoteFiles.isEmpty()) {
-      return;
+      reportReconcileFailure(
+          ctx, "Could not list the upload folder; kept every uploaded copy unverified.");
     }
+    // Only the copies that this check finds in the folder stay verified.
+    SharedPreferences.Editor verified =
+        ctx.getSharedPreferences(VERIFIED_PREFS, Context.MODE_PRIVATE).edit().clear();
     int resent = 0;
+    int stalled = 0;
     for (File file : sentBinFiles) {
-      resent += reconcileSafSentFile(ctx, dir, file, remoteFiles.get()) ? 1 : 0;
+      CheckOutcome outcome =
+          remoteFiles.isPresent()
+              ? reconcileSafSentFile(ctx, dir, file, remoteFiles.get())
+              : CheckOutcome.UNVERIFIED;
+      if (outcome.equals(CheckOutcome.VERIFIED)) {
+        verified.putBoolean(file.getName(), true);
+      }
+      resent += outcome.equals(CheckOutcome.RESENT) ? 1 : 0;
+      stalled += outcome.equals(CheckOutcome.STALLED) ? 1 : 0;
+    }
+    verified.apply();
+    if (stalled > 0) {
+      reportReconcileFailure(
+          ctx,
+          "The upload folder did not return "
+              + stalled
+              + " copy(ies) in time; kept them unverified.");
     }
     if (resent > 0) {
       CrumblesAppAuditLogger.getInstance(ctx)
@@ -262,11 +325,12 @@ public class CrumblesDeleteSentFilesWorker extends Worker {
   }
 
   /**
-   * Returns the documents in the folder of {@code treeUri} by display name, which one query lists,
-   * rather than one query per document, or empty if the provider returns no cursor.
+   * Returns the documents in the folder of {@code treeUri} whose display name is one of {@code
+   * names}, at most {@link #MAX_DOCUMENTS_PER_NAME} per name, by name. One query lists them all,
+   * rather than one query per document. It is empty if the provider returns no cursor.
    */
   private static Optional<ListMultimap<String, DocumentFile>> listRemoteFilesByName(
-      Context ctx, Uri treeUri) {
+      Context ctx, Uri treeUri, Set<String> names) {
     Uri childrenUri =
         DocumentsContract.buildChildDocumentsUriUsingTree(
             treeUri, DocumentsContract.getTreeDocumentId(treeUri));
@@ -282,59 +346,114 @@ public class CrumblesDeleteSentFilesWorker extends Worker {
       if (cursor == null) {
         return Optional.empty();
       }
+      // A document is wanted if it has the name of a kept copy and that name has a place left, so
+      // that other documents, however many, take no memory.
+      Multiset<String> wanted = HashMultiset.create();
+      names.forEach(name -> wanted.add(name, MAX_DOCUMENTS_PER_NAME));
       ImmutableListMultimap.Builder<String, DocumentFile> files = ImmutableListMultimap.builder();
       while (cursor.moveToNext()) {
-        Uri document = DocumentsContract.buildDocumentUriUsingTree(treeUri, cursor.getString(0));
-        files.put(
-            Strings.nullToEmpty(cursor.getString(1)), DocumentFile.fromSingleUri(ctx, document));
+        String name = cursor.getString(1);
+        if (wanted.remove(name)) {
+          Uri document = DocumentsContract.buildDocumentUriUsingTree(treeUri, cursor.getString(0));
+          files.put(name, DocumentFile.fromSingleUri(ctx, document));
+        }
       }
       return Optional.of(files.build());
     }
   }
 
-  private static boolean reconcileSafSentFile(
+  private static CheckOutcome reconcileSafSentFile(
       Context context,
       File directory,
       File sentFile,
       ListMultimap<String, DocumentFile> remoteFiles) {
     String name = sentFile.getName();
-    String originalName =
-        name.substring(0, name.length() - CrumblesConstants.SENT_SUFFIX.length()) + ".bin";
+    String originalName = originalName(sentFile);
     List<DocumentFile> corrupted = new ArrayList<>();
     byte[] local = null;
     boolean foundValid = false;
     for (DocumentFile remoteFile : remoteFiles.get(originalName)) {
-      try {
-        if (local == null) {
+      if (local == null) {
+        try {
           local = sha256(sentFile);
+        } catch (IOException | NoSuchAlgorithmException e) {
+          Log.e(TAG, "Failed to read " + name + ", keeping it.", e);
+          return CheckOutcome.UNVERIFIED;
         }
-        byte[] remote =
+      }
+      byte[] remote;
+      try {
+        remote =
             GoogleDriveStorageUploader.readBackDigest(context, remoteFile, sentFile.length() + 1);
-        if (MessageDigest.isEqual(local, remote)) {
-          foundValid = true;
-        } else {
-          corrupted.add(remoteFile);
-        }
+      } catch (ClosedChannelException e) {
+        // Only the transfer deadline closes the channel early.
+        Log.e(TAG, "The folder did not return " + originalName + " in time.", e);
+        return CheckOutcome.STALLED;
       } catch (IOException | NoSuchAlgorithmException | RuntimeException e) {
-        Log.e(TAG, "Digest match failed", e);
-        return false;
+        // Whoever shares the folder can give the name of a batch to a directory or to a document of
+        // their own, and binder passes on what the provider throws. Such a document is no copy of
+        // the batch, but it is not ours to delete.
+        Log.w(TAG, "Skipped a document named " + originalName + " that cannot be read.", e);
+        continue;
+      }
+      if (MessageDigest.isEqual(local, remote)) {
+        foundValid = true;
+      } else {
+        corrupted.add(remoteFile);
       }
     }
-    corrupted.forEach(DocumentFile::delete);
-    if (foundValid || hasDeletedKey(context, sentFile)) {
-      return false;
+    corrupted.forEach(CrumblesDeleteSentFilesWorker::deleteCorruptedCopy);
+    if (foundValid) {
+      return CheckOutcome.VERIFIED;
+    }
+    if (hasDeletedKey(context, sentFile)) {
+      return CheckOutcome.UNVERIFIED;
     }
     synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
       try {
         Files.move(sentFile.toPath(), new File(directory, originalName).toPath());
-        return true;
+        return CheckOutcome.RESENT;
       } catch (IOException e) {
         Log.e(TAG, "Failed to restore missing batch for retry: " + name, e);
-        return false;
+        return CheckOutcome.UNVERIFIED;
       }
     }
   }
 
+  /** Deletes {@code copy}, unless its provider does not answer in time; the next check retries. */
+  private static void deleteCorruptedCopy(DocumentFile copy) {
+    try {
+      @SuppressWarnings("unused")
+      var unusedDeleted = CrumblesTransferDeadline.callProvider(copy.getUri(), copy::delete);
+    } catch (IOException e) {
+      Log.w(TAG, "The provider did not delete a corrupted copy in time", e);
+    }
+  }
+
+  /**
+   * Returns whether {@code sentFileName} is a copy sent to a SAF folder that the daily re-check has
+   * not found there since its upload, so that deleting it may lose its logs.
+   */
+  static boolean isUnverifiedSafCopy(Context context, String sentFileName) {
+    // Copies with an upload time went to WebDAV, which nothing re-checks.
+    return !context
+            .getSharedPreferences(RETENTION_PREFS, Context.MODE_PRIVATE)
+            .contains(sentFileName)
+        && !context
+            .getSharedPreferences(VERIFIED_PREFS, Context.MODE_PRIVATE)
+            .contains(sentFileName);
+  }
+
+  /** Returns the name that {@code sentFile} had before its upload, which its copy has too. */
+  private static String originalName(File sentFile) {
+    String name = sentFile.getName();
+    return name.substring(0, name.length() - CrumblesConstants.SENT_SUFFIX.length()) + ".bin";
+  }
+
+  /** Records that the re-check could not verify some kept copies, which stay on the device. */
+  private static void reportReconcileFailure(Context context, String message) {
+    CrumblesAppAuditLogger.getInstance(context).logEvent("KEPT_COPY_RECONCILE_FAILED", message);
+  }
   private static byte[] sha256(File file) throws IOException, NoSuchAlgorithmException {
     MessageDigest digest = MessageDigest.getInstance("SHA-256");
     try (InputStream in = new DigestInputStream(Files.newInputStream(file.toPath()), digest)) {
@@ -348,20 +467,21 @@ public class CrumblesDeleteSentFilesWorker extends Worker {
    * internal key that it is encrypted to is gone.
    *
    * <p>A batch-wrapped key names its batch-wrap key, which is replaced together with the internal
-   * key. An RSA-only batch names no key: it is for an internal key if no external key was ever set,
-   * and that key is gone if no internal key exists, or if the current one differs from the key
-   * recorded at upload, or else does not have the size of the RSA-wrapped key.
+   * key. Any other batch for the internal key has an empty batch-wrap key id, unless an earlier
+   * version wrote it: such a batch names no key, and is for an internal key if no external key was
+   * ever set. The key of either batch is gone if no internal key exists, if the current one differs
+   * from the key recorded at upload, or else if it does not have the size of the RSA-wrapped key.
    */
   private static boolean hasDeletedKey(Context context, File sentFile) {
     try {
       CrumblesLogsEncryptor enc = CrumblesMain.getLogsEncryptorInstance();
       var k = enc.deserializeFile(sentFile.toPath()).getKey();
-      if (k.hasBatchWrapKeyId()) {
+      if (!k.getBatchWrapKeyId().isEmpty()) {
         return !enc.doesPrivateKeyExist()
             || !CrumblesBatchKeyStore.hasKeys()
             || !CrumblesBatchKeyStore.keyId().equals(k.getBatchWrapKeyId());
       }
-      if (mayHaveExternalKeyBatches(context)) {
+      if (!k.hasBatchWrapKeyId() && mayHaveExternalKeyBatches(context)) {
         return false;
       }
       PublicKey internalKey = enc.getPublicKey();

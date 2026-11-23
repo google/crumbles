@@ -31,7 +31,6 @@ import java.security.GeneralSecurityException;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
-import java.security.ProviderException;
 import java.security.Signature;
 import java.security.cert.Certificate;
 import java.security.spec.ECGenParameterSpec;
@@ -84,8 +83,9 @@ public final class CrumblesBatchSigningKey {
           .setSignature(ByteString.copyFrom(signer.sign()))
           .addAllAttestationChain(encodedCertificateChain(keyStore))
           .build();
-    } catch (GeneralSecurityException | IOException | ProviderException e) {
-      // Keystore reports some failures, such as having no attestation key, as ProviderException.
+    } catch (GeneralSecurityException | IOException | RuntimeException e) {
+      // Keystore reports some failures, such as having no attestation key, as ProviderException,
+      // and on some OEM builds throws other unchecked exceptions.
       throw new CrumblesKeysException("Failed to sign with the batch-signing key.", e);
     }
   }
@@ -100,8 +100,9 @@ public final class CrumblesBatchSigningKey {
   ImmutableList<ByteString> attestationChain() throws CrumblesKeysException {
     try {
       return encodedCertificateChain(loadKeyStoreCreatingKey());
-    } catch (GeneralSecurityException | IOException | ProviderException e) {
-      // Keystore reports some failures, such as having no attestation key, as ProviderException.
+    } catch (GeneralSecurityException | IOException | RuntimeException e) {
+      // Keystore reports some failures, such as having no attestation key, as ProviderException,
+      // and on some OEM builds throws other unchecked exceptions.
       throw new CrumblesKeysException(
           "Failed to read the attestation chain of the batch-signing key.", e);
     }
@@ -125,8 +126,9 @@ public final class CrumblesBatchSigningKey {
       verifier.initVerify(certificate);
       verifier.update(data);
       return verifier.verify(signature);
-    } catch (GeneralSecurityException | IOException | ProviderException e) {
-      // Keystore reports some failures as ProviderException.
+    } catch (GeneralSecurityException | IOException | RuntimeException e) {
+      // Keystore reports some failures as ProviderException, and on some OEM builds throws other
+      // unchecked exceptions.
       throw new CrumblesKeysException("Failed to verify with the batch-signing key.", e);
     }
   }
@@ -144,7 +146,8 @@ public final class CrumblesBatchSigningKey {
       if (keyStore.containsAlias(ALIAS)) {
         keyStore.deleteEntry(ALIAS);
       }
-    } catch (GeneralSecurityException | IOException | ProviderException e) {
+    } catch (GeneralSecurityException | IOException | RuntimeException e) {
+      // As in verifies.
       throw new CrumblesKeysException("Failed to delete the batch-signing key.", e);
     }
   }
@@ -180,9 +183,10 @@ public final class CrumblesBatchSigningKey {
   private void create() throws GeneralSecurityException {
     try {
       create(/* strongBoxBacked= */ true);
-    } catch (GeneralSecurityException | ProviderException e) {
+    } catch (GeneralSecurityException | RuntimeException e) {
       // StrongBoxUnavailableException only means that the device has no StrongBox. A StrongBox can
-      // also fail in other ways, for example when it has no attestation key, while the TEE works.
+      // also fail in other ways while the TEE works: when it has no attestation key, it throws
+      // ProviderException, and on some OEM builds it throws other unchecked exceptions.
       Log.w(TAG, "StrongBox could not create the batch-signing key; creating it in the TEE.", e);
       create(/* strongBoxBacked= */ false);
     }

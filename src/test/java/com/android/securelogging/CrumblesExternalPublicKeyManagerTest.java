@@ -25,6 +25,7 @@ import com.android.securelogging.CrumblesExternalPublicKeyManager.SavedReEncrypt
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
+import com.google.common.collect.ImmutableList;
 import com.google.common.truth.Expect;
 import com.google.protobuf.ByteString;
 import java.io.File;
@@ -250,6 +251,49 @@ public final class CrumblesExternalPublicKeyManagerTest {
         CrumblesLogsEncryptor.PREFERENCE_PRIMARY_KEY_ALIAS);
 
     assertThat(publicKeyManager.getActiveExternalPublicKey()).isNull();
+  }
+
+  @Test
+  public void getSavedExternalPublicKeys_returnsTheActiveKeyAndTheClearedOnes() throws Exception {
+    PublicKey clearedKey = KeyPairGenerator.getInstance("RSA").generateKeyPair().getPublic();
+    publicKeyManager.saveActiveExternalPublicKey(clearedKey);
+    publicKeyManager.clearActiveExternalPublicKey();
+    publicKeyManager.saveActiveExternalPublicKey(testPublicKey);
+
+    ImmutableList<PublicKey> savedKeys = publicKeyManager.getSavedExternalPublicKeys();
+
+    assertThat(savedKeys.stream().map(key -> ByteString.copyFrom(key.getEncoded())).toList())
+        .containsExactly(
+            ByteString.copyFrom(clearedKey.getEncoded()),
+            ByteString.copyFrom(testPublicKey.getEncoded()));
+  }
+
+  @Test
+  public void getSavedExternalPublicKeys_whenNoneSaved_returnsEmpty() throws Exception {
+    assertThat(publicKeyManager.getSavedExternalPublicKeys()).isEmpty();
+  }
+
+  @Test
+  public void getSavedExternalPublicKeys_whenActiveKeyIdNotInMap_throws() throws Exception {
+    publicKeyManager.saveActiveExternalPublicKey(testPublicKey);
+    testDataStore
+        .updateDataAsync(prefs -> prefs.toBuilder().setActiveKeyId("unknown-key-id").build())
+        .get();
+
+    assertThrows(CrumblesKeysException.class, () -> publicKeyManager.getSavedExternalPublicKeys());
+  }
+
+  @Test
+  public void getSavedExternalPublicKeys_whenASavedKeyCannotBeDecrypted_throws() throws Exception {
+    publicKeyManager.saveActiveExternalPublicKey(testPublicKey);
+    EncryptedPayload badPayload =
+        EncryptedPayload.newBuilder().setCiphertext(ByteString.copyFromUtf8("bad")).build();
+    testDataStore
+        .updateDataAsync(
+            prefs -> prefs.toBuilder().putExternalPublicKeys("bad_key", badPayload).build())
+        .get();
+
+    assertThrows(CrumblesKeysException.class, () -> publicKeyManager.getSavedExternalPublicKeys());
   }
 
   @Test

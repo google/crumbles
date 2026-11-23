@@ -30,6 +30,7 @@ import com.android.securelogging.CrumblesConstants;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
 import com.google.common.io.BaseEncoding;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -318,8 +319,11 @@ public class CrumblesAppAuditLogger {
   }
 
   static void appendLineToFile(File file, String line) throws IOException {
-    Files.writeString(
-        file.toPath(), line + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    Files.write(
+        file.toPath(),
+        (line + "\n").getBytes(UTF_8),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.APPEND);
   }
 
   private void ensureAuxiliaryFilesLocked() {
@@ -914,6 +918,44 @@ public class CrumblesAppAuditLogger {
    * if positive, {@code unsealedRecordCount} unshipped records not sealed before clearing.
    */
   public void clearAllLogs(int unsealedRecordCount) {
+    clear(unsealedRecordCount, /* keptRecords= */ ImmutableList.of());
+  }
+
+  /**
+   * Clears the activity log as {@link #clearAllLogs()} does, but keeps the records that no stored
+   * log batch carries yet, such as those logged while the batch sealed before the clear was being
+   * written, or by another thread since: they follow the tombstone as new records of the new chain,
+   * so that the next batch ships them. Returns how many records were kept.
+   *
+   * <p>A record that cannot be unsealed is not kept: its data key is gone, so no one could read it.
+   */
+  @CanIgnoreReturnValue
+  public int clearShippedLogs() {
+    // Holding fileLock throughout, no record can be logged between reading the unshipped records
+    // and clearing them.
+    synchronized (fileLock) {
+      ImmutableList.Builder<CrumblesAuditEvent> keptRecords = ImmutableList.builder();
+      for (String record : getUnshippedExcerpt().records) {
+        try {
+          CrumblesAuditEvent event = CrumblesAuditEvent.fromJsonString(record);
+          keptRecords.add(
+              new CrumblesAuditEvent(
+                  event.getTimestamp(), event.getEventType(), event.getMessage()));
+        } catch (JSONException e) {
+          Log.e(TAG, "Dropping an unshipped audit record that cannot be read.", e);
+        }
+      }
+      ImmutableList<CrumblesAuditEvent> kept = keptRecords.build();
+      clear(/* unsealedRecordCount= */ 0, kept);
+      return kept.size();
+    }
+  }
+
+  /**
+   * Deletes all persisted audit records, writes the tombstone, then appends {@code keptRecords} as
+   * the next records of the new chain.
+   */
+  private void clear(int unsealedRecordCount, ImmutableList<CrumblesAuditEvent> keptRecords) {
     synchronized (memoryCache) {
       memoryCache.clear();
     }
@@ -921,7 +963,7 @@ public class CrumblesAppAuditLogger {
       rateLimitWindows.clear();
       int priorDropped = droppedWriteCount;
       Instant priorFirstTime = firstFailureTime;
-      String tombstoneMessage = buildTombstoneMessage(unsealedRecordCount);
+      String tombstoneMessage = buildTombstoneMessage(unsealedRecordCount, keptRecords.size());
       if (currentLogFile.exists() && !currentLogFile.delete()) {
         Log.e(TAG, "Failed to delete current audit log file.");
       }
@@ -932,6 +974,9 @@ public class CrumblesAppAuditLogger {
       // New records chain from the genesis tag, or from what is left if a delete failed. Their
       // numbering continues, so the tombstone's number shows how many records came before it.
       lastTag = loadLastTag();
+      if (lastTag == null) {
+        lastSequenceNumber = Math.max(0, lastSequenceNumber - keptRecords.size());
+      }
       signingFailureCount = 0;
       sealingFailureCount = 0;
       clearDroppedStateLocked();
@@ -946,11 +991,18 @@ public class CrumblesAppAuditLogger {
         firstFailureTime = priorFirstTime;
         persistDroppedStateLocked();
       }
+      // Like the tombstone, the kept records are not subject to the rate limit.
+      for (CrumblesAuditEvent keptRecord : keptRecords) {
+        persistAndCache(keptRecord);
+      }
     }
   }
 
-  /** Returns the tombstone message, which states the number of removed records if it is known. */
-  private String buildTombstoneMessage(int unsealedRecordCount) {
+  /**
+   * Returns the tombstone message, which states the number of removed records if it is known, and
+   * how many unshipped records could not be sealed before clearing or follow it.
+   */
+  private String buildTombstoneMessage(int unsealedRecordCount, int keptRecordCount) {
     String lostSuffix =
         droppedWriteCount > 0
             ? " (" + droppedWriteCount + " unpersisted records were also lost)"
@@ -966,6 +1018,9 @@ public class CrumblesAppAuditLogger {
     if (unsealedRecordCount > 0) {
       baseMessage +=
           " (" + unsealedRecordCount + " unshipped records could not be sealed before clear)";
+    }
+    if (keptRecordCount > 0) {
+      baseMessage += " (" + keptRecordCount + " unshipped records follow)";
     }
     return baseMessage;
   }

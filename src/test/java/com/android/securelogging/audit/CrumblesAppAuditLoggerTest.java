@@ -268,7 +268,7 @@ public class CrumblesAppAuditLoggerTest {
   public void logEvent_whenRotationDiscardsOldLogFile_tombstoneGivesItsRecordCountAndDigest()
       throws Exception {
     synchronized (auditLogger.fileLock) {
-      Files.writeString(oldLogFile.toPath(), "first record\n\nsecond record\n");
+      Files.write(oldLogFile.toPath(), "first record\n\nsecond record\n".getBytes(UTF_8));
       Files.write(currentLogFile.toPath(), new byte[OVERSIZED_LOG_FILE_BYTES]);
     }
 
@@ -298,14 +298,16 @@ public class CrumblesAppAuditLoggerTest {
   @Test
   public void logEvent_whenTombstoneCannotBeSealed_keepsTheOldLogFile() throws Exception {
     synchronized (auditLogger.fileLock) {
-      Files.writeString(oldLogFile.toPath(), "kept record\n");
+      Files.write(oldLogFile.toPath(), "kept record\n".getBytes(UTF_8));
       Files.write(currentLogFile.toPath(), new byte[OVERSIZED_LOG_FILE_BYTES]);
     }
     restartLoggerWithUnusableDataKey();
 
     auditLogger.logEvent("EVENT_1", "Cannot be sealed either.");
 
-    expect.that(Files.readString(oldLogFile.toPath())).isEqualTo("kept record\n");
+    expect
+        .that(new String(Files.readAllBytes(oldLogFile.toPath()), UTF_8))
+        .isEqualTo("kept record\n");
     expect.that(currentLogFile.length()).isGreaterThan(CrumblesConstants.MAX_LOG_FILE_SIZE_BYTES);
     expect.that(auditLogger.getWriteFailureCount()).isEqualTo(2);
   }
@@ -1003,6 +1005,51 @@ public class CrumblesAppAuditLoggerTest {
   }
 
   @Test
+  public void clearShippedLogs_keepsTheUnshippedRecordsAfterTheTombstone() throws Exception {
+    auditLogger.logEvent("SHIPPED_EVENT", "Sealed into an earlier batch.");
+    auditLogger.markShipped(auditLogger.getUnshippedExcerpt());
+    auditLogger.logEvent("UNSHIPPED_EVENT_1", "Logged while the earlier batch was written.");
+    auditLogger.logEvent("UNSHIPPED_EVENT_2", "Logged by another thread before the clear.");
+    CrumblesAuditEvent firstUnshipped =
+        CrumblesAuditEvent.fromJsonString(readUnsealedRecords().get(1));
+
+    int kept = auditLogger.clearShippedLogs();
+
+    // Newest first.
+    List<CrumblesAuditEvent> events = auditLogger.getAllPersistedEventsForDisplay();
+    expect.that(kept).isEqualTo(2);
+    expect
+        .that(events.stream().map(CrumblesAuditEvent::getEventType).toList())
+        .containsExactly("UNSHIPPED_EVENT_2", "UNSHIPPED_EVENT_1", "AUDIT_LOG_CLEARED")
+        .inOrder();
+    expect
+        .that(events.stream().map(CrumblesAuditEvent::getSequenceNumber).toList())
+        .containsExactly(OptionalLong.of(4), OptionalLong.of(3), OptionalLong.of(2))
+        .inOrder();
+    expect
+        .that(events.get(2).getMessage())
+        .isEqualTo("Audit log cleared; 3 records removed. (2 unshipped records follow)");
+    expect.that(events.get(1).getMessage()).isEqualTo(firstUnshipped.getMessage());
+    expect.that(events.get(1).getTimestamp()).isEqualTo(firstUnshipped.getTimestamp());
+    expect.that(auditLogger.getUnshippedExcerpt().size()).isEqualTo(3);
+    expect.that(auditLogger.verifyChain().isIntact()).isTrue();
+  }
+
+  @Test
+  public void clearShippedLogs_whenEveryRecordIsShipped_leavesOnlyTheTombstone() {
+    auditLogger.logEvent("SHIPPED_EVENT", "Sealed into an earlier batch.");
+    auditLogger.markShipped(auditLogger.getUnshippedExcerpt());
+
+    int kept = auditLogger.clearShippedLogs();
+
+    List<CrumblesAuditEvent> events = auditLogger.getAllPersistedEventsForDisplay();
+    expect.that(kept).isEqualTo(0);
+    expect.that(events).hasSize(1);
+    expect.that(events.get(0).getEventType()).isEqualTo("AUDIT_LOG_CLEARED");
+    expect.that(events.get(0).getMessage()).isEqualTo("Audit log cleared; 1 records removed.");
+  }
+
+  @Test
   public void auditLogger_writesUnderNoBackupFilesDir() {
     auditLogger.logEvent("TEST", "x");
 
@@ -1178,7 +1225,8 @@ public class CrumblesAppAuditLoggerTest {
   public void verifyChain_whenOldLogFileMissing_logsNoError() {
     auditLogger.logEvent("EVENT_1", "First message.");
 
-    var _ = auditLogger.verifyChain();
+    @SuppressWarnings("unused")
+    var unusedVerification = auditLogger.verifyChain();
 
     assertThat(
             ShadowLog.getLogsForTag("CrumblesAppAuditLogger").stream()
@@ -1546,7 +1594,9 @@ public class CrumblesAppAuditLoggerTest {
 
     auditLogger = CrumblesAppAuditLogger.getInstance(appContext);
 
-    expect.that(Files.readString(currentLogFile.toPath())).doesNotContain("earlier version");
+    expect
+        .that(new String(Files.readAllBytes(currentLogFile.toPath()), UTF_8))
+        .doesNotContain("earlier version");
     expect.that(auditLogger.verifyChain().getVerifiedRecords()).isEqualTo(1);
     expect.that(auditLogger.getAllPersistedEventsForDisplay()).hasSize(1);
   }
@@ -1560,7 +1610,8 @@ public class CrumblesAppAuditLoggerTest {
 
     auditLogger = CrumblesAppAuditLogger.getInstance(appContext);
 
-    assertThat(Files.readString(oldLogFile.toPath())).doesNotContain("earlier version");
+    assertThat(new String(Files.readAllBytes(oldLogFile.toPath()), UTF_8))
+        .doesNotContain("earlier version");
   }
 
   @Test
@@ -1575,7 +1626,9 @@ public class CrumblesAppAuditLoggerTest {
 
     auditLogger = CrumblesAppAuditLogger.getInstance(appContext);
 
-    expect.that(Files.readString(currentLogFile.toPath())).doesNotContain("not-json");
+    expect
+        .that(new String(Files.readAllBytes(currentLogFile.toPath()), UTF_8))
+        .doesNotContain("not-json");
     expect.that(auditLogger.verifyChain().getFirstBrokenIndex()).isEqualTo(1);
   }
 
@@ -1586,7 +1639,9 @@ public class CrumblesAppAuditLoggerTest {
 
     restartLoggerWithUnusableDataKey();
 
-    expect.that(Files.readString(currentLogFile.toPath())).contains("earlier version");
+    expect
+        .that(new String(Files.readAllBytes(currentLogFile.toPath()), UTF_8))
+        .contains("earlier version");
     expect.that(auditLogger.getAllPersistedEventsForDisplay()).hasSize(1);
     expect
         .that(new File(currentLogFile.getPath() + CrumblesConstants.TEMP_FILE_SUFFIX).exists())
@@ -2051,12 +2106,12 @@ public class CrumblesAppAuditLoggerTest {
     logAt(logger, now, "13:00:04Z", "RECOVERED", "Flushes preserved window.");
     expectDroppedSummary(readRecords(currentLogFile).get(0), 3, "13:00:01Z", "13:00:03Z");
     Files.write(currentLogFile.toPath(), new byte[OVERSIZED_LOG_FILE_BYTES]);
-    Files.writeString(oldLogFile.toPath(), "kept", UTF_8);
+    Files.write(oldLogFile.toPath(), "kept".getBytes(UTF_8));
     expect.that(reserveFile.delete()).isTrue();
     failures.set(2);
     logAt(logger, now, "13:00:08Z", "ROTATE_WRITE_FAILS", "Uses rotate reserve; keeps old log.");
     expect.that(failures.get()).isEqualTo(0);
-    expect.that(Files.readString(oldLogFile.toPath(), UTF_8)).isEqualTo("kept");
+    expect.that(new String(Files.readAllBytes(oldLogFile.toPath()), UTF_8)).isEqualTo("kept");
     expect.that(oldLogFile.delete()).isTrue();
     File pin = new File(oldLogFile, "pin");
     expect.that(oldLogFile.mkdir() && pin.createNewFile()).isTrue();

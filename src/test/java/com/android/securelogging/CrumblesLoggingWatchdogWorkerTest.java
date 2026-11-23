@@ -23,6 +23,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -31,12 +32,15 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.admin.DevicePolicyManager;
+import android.app.admin.SecurityLog;
+import android.app.admin.SecurityLog.SecurityEvent;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.os.Process;
 import android.os.UserHandle;
 import android.os.UserManager;
+import android.provider.Settings;
 import android.service.notification.StatusBarNotification;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -49,6 +53,8 @@ import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.common.truth.Expect;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.File;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.security.KeyPairGenerator;
@@ -58,6 +64,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -66,6 +73,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.Shadows;
+import org.robolectric.shadows.ShadowEventLog;
 
 /** Unit tests for {@link CrumblesLoggingWatchdogWorker}. */
 @RunWith(AndroidJUnit4.class)
@@ -571,6 +579,7 @@ public final class CrumblesLoggingWatchdogWorkerTest {
     expect.that(getAuditEventTypes().get(0)).isEqualTo(resumed);
 
     when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    when(mockDpm.isNetworkLoggingEnabled(any(ComponentName.class))).thenReturn(true);
     long session = CrumblesDeviceAdminReceiver.currentNetworkLoggingSessionKey(context);
     Files.write(
         new File(context.getNoBackupFilesDir(), CrumblesDeviceAdminReceiver.DEFERRED_TOKENS_FILE)
@@ -583,8 +592,126 @@ public final class CrumblesLoggingWatchdogWorkerTest {
     expect.that(getAuditEventTypes()).contains(CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST);
   }
 
+  @Test
+  public void doWork_savesThePreRebootLogsOncePerBoot() throws Exception {
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(Collections.singletonList(preRebootSecurityEvent()));
+    runWorkerWithLoggingEnabled(true);
+
+    runWorkerWithLoggingEnabled(true);
+
+    expect.that(new CrumblesLogStaging(context).countBatches()).isEqualTo(1);
+    expect
+        .that(getAuditEventTypes())
+        .containsExactly(CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_STAGED);
+  }
+
+  private static SecurityEvent preRebootSecurityEvent() throws Exception {
+    Constructor<SecurityEvent> constructor =
+        SecurityEvent.class.getDeclaredConstructor(long.class, byte[].class);
+    constructor.setAccessible(true);
+    SecurityEvent securityEvent = constructor.newInstance(7L, new byte[0]);
+    Field event = SecurityEvent.class.getDeclaredField("mEvent");
+    event.setAccessible(true);
+    event.set(
+        securityEvent,
+        new ShadowEventLog.EventBuilder(SecurityLog.TAG_OS_SHUTDOWN, "restart")
+            .setTimeNanos(TimeUnit.MILLISECONDS.toNanos(1672531200000L))
+            .build());
+    return securityEvent;
+  }
+
   private boolean hasPausedNotification() {
     return Arrays.stream(getNotificationManager().getActiveNotifications())
         .anyMatch(n -> n.getId() == CrumblesConstants.COLLECTION_PAUSED_NOTIFICATION_ID);
+  }
+
+  @Test
+  public void doWork_asDeviceOwnerWhileRefusedWithoutSecondaryUsers_keepsCollectionPaused() {
+    when(mockDpm.isSecurityLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    SecurityException refusal = new SecurityException("An unaffiliated work profile is present");
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenThrow(refusal);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class))).thenThrow(refusal);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(contextWithDpm);
+
+    runWorker();
+
+    expect
+        .that(getAuditEventTypes())
+        .doesNotContain(CrumblesDeviceAdminReceiver.AUDIT_EVENT_COLLECTION_RESUMED);
+    expect.that(hasPausedNotification()).isTrue();
+  }
+
+  @Test
+  public void doWork_whenNetworkLoggingTurnedOffAndOn_reportsDeferredBatchOfOldSessionLost()
+      throws Exception {
+    when(mockDpm.isNetworkLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    runWorkerWithLoggingEnabled(true);
+    long oldSession = CrumblesDeviceAdminReceiver.currentNetworkLoggingSessionKey(context);
+    when(mockDpm.isNetworkLoggingEnabled(any(ComponentName.class))).thenReturn(false);
+    runWorkerWithLoggingEnabled(true);
+    when(mockDpm.isNetworkLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    // A batch deferred before network logging went off, whose token the new session reuses.
+    Files.write(
+        new File(context.getNoBackupFilesDir(), CrumblesDeviceAdminReceiver.DEFERRED_TOKENS_FILE)
+            .toPath(),
+        ByteBuffer.allocate(268).putLong(oldSession).putInt(1).putLong(1L).array());
+
+    runWorkerWithLoggingEnabled(true);
+
+    verify(mockDpm, never()).retrieveNetworkLogs(any(ComponentName.class), eq(1L));
+    expect
+        .that(getAuditEvents().get(0).getMessage())
+        .isEqualTo(
+            "Deferred network log batch (token 1) was lost: logging session restarted before"
+                + " retrieval.");
+
+    // A batch deferred after the re-enable belongs to the live session and is retrieved.
+    long liveSession = CrumblesDeviceAdminReceiver.currentNetworkLoggingSessionKey(context);
+    when(mockDpm.isNetworkLoggingEnabled(any(ComponentName.class))).thenReturn(false);
+    runWorkerWithLoggingEnabled(true);
+    when(mockDpm.isNetworkLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    long reenabledSession = CrumblesDeviceAdminReceiver.currentNetworkLoggingSessionKey(context);
+    expect.that(reenabledSession).isNotEqualTo(liveSession);
+    Files.write(
+        new File(context.getNoBackupFilesDir(), CrumblesDeviceAdminReceiver.DEFERRED_TOKENS_FILE)
+            .toPath(),
+        ByteBuffer.allocate(268).putLong(reenabledSession).putInt(1).putLong(2L).array());
+    runWorkerWithLoggingEnabled(true);
+    verify(mockDpm).retrieveNetworkLogs(any(ComponentName.class), eq(2L));
+  }
+
+  @Test
+  public void doWork_whenNotificationsAreTurnedOffThenOn_recordsEachChangeOnce() {
+    Shadows.shadowOf(getNotificationManager()).setNotificationsEnabled(false);
+    runWorker();
+    runWorker();
+    Shadows.shadowOf(getNotificationManager()).setNotificationsEnabled(true);
+
+    runWorker();
+
+    expect
+        .that(getAuditEventTypes())
+        .containsExactly(
+            CrumblesLoggingWatchdogWorker.AUDIT_EVENT_NOTIFICATIONS_RESTORED,
+            CrumblesLoggingWatchdogWorker.AUDIT_EVENT_NOTIFICATIONS_BLOCKED)
+        .inOrder();
+  }
+
+  @Test
+  public void doWork_whenActionNeededChannelIsTurnedOff_recordsNotificationsBlocked() {
+    getNotificationManager()
+        .createNotificationChannel(
+            new NotificationChannel(
+                CrumblesConstants.ACTION_NEEDED_NOTIFICATION_CHANNEL_ID,
+                "Background sync alerts",
+                NotificationManager.IMPORTANCE_NONE));
+
+    runWorker();
+
+    expect
+        .that(getAuditEventTypes())
+        .containsExactly(CrumblesLoggingWatchdogWorker.AUDIT_EVENT_NOTIFICATIONS_BLOCKED);
   }
 }

@@ -24,6 +24,8 @@ import android.content.SharedPreferences;
 import android.provider.Settings;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import java.time.Duration;
+import java.util.concurrent.locks.LockSupport;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -128,6 +130,33 @@ public final class CrumblesDeviceIdManagerTest {
     CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ false);
 
     assertThat(CrumblesDeviceIdManager.getDeviceId(context)).isNotEqualTo("hardware_serial_12345");
+  }
+
+  @Test
+  public void setHardwareAttributionEnabled_whileUploadLockIsHeld_waitsToChangeTheDeviceId()
+      throws InterruptedException {
+    ShadowBuild.setSerial("hardware_serial_12345");
+    Thread enabler =
+        new Thread(
+            () ->
+                CrumblesDeviceIdManager.setHardwareAttributionEnabled(
+                    context, /* enabled= */ true));
+
+    boolean enabledWhileLockIsHeld;
+    synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
+      enabler.start();
+      long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+      while (enabler.isAlive()
+          && enabler.getState() != Thread.State.BLOCKED
+          && System.nanoTime() < deadline) {
+        LockSupport.parkNanos(Duration.ofMillis(10).toNanos());
+      }
+      enabledWhileLockIsHeld = CrumblesDeviceIdManager.isHardwareAttributionEnabled(context);
+    }
+    enabler.join(Duration.ofSeconds(10).toMillis());
+
+    assertThat(enabledWhileLockIsHeld).isFalse();
+    assertThat(CrumblesDeviceIdManager.getDeviceId(context)).isEqualTo("hardware_serial_12345");
   }
 
   @Test

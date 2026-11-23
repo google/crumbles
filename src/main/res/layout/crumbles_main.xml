@@ -49,6 +49,16 @@
             android:text="@string/btn_set_screen_lock_label" />
     </LinearLayout>
 
+    <TextView
+        android:id="@+id/alerts_blocked_warning"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:text="@string/alerts_blocked_warning"
+        android:textColor="?attr/colorError"
+        android:textSize="16sp"
+        android:visibility="gone" />
+
     <LinearLayout
         android:id="@+id/device_admin_offer"
         android:layout_width="match_parent"

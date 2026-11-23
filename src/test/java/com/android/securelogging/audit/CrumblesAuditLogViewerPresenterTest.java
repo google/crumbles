@@ -178,7 +178,7 @@ public class CrumblesAuditLogViewerPresenterTest {
     presenter.onClearLogsConfirmed();
 
     verify(mockView).requestDeviceCredentialConfirmation();
-    verify(mockAuditLogger, never()).clearAllLogs();
+    verify(mockAuditLogger, never()).clearShippedLogs();
   }
 
   @Test
@@ -206,7 +206,7 @@ public class CrumblesAuditLogViewerPresenterTest {
             "AUDIT_LOG_CLEAR_REFUSED",
             "Activity log kept because no secure lock screen is set up.");
     inOrder.verify(mockView).showLogs(ImmutableList.of(TEST_EVENT));
-    verify(mockAuditLogger, never()).clearAllLogs();
+    verify(mockAuditLogger, never()).clearShippedLogs();
   }
 
   @Test
@@ -223,7 +223,7 @@ public class CrumblesAuditLogViewerPresenterTest {
             "AUDIT_LOG_CLEAR_AUTH_FAILED",
             "Activity log kept because no device credential was confirmed for clearing it.");
     inOrder.verify(mockView).showLogs(ImmutableList.of(TEST_EVENT));
-    verify(mockAuditLogger, never()).clearAllLogs();
+    verify(mockAuditLogger, never()).clearShippedLogs();
   }
 
   @Test
@@ -235,13 +235,13 @@ public class CrumblesAuditLogViewerPresenterTest {
 
     InOrder inOrder = inOrder(mockSealBeforeClear, mockAuditLogger, mockView);
     inOrder.verify(mockSealBeforeClear).getAsInt();
-    inOrder.verify(mockAuditLogger).clearAllLogs(0);
+    inOrder.verify(mockAuditLogger).clearShippedLogs();
     inOrder.verify(mockAuditLogger).getAllPersistedEventsForDisplay();
     inOrder.verify(mockView).showNoLogsMessage();
   }
 
   @Test
-  public void onDeviceCredentialConfirmed_whenSealingFails_clearsWithUnsealedCountAndRefreshes() {
+  public void onDeviceCredentialConfirmed_whenSealingFails_keepsLogsRecordsRefusalAndTellsUser() {
     when(mockSealBeforeClear.getAsInt()).thenReturn(2);
     when(mockAuditLogger.getAllPersistedEventsForDisplay())
         .thenReturn(ImmutableList.of(TEST_EVENT));
@@ -250,9 +250,16 @@ public class CrumblesAuditLogViewerPresenterTest {
 
     InOrder inOrder = inOrder(mockSealBeforeClear, mockAuditLogger, mockView);
     inOrder.verify(mockSealBeforeClear).getAsInt();
-    inOrder.verify(mockAuditLogger).clearAllLogs(2);
-    inOrder.verify(mockAuditLogger).getAllPersistedEventsForDisplay();
+    inOrder
+        .verify(mockAuditLogger)
+        .logEvent(
+            "AUDIT_LOG_CLEAR_REFUSED",
+            "Activity log kept because 2 unshipped record(s) could not be sealed into a log batch"
+                + " first.");
+    inOrder.verify(mockView).showClearRefused();
     inOrder.verify(mockView).showLogs(ImmutableList.of(TEST_EVENT));
+    verify(mockAuditLogger, never()).clearShippedLogs();
+    verify(mockAuditLogger, never()).clearAllLogs(anyInt());
   }
 
   @Test
@@ -265,11 +272,11 @@ public class CrumblesAuditLogViewerPresenterTest {
 
     presenter.onDeviceCredentialConfirmed();
     verify(mockSealBeforeClear, never()).getAsInt();
-    verify(mockAuditLogger, never()).clearAllLogs(anyInt());
+    verify(mockAuditLogger, never()).clearShippedLogs();
 
     backgroundTasks.get(0).run();
     verify(mockSealBeforeClear).getAsInt();
-    verify(mockAuditLogger).clearAllLogs(0);
+    verify(mockAuditLogger).clearShippedLogs();
     verify(mockView, never()).showNoLogsMessage();
   }
 }

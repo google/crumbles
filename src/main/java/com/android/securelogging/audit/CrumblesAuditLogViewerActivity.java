@@ -18,18 +18,19 @@ package com.android.securelogging.audit;
 
 import android.content.Context;
 import android.os.Bundle;
-import android.support.v7.app.AlertDialog;
-import android.support.v7.app.AppCompatActivity;
-import android.support.v7.widget.LinearLayoutManager;
-import android.support.v7.widget.RecyclerView;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 import com.android.securelogging.CrumblesDeviceAdminReceiver;
 import com.android.securelogging.CrumblesDeviceCredentialGate;
+import com.android.securelogging.CrumblesLauncherEntry;
 import com.android.securelogging.CrumblesWindowInsets;
 import com.android.securelogging.R;
 import com.android.securelogging.audit.CrumblesAppAuditLogger.CrumblesChainVerification;
@@ -68,6 +69,7 @@ public class CrumblesAuditLogViewerActivity extends AppCompatActivity
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
+    CrumblesLauncherEntry.applyToTask(this);
     setContentView(R.layout.activity_audit_log_viewer);
     CrumblesWindowInsets.applySystemBarPadding(this);
 
@@ -223,5 +225,10 @@ public class CrumblesAuditLogViewerActivity extends AppCompatActivity
       return true;
     }
     return super.onOptionsItemSelected(item);
+  }
+
+  @Override
+  public void showClearRefused() {
+    Toast.makeText(this, R.string.toast_audit_log_clear_refused, Toast.LENGTH_LONG).show();
   }
 }

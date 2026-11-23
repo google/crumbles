@@ -42,16 +42,20 @@ import androidx.core.content.FileProvider;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.google.common.collect.ImmutableList;
+import com.google.protobuf.ByteString;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.PublicKey;
-import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /** An activity to display decrypted Crumbles logs and offer re-encryption and sharing options. */
 public class CrumblesDecryptedLogsActivity extends Activity {
@@ -85,6 +89,7 @@ public class CrumblesDecryptedLogsActivity extends Activity {
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
+    CrumblesLauncherEntry.applyToTask(this);
     setContentView(R.layout.activity_decrypted_logs);
     CrumblesWindowInsets.applySystemBarPadding(this);
     setTitle(R.string.decrypted_logs_viewer_title);
@@ -259,7 +264,8 @@ public class CrumblesDecryptedLogsActivity extends Activity {
     ArrayList<Uri> reEncryptedFileUris = new ArrayList<>();
     boolean allSuccess = true;
 
-    for (CrumblesDecryptedLogEntry entry : decryptedLogEntries) {
+    for (int index = 0; index < decryptedLogEntries.size(); index++) {
+      CrumblesDecryptedLogEntry entry = decryptedLogEntries.get(index);
       if (entry.getRawBytes() == null) {
         Log.w(
             TAG,
@@ -270,16 +276,10 @@ public class CrumblesDecryptedLogsActivity extends Activity {
       try {
         LogBatch encryptedBatch = reEncryptEntry(entry, entry.getRawBytes(), reEncryptionKey);
 
-        String sanitizedOriginalFileName = entry.getFileName().replaceAll("[^a-zA-Z0-9._-]", "_");
-        String tempFileName =
-            "re_encrypted_"
-                + InstantSource.system().instant().toEpochMilli()
-                + "_"
-                + sanitizedOriginalFileName;
-        if (tempFileName.length() > 100) {
-          tempFileName = tempFileName.substring(0, 100);
-        }
-        tempFileName += ".bin";
+        // Several batches can share a display name, so each copy gets a new name of its own,
+        // created only if no file has it yet (CREATE_NEW): no copy can replace another.
+        String tempFileName = "re_encrypted_" + index + "_" + UUID.randomUUID() + ".bin";
+        Files.createFile(new File(tempDirBase, tempFileName).toPath());
 
         Path tempFilePath = logsEncryptor.serializeBytes(encryptedBatch, tempDirBase, tempFileName);
 
@@ -514,10 +514,10 @@ public class CrumblesDecryptedLogsActivity extends Activity {
   }
 
   /**
-   * Re-encrypts {@code rawBytes} for {@code reEncryptionKey}. When {@code entry} came from a batch
-   * signed by this installation, the new batch is signed again under the original sequence number,
-   * attributed to this installation's device ID and sealing the attestation chain of its
-   * batch-signing key.
+   * Re-encrypts {@code rawBytes} for {@code reEncryptionKey}. The new batch keeps the time recorded
+   * in the batch that {@code entry} came from. When that batch was signed by this installation, the
+   * new batch is signed again under the original sequence number, attributed to this installation's
+   * device ID and sealing the attestation chain of its batch-signing key.
    *
    * <p>Format version 2 batches leave the cleartext outer {@code device_id} empty, so signing a
    * re-encrypted copy stamped from {@code entry.getDeviceId()} would attest {@code unknown_device}.
@@ -529,15 +529,18 @@ public class CrumblesDecryptedLogsActivity extends Activity {
       CrumblesDecryptedLogEntry entry, byte[] rawBytes, PublicKey reEncryptionKey)
       throws CrumblesKeysException {
     LogBatch originalBatch = entry.getOriginalBatch();
+    LogMetadata original = recordedMetadata(entry);
     if (originalBatch == null || !originalBatch.hasSignature()) {
-      return logsEncryptor.reEncryptLogBatch(rawBytes, reEncryptionKey, entry.getDeviceId());
+      return logsEncryptor.reEncryptLogBatch(rawBytes, reEncryptionKey, original);
     }
     CrumblesBatchSigner batchSigner = new CrumblesBatchSigner(this);
     if (batchSigner.isSignedByThisInstallation(originalBatch)) {
+      ImmutableList<ByteString> attestationChain = batchSigner.attestationChainToSeal();
       LogBatch localBatch =
-          logsEncryptor.reEncryptLogBatchForSigning(this, rawBytes, reEncryptionKey);
+          logsEncryptor.reEncryptLogBatchForSigning(
+              this, rawBytes, reEncryptionKey, original, attestationChain);
       try {
-        return batchSigner.signAgain(originalBatch, localBatch);
+        return batchSigner.signAgain(originalBatch, localBatch, attestationChain);
       } catch (CrumblesKeysException e) {
         Log.e(TAG, "Failed to sign a re-encrypted log batch again; writing it unsigned.", e);
       }
@@ -548,7 +551,19 @@ public class CrumblesDecryptedLogsActivity extends Activity {
             "Re-encrypted log batch "
                 + originalBatch.getSequenceNumber()
                 + " written without a signature: signing it again failed.");
-    return logsEncryptor.reEncryptLogBatch(rawBytes, reEncryptionKey, entry.getDeviceId());
+    return logsEncryptor.reEncryptLogBatch(rawBytes, reEncryptionKey, original);
+  }
+
+  /** Returns the device ID and the time recorded in the batch that {@code entry} came from. */
+  private static LogMetadata recordedMetadata(CrumblesDecryptedLogEntry entry) {
+    LogMetadata.Builder metadata = LogMetadata.newBuilder();
+    if (entry.getDeviceId() != null) {
+      metadata.setDevice(DeviceId.newBuilder().setDeviceId(entry.getDeviceId()));
+    }
+    if (entry.getTimestamp() != null) {
+      metadata.setTimestamp(entry.getTimestamp());
+    }
+    return metadata.build();
   }
 
   /**

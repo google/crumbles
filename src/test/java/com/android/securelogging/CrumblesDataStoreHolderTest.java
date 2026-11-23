@@ -144,11 +144,11 @@ public final class CrumblesDataStoreHolderTest {
         .that(latestAuditEvent().getEventType())
         .isEqualTo(CrumblesDataStoreHolder.AUDIT_EVENT_PREFERENCES_ALTERED);
 
-    first.updateDataAsync(_ -> CrumblesDataStoreHolder.UNREADABLE_STORE_REPLACEMENT).get();
+    first.updateDataAsync(unused -> CrumblesDataStoreHolder.UNREADABLE_STORE_REPLACEMENT).get();
     expect
         .that(CrumblesKeyHandover.handOver(context, "recover from unreadable store"))
         .isEqualTo(CrumblesKeyHandover.Outcome.NOT_NEEDED);
-    first.updateDataAsync(_ -> PREFERENCES).get();
+    first.updateDataAsync(unused -> PREFERENCES).get();
     expect
         .that(CrumblesKeyHandover.handOver(context, "missing outgoing key"))
         .isEqualTo(CrumblesKeyHandover.Outcome.NOT_SEALED);
@@ -214,7 +214,7 @@ public final class CrumblesDataStoreHolderTest {
     File testFile = writeCorruptStore("recorrupt_user_key_prefs.pb");
     File preservedFile =
         new File(testFile.getAbsolutePath() + CrumblesDataStoreHolder.CORRUPT_FILE_SUFFIX);
-    Files.writeString(preservedFile.toPath(), "an older unreadable store");
+    Files.write(preservedFile.toPath(), "an older unreadable store".getBytes(UTF_8));
     byte[] corruptBytes = Files.readAllBytes(testFile.toPath());
 
     CrumblesDataStoreHolder.createDataStore(testFile, context).getDataAsync().get();
@@ -606,7 +606,7 @@ public final class CrumblesDataStoreHolderTest {
     File unwritableStore = tempFolder.newFolder("unwritable_initial_store.pb");
     var failedWrite =
         CrumblesDataStoreHolder.createDataStore(unwritableStore, context)
-            .updateDataAsync(_ -> PREFERENCES);
+            .updateDataAsync(unused -> PREFERENCES);
     assertThrows(ExecutionException.class, failedWrite::get);
     expect
         .that(FakeAndroidKeyStoreSpi.keystoreEntries)
@@ -955,7 +955,7 @@ public final class CrumblesDataStoreHolderTest {
   /** Returns the bytes that a DataStore writes for {@code preferences}, including the HMAC. */
   private byte[] writtenStore(UserKeyPreferences preferences) throws Exception {
     File file = new File(tempFolder.newFolder(), "written_store.pb");
-    CrumblesDataStoreHolder.createDataStore(file).updateDataAsync(_ -> preferences).get();
+    CrumblesDataStoreHolder.createDataStore(file).updateDataAsync(unused -> preferences).get();
     return Files.readAllBytes(file.toPath());
   }
 

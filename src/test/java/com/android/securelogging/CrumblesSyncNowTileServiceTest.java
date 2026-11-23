@@ -18,6 +18,7 @@ package com.android.securelogging;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.robolectric.Shadows.shadowOf;
 
 import android.Manifest;
@@ -125,7 +126,8 @@ public final class CrumblesSyncNowTileServiceTest {
 
   @Test
   public void onStartListening_whileCopiesForAFolderAreKept_saysThatDataIsLeft() throws Exception {
-    Files.writeString(createLogsDirectory().resolve("batch" + CrumblesConstants.SENT_SUFFIX), "c");
+    Files.write(
+        createLogsDirectory().resolve("batch" + CrumblesConstants.SENT_SUFFIX), "c".getBytes(UTF_8));
     CrumblesSyncNowTileService service = Robolectric.setupService(CrumblesSyncNowTileService.class);
 
     service.onStartListening();
@@ -135,7 +137,7 @@ public final class CrumblesSyncNowTileServiceTest {
 
   @Test
   public void onStartListening_afterASyncLeftABatch_saysThatDataIsLeft() throws Exception {
-    Files.writeString(createLogsDirectory().resolve("batch.bin"), "not uploaded");
+    Files.write(createLogsDirectory().resolve("batch.bin"), "not uploaded".getBytes(UTF_8));
     CrumblesSyncNowTileService service = Robolectric.setupService(CrumblesSyncNowTileService.class);
     service.onClick();
     assertThat(CrumblesUploadAndWipeWorker.getBatchesLeft(context)).isEqualTo(1);

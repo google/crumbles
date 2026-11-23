@@ -33,7 +33,6 @@ import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.Locale;
-import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import javax.crypto.AEADBadTagException;
 
@@ -41,18 +40,26 @@ import javax.crypto.AEADBadTagException;
  * Holds log batches that arrive while no recipient key is available, sealed by {@link
  * CrumblesLogStagingSealer}, until {@link #drain} hands them over to be encrypted to the recipient.
  *
- * <p>Staged batches use at most {@link #CAP_BYTES}. A batch that does not fit is refused rather
- * than evicting older ones, and the user is alerted as when the storage cap is reached.
+ * <p>Staged batches use at most {@link #CAP_BYTES}, and network batches leave the last {@link
+ * #SECURITY_RESERVE_BYTES} of it to security batches, since any app can cause network logs in bulk.
+ * A batch that does not fit is refused rather than evicting older ones, and the user is alerted as
+ * when the storage cap is reached.
  *
  * <p>Thread-safe: staging, draining, counting, wiping and emptiness checks synchronize on {@link
  * #LOCK}.
  */
 final class CrumblesLogStaging {
-  /** Guards the staged batches. Lock order: this lock, then the receiver's {@code EXCERPT_LOCK}. */
+  /**
+   * Guards the staged batches. Lock order: {@code CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK},
+   * then this lock.
+   */
   private static final Object LOCK = new Object();
 
   /** The most bytes that staged batches may use. */
   static final long CAP_BYTES = 16L * 1024 * 1024;
+
+  /** The bytes of {@link #CAP_BYTES} that only security batches may use. */
+  static final long SECURITY_RESERVE_BYTES = CAP_BYTES / 4;
 
   @VisibleForTesting static final String AUDIT_EVENT_STAGING_FULL = "LOGS_STAGING_FULL";
 
@@ -114,13 +121,6 @@ final class CrumblesLogStaging {
     }
   }
 
-  /** Runs {@code action} holding the staging lock, so that it may then take the excerpt lock. */
-  static <T> T callLocked(Supplier<T> action) {
-    synchronized (LOCK) {
-      return action.get();
-    }
-  }
-
   /**
    * Seals {@code logs} and stages them after the batches already staged, unless they do not fit.
    *
@@ -130,24 +130,25 @@ final class CrumblesLogStaging {
    */
   boolean stage(boolean isNetworkBatch, byte[] logs) throws GeneralSecurityException, IOException {
     synchronized (LOCK) {
-    File[] batches = listBatches();
-    long usedBytes = Arrays.stream(batches).mapToLong(File::length).sum();
-    long sealedBytes = (long) logs.length + CrumblesLogStagingSealer.OVERHEAD_BYTES;
-    if (usedBytes + sealedBytes > CAP_BYTES) {
-      reportFull(usedBytes, sealedBytes);
-      return false;
-    }
-    long sequence = batches.length == 0 ? 1 : sequenceOf(batches[batches.length - 1]) + 1;
-    String name =
-        String.format(Locale.US, "%019d", sequence)
-            + (isNetworkBatch ? "-N" : "-S")
-            + SEALED_SUFFIX;
-    byte[] sealed = CrumblesLogStagingSealer.seal(logs, name);
-    Path temp = Files.createDirectories(directory.toPath()).resolve(name + ".tmp");
-    // The platform keeps no copy of the logs, so they must be durable before staging succeeds.
-    Files.write(temp, sealed, CREATE, TRUNCATE_EXISTING, WRITE, DSYNC);
-    Files.move(temp, temp.resolveSibling(name), ATOMIC_MOVE);
-    return true;
+      File[] batches = listBatches();
+      long usedBytes = Arrays.stream(batches).mapToLong(File::length).sum();
+      long sealedBytes = (long) logs.length + CrumblesLogStagingSealer.OVERHEAD_BYTES;
+      long permittedBytes = isNetworkBatch ? CAP_BYTES - SECURITY_RESERVE_BYTES : CAP_BYTES;
+      if (usedBytes + sealedBytes > permittedBytes) {
+        reportFull(usedBytes, sealedBytes, permittedBytes);
+        return false;
+      }
+      long sequence = batches.length == 0 ? 1 : sequenceOf(batches[batches.length - 1]) + 1;
+      String name =
+          String.format(Locale.US, "%019d", sequence)
+              + (isNetworkBatch ? "-N" : "-S")
+              + SEALED_SUFFIX;
+      byte[] sealed = CrumblesLogStagingSealer.seal(logs, name);
+      Path temp = Files.createDirectories(directory.toPath()).resolve(name + ".tmp");
+      // The platform keeps no copy of the logs, so they must be durable before staging succeeds.
+      Files.write(temp, sealed, CREATE, TRUNCATE_EXISTING, WRITE, DSYNC);
+      Files.move(temp, temp.resolveSibling(name), ATOMIC_MOVE);
+      return true;
     }
   }
 
@@ -201,7 +202,7 @@ final class CrumblesLogStaging {
     return Long.parseLong(name.substring(0, 19));
   }
 
-  private void reportFull(long usedBytes, long sealedBytes) {
+  private void reportFull(long usedBytes, long sealedBytes, long permittedBytes) {
     Log.w(TAG, "Staging is full; refusing the batch rather than evicting older ones.");
     CrumblesAppAuditLogger.getInstance(context)
         .logEvent(
@@ -209,10 +210,15 @@ final class CrumblesLogStaging {
             "Staged log batches use "
                 + usedBytes
                 + " of "
-                + CAP_BYTES
+                + permittedBytes
                 + " permitted bytes; a batch of "
                 + sealedBytes
-                + " bytes was refused.");
+                + " bytes was refused."
+                + (permittedBytes < CAP_BYTES
+                    ? " Network batches leave the last "
+                        + SECURITY_RESERVE_BYTES
+                        + " bytes to security batches."
+                    : ""));
     CrumblesLogStorageQuota.notifyUser(context, R.string.notification_text_storage_stopped);
   }
 

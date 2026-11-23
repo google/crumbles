@@ -21,6 +21,9 @@ import static com.android.securelogging.CrumblesConstants.PREF_UPLOAD_DESTINATIO
 import static com.android.securelogging.CrumblesDeleteSentFilesWorker.RETENTION_PREFS;
 import static com.android.securelogging.CrumblesDeleteSentFilesWorker.SENT_KEY_PREFS;
 import static com.google.common.truth.Truth.assertThat;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -36,6 +39,7 @@ import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
+import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.provider.DocumentsContract.Document;
@@ -53,9 +57,11 @@ import com.android.securelogging.GoogleDriveStorageUploaderTest.TestDriveContent
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.google.common.truth.Expect;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.protobuf.ByteString;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
@@ -68,8 +74,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -95,6 +106,8 @@ public class CrumblesDeleteSentFilesWorkerTest {
           .setStorageType(StorageType.STORAGE_TYPE_GOOGLE_DRIVE)
           .setUploadDestinationUri(SAF_URI.toString())
           .build();
+  private static final String LISTING_FAILED =
+      "Could not list the upload folder; kept every uploaded copy unverified.";
   private Context context;
   private File logDirectory;
   private TreeProvider safProvider;
@@ -102,25 +115,42 @@ public class CrumblesDeleteSentFilesWorkerTest {
 
   @Rule public final Expect expect = Expect.create();
 
-  /** A strict provider, which lists children with only the columns it knows, and counts queries. */
+  /**
+   * A strict provider, which lists children in name order with only the columns it knows, and
+   * counts queries and the documents that it opens.
+   */
   public static final class TreeProvider extends TestDriveContentProvider {
     /** Prefix of a document that has the display name of another one, as in a duplicate. */
     private static final Pattern DUPLICATE_PREFIX = Pattern.compile("^dup\\d+_");
 
     int queryCount;
 
+    /** Documents named like no batch, which the folder lists after its files. */
+    int otherDocumentCount;
+
+    final List<String> openedDocuments = new ArrayList<>();
+
     @Override
     public Cursor query(Uri uri, String[] proj, String sel, String[] selArgs, String sortOrder) {
       queryCount++;
+      holdIf("query");
       if (queryFault != 0 || !uri.getPath().endsWith("/children")) {
         return super.query(uri, proj, sel, selArgs, sortOrder);
       }
       MatrixCursor cursor = new MatrixCursor(proj);
-      for (File file : tempDriveDir.listFiles()) {
-        cursor.addRow(
-            Arrays.stream(proj).map(column -> columnOf(file.getName(), column)).toArray());
-      }
+      Stream<String> ids =
+          Stream.concat(
+              Arrays.stream(tempDriveDir.list()).sorted(),
+              IntStream.range(0, otherDocumentCount).mapToObj(index -> "other" + index));
+      ids.forEach(
+          id -> cursor.addRow(Arrays.stream(proj).map(column -> columnOf(id, column)).toArray()));
       return cursor;
+    }
+
+    @Override
+    public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
+      openedDocuments.add(uri.getLastPathSegment());
+      return super.openFile(uri, mode);
     }
 
     /** Returns {@code column} of document {@code id}, and throws for a column it does not know. */
@@ -168,7 +198,9 @@ public class CrumblesDeleteSentFilesWorkerTest {
   }
 
   @After
-  public void tearDown() {
+  public void tearDown() throws Exception {
+    safProvider.release.countDown();
+    GoogleDriveStorageUploaderTest.awaitProviderAnswers(SAF_URI);
     CrumblesMain.getLogsEncryptorInstance().deleteExistingKeyPair();
     if (logDirectory != null && logDirectory.exists()) {
       deleteRecursive(logDirectory);
@@ -218,12 +250,14 @@ public class CrumblesDeleteSentFilesWorkerTest {
   /** Creates a copy sent to a SAF folder, which has no upload time. */
   private File sent(String baseName, String content) throws IOException {
     File file = createFile(baseName + CrumblesConstants.SENT_SUFFIX);
-    assertTrue(Files.writeString(file.toPath(), content).toFile().setLastModified(1_000L));
+    Files.write(file.toPath(), content.getBytes(UTF_8));
+    assertThat(file.setLastModified(1_000L)).isTrue();
     return file;
   }
 
   private File createRemote(String name, String content) throws IOException {
-    return Files.writeString(new File(safProvider.tempDriveDir, name).toPath(), content).toFile();
+    return Files.write(new File(safProvider.tempDriveDir, name).toPath(), content.getBytes(UTF_8))
+        .toFile();
   }
 
   private List<String> events(String eventType) {
@@ -268,21 +302,61 @@ public class CrumblesDeleteSentFilesWorkerTest {
     File bad1 = createRemote("dup1_log2.bin", "truncated");
     File bad2 = createRemote("dup2_log2.bin", "encrypted payload!");
     configureStorage(SAF_CONFIG);
-    for (int f : new int[] {1, 2, 3, 4}) {
-      safProvider.queryFault = f <= 2 ? f : 0;
-      safProvider.setShouldCrash(f == 3);
-      safProvider.setShouldWithholdReadBack(f == 4);
+    for (int fault : new int[] {1, 2}) {
+      safProvider.queryFault = fault;
       assertTrue(runWorker() && mismatch.exists() && bad1.exists() && bad2.exists());
     }
+    safProvider.queryFault = 0;
+    safProvider.setShouldWithholdReadBack(true);
     DocumentFile doc = DocumentFile.fromSingleUri(context, Uri.parse("content://s/doc/x"));
     assertThrows(IOException.class, () -> GoogleDriveStorageUploader.readBackDigest(context, doc, 10));
     safProvider.setShouldWithholdReadBack(false);
     File blockedSent = sent("blocked", "older");
-    Files.writeString(createFile("blocked.bin").toPath(), "newer");
+    Files.write(createFile("blocked.bin").toPath(), "newer".getBytes(UTF_8));
     assertTrue(runWorker() && new File(logDirectory, "log2.bin").exists());
     assertTrue(!bad1.exists() && !bad2.exists() && !mismatch.exists() && blockedSent.exists());
-    assertThat(Files.readString(new File(logDirectory, "blocked.bin").toPath())).isEqualTo("newer");
+    assertThat(new String(Files.readAllBytes(new File(logDirectory, "blocked.bin").toPath()), UTF_8))
+        .isEqualTo("newer");
     assertThat(events("KEPT_COPY_RESENT")).containsExactly("Resent 1 missing uploaded copy(ies).");
+  }
+
+  @Test
+  public void doWork_whenTheFolderProviderNeverAnswersTheListing_keepsCopiesAtTheDeadline()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    File kept = sent("log1", "payload");
+    safProvider.heldCall = "query";
+
+    boolean succeeded = runWorkerPastDeadline();
+
+    expect.that(succeeded).isTrue();
+    expect.that(kept.exists()).isTrue();
+  }
+
+  @Test
+  public void doWork_whenTheProviderNeverDeletesACorruptedCopy_resendsTheBatchAtTheDeadline()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    File kept = sent("log1", "payload");
+    File corrupted = createRemote("log1.bin", "other bytes");
+    safProvider.heldCall = "android:deleteDocument";
+
+    boolean succeeded = runWorkerPastDeadline();
+
+    expect.that(succeeded).isTrue();
+    expect.that(kept.exists()).isFalse();
+    expect.that(new File(logDirectory, "log1.bin").exists()).isTrue();
+    expect.that(corrupted.exists()).isTrue();
+  }
+
+  /** Runs the worker on another thread, and moves the clock on until the run ends. */
+  private boolean runWorkerPastDeadline() throws Exception {
+    ExecutorService workerThread = Executors.newSingleThreadExecutor();
+    try {
+      return GoogleDriveStorageUploaderTest.awaitPastDeadline(workerThread.submit(this::runWorker));
+    } finally {
+      workerThread.shutdownNow();
+    }
   }
 
   @Test
@@ -309,6 +383,210 @@ public class CrumblesDeleteSentFilesWorkerTest {
   }
 
   @Test
+  public void doWork_safFolderReturnsNoCursor_keepsCopyAndRecordsFailure() throws Exception {
+    configureStorage(SAF_CONFIG);
+    File sentFile = sent("log", "payload");
+    safProvider.queryFault = 1;
+
+    boolean succeeded = runWorker();
+
+    expect.that(succeeded).isTrue();
+    expect.that(sentFile.exists()).isTrue();
+    expect.that(events("KEPT_COPY_RECONCILE_FAILED")).containsExactly(LISTING_FAILED);
+  }
+
+  @Test
+  public void doWork_safFolderQueryThrows_keepsCopyAndRecordsFailure() throws Exception {
+    configureStorage(SAF_CONFIG);
+    File sentFile = sent("log", "payload");
+    safProvider.queryFault = 2;
+
+    boolean succeeded = runWorker();
+
+    expect.that(succeeded).isTrue();
+    expect.that(sentFile.exists()).isTrue();
+    expect.that(events("KEPT_COPY_RECONCILE_FAILED")).containsExactly(LISTING_FAILED);
+  }
+
+  @Test
+  public void doWork_safFolderWithMoreThanTenThousandOtherDocuments_resendsMissingCopy()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    File missing = sent("missing", "payload");
+    safProvider.otherDocumentCount = 10_001;
+
+    boolean succeeded = runWorker();
+
+    expect.that(succeeded).isTrue();
+    expect.that(missing.exists()).isFalse();
+    expect.that(events("KEPT_COPY_RESENT")).containsExactly("Resent 1 missing uploaded copy(ies).");
+    expect.that(events("KEPT_COPY_RECONCILE_FAILED")).isEmpty();
+  }
+
+  @Test
+  public void doWork_safCopyWithThreeNamesakes_readsBackOnlyTwo() throws Exception {
+    configureStorage(SAF_CONFIG);
+    File sentFile = sent("log", "payload");
+    File first = createRemote("dup1_log.bin", "other payload 1");
+    File second = createRemote("dup2_log.bin", "other payload 2");
+    File third = createRemote("dup3_log.bin", "other payload 3");
+
+    boolean succeeded = runWorker();
+
+    expect.that(succeeded).isTrue();
+    expect.that(safProvider.openedDocuments).containsExactly("dup1_log.bin", "dup2_log.bin");
+    expect.that(first.exists()).isFalse();
+    expect.that(second.exists()).isFalse();
+    expect.that(third.exists()).isTrue();
+    expect.that(sentFile.exists()).isFalse();
+  }
+
+  @Test
+  public void doWork_safCopyWhoseOnlyNamesakeCannotBeOpened_isResentAndNamesakeKept()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    File sentFile = sent("log", "payload");
+    File namesake = createRemote("log.bin", "payload");
+    safProvider.setShouldCrash(true);
+
+    boolean succeeded = runWorker();
+
+    expect.that(succeeded).isTrue();
+    expect.that(sentFile.exists()).isFalse();
+    expect.that(new File(logDirectory, "log.bin").exists()).isTrue();
+    expect.that(namesake.exists()).isTrue();
+    expect.that(events("KEPT_COPY_RESENT")).containsExactly("Resent 1 missing uploaded copy(ies).");
+  }
+
+  @Test
+  public void doWork_safCopyWithUnreadableNamesakeBeforeItsCopy_checksBothAndStaysKept()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    File sentFile = sent("log", "payload");
+    File directory = new File(safProvider.tempDriveDir, "dup1_log.bin");
+    assertThat(directory.mkdir()).isTrue();
+    File copy = createRemote("dup2_log.bin", "payload");
+
+    boolean succeeded = runWorker();
+
+    expect.that(succeeded).isTrue();
+    expect.that(safProvider.openedDocuments).containsExactly("dup1_log.bin", "dup2_log.bin");
+    expect.that(sentFile.exists()).isTrue();
+    expect.that(directory.exists()).isTrue();
+    expect.that(copy.exists()).isTrue();
+  }
+
+  @Test
+  public void doWork_safCopyThatCannotBeRead_staysKeptAndOpensNoNamesake() throws Exception {
+    configureStorage(SAF_CONFIG);
+    File unreadable = new File(logDirectory, "log" + CrumblesConstants.SENT_SUFFIX);
+    assertThat(unreadable.mkdir()).isTrue();
+    File namesake = createRemote("log.bin", "payload");
+
+    boolean succeeded = runWorker();
+
+    expect.that(succeeded).isTrue();
+    expect.that(unreadable.exists()).isTrue();
+    expect.that(namesake.exists()).isTrue();
+    expect.that(safProvider.openedDocuments).isEmpty();
+  }
+
+  @Test
+  public void doWork_safReadBacksPastTheirDeadline_checksEveryCopyAndRecordsFailure()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    File firstSentFile = sent("log1", "payload 1");
+    File secondSentFile = sent("log2", "payload 2");
+    File firstCopy = createRemote("log1.bin", "payload 1");
+    File secondCopy = createRemote("log2.bin", "payload 2");
+    File pipe = new File(context.getCacheDir(), "stalled_pipe");
+    assertThat(new ProcessBuilder("mkfifo", pipe.getPath()).start().waitFor()).isEqualTo(0);
+    ExecutorService workerThread = Executors.newSingleThreadExecutor();
+    // Holding the pipe open for writing, but writing nothing, leaves every read of it blocked.
+    try (RandomAccessFile idleWriter = new RandomAccessFile(pipe, "rw")) {
+      safProvider.stalledReadBack = pipe;
+      Future<Boolean> run = workerThread.submit(this::runWorker);
+
+      boolean succeeded = awaitPastDeadline(run);
+
+      expect.that(succeeded).isTrue();
+      expect.that(safProvider.openedDocuments).hasSize(2);
+      expect.that(firstSentFile.exists()).isTrue();
+      expect.that(secondSentFile.exists()).isTrue();
+      expect.that(firstCopy.exists()).isTrue();
+      expect.that(secondCopy.exists()).isTrue();
+      expect
+          .that(events("KEPT_COPY_RECONCILE_FAILED"))
+          .containsExactly(
+              "The upload folder did not return 2 copy(ies) in time; kept them unverified.");
+    } finally {
+      workerThread.shutdownNow();
+    }
+  }
+
+  @Test
+  public void storageQuota_reclaimingSafCopyThatNoRecheckFound_recordsLogsLost() throws Exception {
+    File safCopy = sent("saf", "x".repeat(300));
+    File webDavCopy = createSentFile("webdav", Duration.ofDays(1));
+    Files.write(webDavCopy.toPath(), "x".repeat(300).getBytes(UTF_8));
+
+    boolean admitted =
+        CrumblesLogStorageQuota.admitNewBatch(
+            context,
+            logDirectory,
+            /* capBytes= */ 1000,
+            /* isNetworkBatch= */ false,
+            /* incomingBytes= */ 700L);
+
+    expect.that(admitted).isTrue();
+    expect.that(safCopy.exists()).isFalse();
+    expect.that(webDavCopy.exists()).isFalse();
+    expect
+        .that(events("LOGS_LOST"))
+        .containsExactly(
+            "Reclaimed 1 uploaded copy(ies) that no re-check found at the destination: "
+                + "saf_sent.bin.");
+  }
+
+  @Test
+  public void storageQuota_afterAFailedListing_recordsReclaimingAVerifiedCopyAsLost()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    File sentFile = sent("log", "x".repeat(300));
+    assertTrue(createRemote("log.bin", "x".repeat(300)).exists() && runWorker());
+    safProvider.queryFault = 1;
+    assertTrue(runWorker());
+
+    boolean admitted =
+        CrumblesLogStorageQuota.admitNewBatch(
+            context,
+            logDirectory,
+            /* capBytes= */ 1000,
+            /* isNetworkBatch= */ false,
+            /* incomingBytes= */ 800L);
+
+    expect.that(admitted).isTrue();
+    expect.that(sentFile.exists()).isFalse();
+    expect
+        .that(events("LOGS_LOST"))
+        .containsExactly(
+            "Reclaimed 1 uploaded copy(ies) that no re-check found at the destination: "
+                + "log_sent.bin.");
+  }
+
+  /**
+   * Moves the clock past the transfer deadline, repeatedly until {@code run} ends, as the worker
+   * sets its deadline only once it reads a document back, and returns whether it succeeded.
+   */
+  private static boolean awaitPastDeadline(Future<Boolean> run) throws Exception {
+    for (int attempt = 0; attempt < 100 && !run.isDone(); attempt++) {
+      ShadowSystemClock.advanceBy(Duration.ofHours(1));
+      Uninterruptibles.sleepUninterruptibly(50, MILLISECONDS);
+    }
+    return run.get(/* timeout= */ 1, SECONDS);
+  }
+
+  @Test
   public void doWork_safResendsMissingCopiesOnlyWhileTheirKeyMayExist() throws Exception {
     configureStorage(SAF_CONFIG);
     CrumblesLogsEncryptor enc = CrumblesMain.getLogsEncryptorInstance();
@@ -323,8 +601,11 @@ public class CrumblesDeleteSentFilesWorkerTest {
     assertTrue(!restores(wrapped, "rotated"));
     CrumblesBatchKeyStore.deleteKeys();
     assertTrue(!restores(wrapped, "no_batch_keys"));
-    // Without batch-wrap keys, batches for the internal key are RSA-only, as for an external key.
-    LogBatch rsaOnly = enc.encryptLogs(new byte[1], null);
+    // Batches that earlier versions wrote for the internal key without batch-wrap keys name no key,
+    // as batches for an external key.
+    LogBatch written = enc.encryptLogs(new byte[1], null);
+    LogBatch rsaOnly =
+        written.toBuilder().setKey(written.getKey().toBuilder().clearBatchWrapKeyId()).build();
     LogBatch unfit =
         rsaOnly.toBuilder()
             .setKey(
@@ -342,6 +623,26 @@ public class CrumblesDeleteSentFilesWorkerTest {
     updateKeyPrefs(UserKeyPreferences.Builder::clearExternalPublicKeys);
     enc.deleteExistingKeyPair();
     assertTrue(!restores(rsaOnly, "deleted"));
+  }
+
+  @Test
+  public void doWork_safResendsMissingCopyForInternalKeyWithoutBatchWrapKeysWhileThatKeyExists()
+      throws Exception {
+    configureStorage(SAF_CONFIG);
+    CrumblesLogsEncryptor enc = CrumblesMain.getLogsEncryptorInstance();
+    enc.generateKeyPair();
+    CrumblesBatchKeyStore.deleteKeys();
+    LogBatch rsaOnly = enc.encryptLogs(new byte[1], null);
+    // An external key was selected since then, so a batch that names no key may be for it.
+    updateKeyPrefs(prefs -> prefs.setActiveKeyId("unreadable"));
+
+    boolean restoredWithInternalKey = restores(rsaOnly, "with_key");
+    enc.deleteExistingKeyPair();
+    boolean restoredWithoutInternalKey = restores(rsaOnly, "without_key");
+    updateKeyPrefs(UserKeyPreferences.Builder::clearActiveKeyId);
+
+    assertThat(restoredWithInternalKey).isTrue();
+    assertThat(restoredWithoutInternalKey).isFalse();
   }
 
   @Test

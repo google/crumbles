@@ -24,6 +24,9 @@ import android.content.pm.PackageManager;
 import android.content.res.XmlResourceParser;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import com.google.common.collect.ImmutableList;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -71,5 +74,48 @@ public class CrumblesBackupPolicyTest {
     assertThat(dataExtractionRulesResId).isNotEqualTo(0);
     assertThat(hasCloudBackup).isTrue();
     assertThat(hasDeviceTransfer).isTrue();
+  }
+
+  @Test
+  public void dataExtractionRules_excludeEveryDomainFromBackupAndTransfer() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    int rulesId =
+        context
+            .getResources()
+            .getIdentifier("data_extraction_rules", "xml", context.getPackageName());
+    List<String> cloudBackupExclusions = new ArrayList<>();
+    List<String> deviceTransferExclusions = new ArrayList<>();
+
+    try (XmlResourceParser parser = context.getResources().getXml(rulesId)) {
+      List<String> exclusions = new ArrayList<>();
+      for (int event = parser.getEventType();
+          event != XmlPullParser.END_DOCUMENT;
+          event = parser.next()) {
+        if (event == XmlPullParser.START_TAG) {
+          switch (parser.getName()) {
+            case "cloud-backup" -> exclusions = cloudBackupExclusions;
+            case "device-transfer" -> exclusions = deviceTransferExclusions;
+            case "exclude" ->
+                exclusions.add(parser.getAttributeValue(/* namespace= */ null, "domain"));
+            default -> {}
+          }
+        }
+      }
+    }
+
+    // Device-protected storage, which Direct Boot uses, has domains of its own.
+    ImmutableList<String> everyDomain =
+        ImmutableList.of(
+            "root",
+            "file",
+            "database",
+            "sharedpref",
+            "external",
+            "device_root",
+            "device_file",
+            "device_database",
+            "device_sharedpref");
+    assertThat(cloudBackupExclusions).containsExactlyElementsIn(everyDomain);
+    assertThat(deviceTransferExclusions).containsExactlyElementsIn(everyDomain);
   }
 }

@@ -53,7 +53,8 @@ import java.util.EnumSet;
  * turned off.
  *
  * <p>Each run also reports a device key pair that the Keystore permanently invalidated, as log
- * retrieval does, so that it shows even while no logs arrive.
+ * retrieval does, so that it shows even while no logs arrive, and records when the user blocks or
+ * unblocks the alerts of Crumbles.
  */
 public class CrumblesLoggingWatchdogWorker extends Worker {
 
@@ -82,6 +83,15 @@ public class CrumblesLoggingWatchdogWorker extends Worker {
 
   @VisibleForTesting
   static final String AUDIT_EVENT_NETWORK_LOGGING_ACCESS_LOST = "NETWORK_LOGGING_ACCESS_LOST";
+
+  @VisibleForTesting
+  static final String AUDIT_EVENT_NOTIFICATIONS_BLOCKED = "NOTIFICATIONS_BLOCKED";
+
+  @VisibleForTesting
+  static final String AUDIT_EVENT_NOTIFICATIONS_RESTORED = "NOTIFICATIONS_RESTORED";
+
+  /** Preference holding whether the previous run found the alerts of Crumbles blocked. */
+  private static final String PREF_ALERTS_BLOCKED = "alertsBlocked";
 
   /** The state of a type of logging that a run observes. */
   private enum ObservedState {
@@ -180,6 +190,7 @@ public class CrumblesLoggingWatchdogWorker extends Worker {
   public Result doWork() {
     Context context = getApplicationContext();
     reportInvalidatedDeviceKey(context);
+    recordAlertsBlockedChange(context);
     boolean anyTurnedOff = false;
     for (WatchedLogging logging : EnumSet.allOf(WatchedLogging.class)) {
       if (logging.isWatched(context)) {
@@ -204,6 +215,7 @@ public class CrumblesLoggingWatchdogWorker extends Worker {
     recordUserAdditionAllowedChange(context);
     if (!CrumblesDeviceAdminReceiver.reconcileSecondaryUserPause(context)) {
       CrumblesDeviceAdminReceiver.drainDeferredNetworkLogsIfPossible(context);
+      CrumblesDeviceAdminReceiver.savePreRebootLogsIfPending(context);
     }
     return Result.success();
   }
@@ -235,6 +247,8 @@ public class CrumblesLoggingWatchdogWorker extends Worker {
     if (hasPreviousState && wasEnabled != isEnabled) {
       if (logging == WatchedLogging.SECURITY) {
         CrumblesDeviceAdminReceiver.bumpSecurityLoggingEnableEpoch(context);
+      } else if (wasEnabled) {
+        CrumblesDeviceAdminReceiver.bumpNetworkLoggingEnableEpoch(context);
       }
       logTransition(context, logging, state);
       if (state == ObservedState.DISABLED || state == ObservedState.NO_ACCESS) {
@@ -247,7 +261,56 @@ public class CrumblesLoggingWatchdogWorker extends Worker {
   /** Reports a permanently invalidated device key pair, unless logs go to an external key. */
   private static void reportInvalidatedDeviceKey(Context context) {
     if (!CrumblesExternalPublicKeyManager.getInstance(context).isExternalKeySelected()) {
-      var _ = CrumblesDeviceAdminReceiver.reportIfDeviceKeyInvalidated(context);
+      @SuppressWarnings("unused")
+      var unusedReported = CrumblesDeviceAdminReceiver.reportIfDeviceKeyInvalidated(context);
+    }
+  }
+
+  /** Records once per change whether the alerts of Crumbles are blocked. */
+  private static void recordAlertsBlockedChange(Context context) {
+    boolean blocked = areAlertsBlocked(context);
+    SharedPreferences preferences =
+        context.getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE);
+    if (blocked == preferences.getBoolean(PREF_ALERTS_BLOCKED, /* defValue= */ false)) {
+      return;
+    }
+    preferences.edit().putBoolean(PREF_ALERTS_BLOCKED, blocked).apply();
+    CrumblesAppAuditLogger auditLogger = CrumblesAppAuditLogger.getInstance(context);
+    if (blocked) {
+      auditLogger.logEvent(
+          AUDIT_EVENT_NOTIFICATIONS_BLOCKED,
+          "Notifications or action-needed alerts were turned off: the user is no longer alerted"
+              + " when collection stops.");
+    } else {
+      auditLogger.logEvent(
+          AUDIT_EVENT_NOTIFICATIONS_RESTORED,
+          "Notifications and action-needed alerts were turned back on.");
+    }
+  }
+
+  /**
+   * Returns whether the user turned off the notifications of Crumbles or its action-needed channel,
+   * which hides every alert that collection stopped or needs the user.
+   */
+  static boolean areAlertsBlocked(Context context) {
+    NotificationManagerCompat notificationManager = NotificationManagerCompat.from(context);
+    NotificationChannel channel =
+        notificationManager.getNotificationChannel(
+            CrumblesConstants.ACTION_NEEDED_NOTIFICATION_CHANNEL_ID);
+    return !notificationManager.areNotificationsEnabled()
+        || (channel != null && channel.getImportance() == NotificationManager.IMPORTANCE_NONE);
+  }
+
+  /**
+   * Records each type of logging that is on, for callers that have just turned logging on and store
+   * its new state as observed, so that no run reports the change.
+   */
+  static void recordLoggingTurnedOn(Context context) {
+    for (WatchedLogging logging : EnumSet.allOf(WatchedLogging.class)) {
+      if (logging.isWatched(context)
+          && observeLoggingState(context, logging) == ObservedState.ENABLED) {
+        logTransition(context, logging, ObservedState.ENABLED);
+      }
     }
   }
 

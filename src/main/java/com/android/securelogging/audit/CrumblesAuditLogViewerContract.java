@@ -37,6 +37,9 @@ public final class CrumblesAuditLogViewerContract {
 
     /** Asks the user to re-enter the device credential before the logs are cleared. */
     void requestDeviceCredentialConfirmation();
+
+    /** Tells the user that the logs were kept because their newest records could not be sealed. */
+    void showClearRefused();
   }
 
   /** The presenter interface for the Crumbles audit log viewer. */

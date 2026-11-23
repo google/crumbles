@@ -17,41 +17,63 @@
 package com.android.securelogging;
 
 import static com.android.securelogging.CrumblesKeyHandover.handOver;
+import static com.android.securelogging.CrumblesKeyHandover.handOverDestination;
 import static com.android.securelogging.CrumblesLogsEncryptor.KEY_ALIAS;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.robolectric.Shadows.shadowOf;
 
+import android.app.Notification;
 import android.app.NotificationManager;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
+import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
 import androidx.annotation.Nullable;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.CrumblesKeyHandover.Outcome;
+import com.android.securelogging.CrumblesSendAndMarkProcessingWorker.UploadDestination;
 import com.android.securelogging.CrumblesSendAndMarkProcessingWorkerTest.FakeGoogleDriveContentProvider;
+import com.android.securelogging.CrumblesSendAndMarkProcessingWorkerTest.TestRootTrustProvider;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.android.securelogging.audit.CrumblesAuditEvent;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsServer;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
+import java.nio.channels.ClosedChannelException;
 import java.nio.file.Files;
+import java.security.MessageDigest;
 import java.security.PublicKey;
 import java.security.Security;
 import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.Robolectric;
+import org.robolectric.shadows.ShadowNetworkCapabilities;
 
 /** Unit tests for {@link CrumblesKeyHandover}. */
 @RunWith(AndroidJUnit4.class)
@@ -60,6 +82,7 @@ public final class CrumblesKeyHandoverTest {
   private static final Uri DRIVE_TREE_URI =
       Uri.parse("content://" + DRIVE_AUTHORITY + "/tree/valid_drive");
   private static final String CHANGE_DESCRIPTION = "Changing to a test key";
+  private static final String DESTINATION_CHANGE = "Changing the upload destination to a folder";
   private static final String WEBDAV_USERNAME = "user";
   private static final String WEBDAV_PASSWORD = "password";
 
@@ -74,6 +97,9 @@ public final class CrumblesKeyHandoverTest {
   private final File logsDirectory =
       new File(context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
 
+  /** Where {@link FakeGoogleDriveContentProvider} keeps the documents of its folder. */
+  private final File driveFolder = new File(context.getFilesDir(), "fake_remote_drive");
+
   /** Bodies of the uploads that the WebDAV server accepted, by file name. */
   private final Map<String, byte[]> webDavUploads = new ConcurrentHashMap<>();
 
@@ -85,6 +111,7 @@ public final class CrumblesKeyHandoverTest {
   public void setUp() throws Exception {
     Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
     Security.insertProviderAt(new FakeAndroidKeyStoreProvider(), 1);
+    CrumblesAppAuditLogger.getInstance(context).clearAllLogs();
     driveProvider =
         Robolectric.setupContentProvider(FakeGoogleDriveContentProvider.class, DRIVE_AUTHORITY);
     // The device key is the outgoing key, so that the tests can decrypt the handover record.
@@ -101,6 +128,7 @@ public final class CrumblesKeyHandoverTest {
     if (webDavServer != null) {
       webDavServer.stop(/* delay= */ 0);
     }
+    Security.removeProvider(TestRootTrustProvider.NAME);
   }
 
   @Test
@@ -144,6 +172,113 @@ public final class CrumblesKeyHandoverTest {
     assertThat(webDavUploads.keySet()).containsExactly(uploadedName);
     assertThat(webDavUploads.get(uploadedName)).isEqualTo(Files.readAllBytes(sentBatch.toPath()));
     assertThat(latestAuditEventType()).isEqualTo("KEY_HANDOVER_UPLOADED");
+  }
+
+  @Test
+  public void handOverDestination_withWebDavDestination_uploadsSealedNoticeThere()
+      throws Exception {
+    saveRemoteStorageConfig(webDavConfig(startWebDavServer()));
+
+    Outcome outcome =
+        handOverToSavedDestination(context, "Changing the upload destination to a folder");
+
+    File sentBatch = onlyBatch();
+    assertThat(outcome).isEqualTo(Outcome.UPLOADED);
+    assertThat(webDavUploads.keySet())
+        .containsExactly(sentBatch.getName().replace(CrumblesConstants.SENT_SUFFIX, ".bin"));
+    assertThat(
+            new String(encryptor.decryptLogs(encryptor.deserializeFile(sentBatch.toPath())), UTF_8))
+        .startsWith(
+            """
+            Crumbles upload destination change
+            Change: Changing the upload destination to a folder
+            Sealed to key fingerprint:\
+            """);
+    assertThat(latestAuditEventType()).isEqualTo("DESTINATION_HANDOVER_UPLOADED");
+  }
+
+  @Test
+  public void handOverDestination_withDriveDestinationOnline_reportsUploadedUnconfirmed() {
+    selectDriveDestination();
+    validateActiveNetwork();
+
+    Outcome outcome = handOverToSavedDestination(context, DESTINATION_CHANGE);
+
+    assertThat(outcome).isEqualTo(Outcome.UPLOADED_UNCONFIRMED);
+    assertThat(onlyBatch().getName()).endsWith(CrumblesConstants.SENT_SUFFIX);
+    assertThat(latestAuditEventType()).isEqualTo("DESTINATION_HANDOVER_UPLOADED_UNCONFIRMED");
+  }
+
+  @Test
+  public void handOverDestination_withDriveDestinationOffline_reportsUploadedOffline() {
+    selectDriveDestination();
+
+    Outcome outcome = handOverToSavedDestination(context, DESTINATION_CHANGE);
+
+    assertThat(outcome).isEqualTo(Outcome.UPLOADED_OFFLINE);
+    assertThat(onlyBatch().getName()).endsWith(CrumblesConstants.SENT_SUFFIX);
+    assertThat(latestAuditEventType()).isEqualTo("DESTINATION_HANDOVER_UPLOADED_OFFLINE");
+  }
+
+  @Test
+  public void handOverDestination_withDriveDestinationAndNoNetwork_reportsUploadedOffline() {
+    selectDriveDestination();
+    shadowOf(context.getSystemService(ConnectivityManager.class)).setDefaultNetworkActive(false);
+
+    assertThat(handOverToSavedDestination(context, DESTINATION_CHANGE))
+        .isEqualTo(Outcome.UPLOADED_OFFLINE);
+  }
+
+  @Test
+  public void handOverDestination_withoutConnectivityService_reportsUploadedOffline() {
+    selectDriveDestination();
+    Context withoutConnectivityService =
+        new ContextWrapper(context) {
+          @Override
+          @Nullable
+          public Object getSystemService(String name) {
+            return Objects.equals(name, Context.CONNECTIVITY_SERVICE)
+                ? null
+                : super.getSystemService(name);
+          }
+        };
+
+    assertThat(handOverToSavedDestination(withoutConnectivityService, DESTINATION_CHANGE))
+        .isEqualTo(Outcome.UPLOADED_OFFLINE);
+  }
+
+  @Test
+  public void handOverDestination_whenNoLongerAwaited_sealsTheNoticeButLeavesItPending() {
+    selectDriveDestination();
+
+    Outcome outcome =
+        handOverDestination(
+            context,
+            DESTINATION_CHANGE,
+            CrumblesSendAndMarkProcessingWorker.readUploadDestination(context),
+            /* shouldUpload= */ () -> false);
+
+    assertThat(outcome).isEqualTo(Outcome.UPLOAD_FAILED);
+    assertThat(onlyBatch().getName()).doesNotContain(CrumblesConstants.SENT_SUFFIX);
+    assertThat(driveFolder.list()).isEmpty();
+    assertThat(latestAuditEventType()).isEqualTo("DESTINATION_HANDOVER_UPLOAD_FAILED");
+  }
+
+  @Test
+  public void handOverDestination_afterTheDestinationChanged_uploadsToTheOutgoingOne()
+      throws Exception {
+    saveRemoteStorageConfig(webDavConfig(startWebDavServer()));
+    UploadDestination outgoing = CrumblesSendAndMarkProcessingWorker.readUploadDestination(context);
+    saveRemoteStorageConfig(RemoteStorageConfig.getDefaultInstance());
+    selectDriveDestination();
+
+    Outcome outcome =
+        handOverDestination(context, DESTINATION_CHANGE, outgoing, /* shouldUpload= */ () -> true);
+
+    assertThat(outcome).isEqualTo(Outcome.UPLOADED);
+    assertThat(webDavUploads.keySet())
+        .containsExactly(onlyBatch().getName().replace(CrumblesConstants.SENT_SUFFIX, ".bin"));
+    assertThat(driveFolder.list()).isEmpty();
   }
 
   @Test
@@ -192,6 +327,44 @@ public final class CrumblesKeyHandoverTest {
   }
 
   @Test
+  public void handOver_whenWebDavServerPresentsAnotherKey_keepsRecordPendingAndReportsKeyChange()
+      throws Exception {
+    AtomicBoolean requestReceived = new AtomicBoolean();
+    // The test certificates and the TLS handshake create EC key pairs with the first provider that
+    // offers them, so the fake Keystore provider, whose generator only makes Keystore keys, goes
+    // last.
+    Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
+    Security.addProvider(new FakeAndroidKeyStoreProvider());
+    HttpsServer server =
+        CrumblesSendAndMarkProcessingWorkerTest.startHttpsWebDavServer(requestReceived);
+    webDavServer = server;
+    Security.insertProviderAt(new TestRootTrustProvider(), 1);
+    byte[] pinOfAnotherKey =
+        MessageDigest.getInstance("SHA-256").digest("another key".getBytes(UTF_8));
+    saveRemoteStorageConfig(
+        webDavConfig("https://localhost:" + server.getAddress().getPort() + "/webdav").toBuilder()
+            .setWebdavServerKeySha256(
+                encryptor.encryptDataStoreEntry(
+                    pinOfAnotherKey, CrumblesConstants.WEBDAV_SERVER_KEY_SHA256_ENTRY_ID))
+            .build());
+
+    Outcome outcome = handOver(context, CHANGE_DESCRIPTION);
+
+    assertThat(outcome).isEqualTo(Outcome.UPLOAD_FAILED);
+    assertThat(onlyBatch().getName()).doesNotContain(CrumblesConstants.SENT_SUFFIX);
+    // Requests carry the credentials, so none may reach a server that lacks the pinned key.
+    assertThat(requestReceived.get()).isFalse();
+    assertThat(auditEventTypes())
+        .containsAtLeast("KEY_HANDOVER_UPLOAD_FAILED", "UPLOAD_SERVER_KEY_REJECTED")
+        .inOrder();
+    Notification notification =
+        shadowOf(context.getSystemService(NotificationManager.class))
+            .getNotification(CrumblesConstants.UPLOAD_NOTIFICATION_ID);
+    assertThat(shadowOf(notification).getContentText().toString())
+        .isEqualTo(context.getString(R.string.notification_text_upload_server_key_changed));
+  }
+
+  @Test
   public void handOver_whenNetworkStorageCapReached_stillSealsRecordInSecurityReserve()
       throws Exception {
     File networkFullBatch = new File(logsDirectory, "pending.bin");
@@ -217,6 +390,56 @@ public final class CrumblesKeyHandoverTest {
     assertThat(onlyBatch()).isEqualTo(fullBatch);
   }
 
+  @Test
+  public void handOver_whenTheWaitStopsWhileTheFolderHoldsACall_failsAtOnceAndKeepsTheRecord()
+      throws Exception {
+    selectDriveDestination();
+    CountDownLatch held = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    driveProvider.onOpenFile =
+        () -> {
+          held.countDown();
+          try {
+            release.await();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+          }
+        };
+    CrumblesTransferDeadline.Budget budget = CrumblesTransferDeadline.Budget.untilStopped();
+    ExecutorService handOverThread = Executors.newSingleThreadExecutor();
+    try {
+      Future<Outcome> handOver =
+          handOverThread.submit(() ->
+              CrumblesTransferDeadline.within(budget, () -> handOver(context, CHANGE_DESCRIPTION)));
+      assertThat(held.await(10, SECONDS)).isTrue();
+
+      budget.stop();
+
+      Outcome outcome = handOver.get(/* timeout= */ 10, SECONDS);
+      assertThat(outcome).isEqualTo(Outcome.UPLOAD_FAILED);
+      assertThat(latestAuditEventType()).isEqualTo("KEY_HANDOVER_UPLOAD_FAILED");
+      assertThat(onlyBatch().getName()).doesNotContain(CrumblesConstants.SENT_SUFFIX);
+      assertThat(onlyBatch().getName()).doesNotContain(CrumblesConstants.PROCESSING_SUFFIX);
+    } finally {
+      release.countDown();
+      handOverThread.shutdown();
+      awaitProviderAnswers(DRIVE_TREE_URI);
+    }
+  }
+
+  /** Waits until the provider of {@code document} takes calls again, once it returns a held one. */
+  private static void awaitProviderAnswers(Uri document) throws Exception {
+    for (int attempt = 0; attempt < 100; attempt++) {
+      try {
+        @SuppressWarnings("unused")
+        var unused = CrumblesTransferDeadline.callProvider(document, () -> true);
+        return;
+      } catch (ClosedChannelException e) {
+        Uninterruptibles.sleepUninterruptibly(10, MILLISECONDS);
+      }
+    }
+  }
+
   private void selectDriveDestination() {
     context.grantUriPermission(
         context.getPackageName(),
@@ -236,6 +459,15 @@ public final class CrumblesKeyHandoverTest {
         .edit()
         .putString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, DRIVE_TREE_URI.toString())
         .commit();
+  }
+
+  /** Lets the active network count as validated, that is, as reaching the internet. */
+  private void validateActiveNetwork() {
+    ConnectivityManager connectivityManager = context.getSystemService(ConnectivityManager.class);
+    NetworkCapabilities validated = ShadowNetworkCapabilities.newInstance();
+    shadowOf(validated).addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+    shadowOf(connectivityManager)
+        .setNetworkCapabilities(connectivityManager.getActiveNetwork(), validated);
   }
 
   /** Returns WebDAV settings for {@code serverUrl}, sealed like the app seals them. */
@@ -289,6 +521,15 @@ public final class CrumblesKeyHandoverTest {
     return "http://localhost:" + webDavServer.getAddress().getPort() + "/webdav";
   }
 
+  /** Hands the destination change over to the destination saved now, waiting for its upload. */
+  private static Outcome handOverToSavedDestination(Context context, String changeDescription) {
+    return handOverDestination(
+        context,
+        changeDescription,
+        CrumblesSendAndMarkProcessingWorker.readUploadDestination(context),
+        /* shouldUpload= */ () -> true);
+  }
+
   private void assertHandoverNotSealed() {
     assertThat(handOver(context, CHANGE_DESCRIPTION)).isEqualTo(Outcome.NOT_SEALED);
     assertThat(latestAuditEventType()).isEqualTo("KEY_HANDOVER_NOT_SEALED");
@@ -299,6 +540,7 @@ public final class CrumblesKeyHandoverTest {
     assertThat(onlyBatch().getName()).doesNotContain(CrumblesConstants.PROCESSING_SUFFIX);
     assertThat(onlyBatch().getName()).doesNotContain(CrumblesConstants.SENT_SUFFIX);
     assertThat(latestAuditEventType()).isEqualTo("KEY_HANDOVER_UPLOAD_FAILED");
+    assertThat(auditEventTypes()).doesNotContain("UPLOAD_SERVER_KEY_REJECTED");
   }
 
   private File onlyBatch() {
@@ -312,5 +554,12 @@ public final class CrumblesKeyHandoverTest {
         .getMemoryCachedEvents()
         .get(0)
         .getEventType();
+  }
+
+  /** Returns the types of the activity log events, newest first. */
+  private ImmutableList<String> auditEventTypes() {
+    return CrumblesAppAuditLogger.getInstance(context).getMemoryCachedEvents().stream()
+        .map(CrumblesAuditEvent::getEventType)
+        .collect(toImmutableList());
   }
 }

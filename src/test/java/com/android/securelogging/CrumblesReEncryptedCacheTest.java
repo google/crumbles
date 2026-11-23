@@ -17,6 +17,7 @@
 package com.android.securelogging;
 
 import static com.google.common.truth.Truth.assertThat;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertThrows;
 
 import android.content.Context;
@@ -114,7 +115,7 @@ public class CrumblesReEncryptedCacheTest {
   public void sweep_deletesStagedFilesAndDirectory() throws Exception {
     assertThat(cacheDirectory.mkdirs()).isTrue();
     File stagedFile = new File(cacheDirectory, "re_encrypted_log.bin");
-    Files.writeString(stagedFile.toPath(), "re-encrypted content");
+    Files.write(stagedFile.toPath(), "re-encrypted content".getBytes(UTF_8));
 
     CrumblesReEncryptedCache.sweep(context);
 
@@ -127,7 +128,7 @@ public class CrumblesReEncryptedCacheTest {
     File nestedDirectory = new File(cacheDirectory, "nested");
     assertThat(nestedDirectory.mkdirs()).isTrue();
     File nestedFile = new File(nestedDirectory, "re_encrypted_log.bin");
-    Files.writeString(nestedFile.toPath(), "re-encrypted content");
+    Files.write(nestedFile.toPath(), "re-encrypted content".getBytes(UTF_8));
 
     CrumblesReEncryptedCache.sweep(context);
 
@@ -139,8 +140,10 @@ public class CrumblesReEncryptedCacheTest {
   public void sweep_revokesReadGrantOfEachStagedFileBeforeDeletingIt() throws Exception {
     File nestedDirectory = new File(cacheDirectory, "nested");
     assertThat(nestedDirectory.mkdirs()).isTrue();
-    Files.writeString(new File(cacheDirectory, "log1.bin").toPath(), "re-encrypted content");
-    Files.writeString(new File(nestedDirectory, "log2.bin").toPath(), "re-encrypted content");
+    Files.write(
+        new File(cacheDirectory, "log1.bin").toPath(), "re-encrypted content".getBytes(UTF_8));
+    Files.write(
+        new File(nestedDirectory, "log2.bin").toPath(), "re-encrypted content".getBytes(UTF_8));
     List<Revocation> revocations = new ArrayList<>();
 
     CrumblesReEncryptedCache.sweep(recordingRevocationsIn(revocations));
@@ -161,7 +164,7 @@ public class CrumblesReEncryptedCacheTest {
   public void sweep_withLinkOutsideProviderRoots_deletesLinkWithoutRevoking() throws Exception {
     assertThat(cacheDirectory.mkdirs()).isTrue();
     File outsideFile = new File(context.getFilesDir(), "outside_provider_roots.bin");
-    Files.writeString(outsideFile.toPath(), "unshared content");
+    Files.write(outsideFile.toPath(), "unshared content".getBytes(UTF_8));
     Path link =
         Files.createSymbolicLink(
             new File(cacheDirectory, "link.bin").toPath(), outsideFile.toPath());
@@ -178,11 +181,11 @@ public class CrumblesReEncryptedCacheTest {
   public void sweep_keepsFilesOutsideTheReEncryptionDirectory() throws Exception {
     assertThat(cacheDirectory.mkdirs()).isTrue();
     File otherCacheFile = new File(context.getCacheDir(), "other_cached_file.bin");
-    Files.writeString(otherCacheFile.toPath(), "unrelated cached content");
+    Files.write(otherCacheFile.toPath(), "unrelated cached content".getBytes(UTF_8));
     File otherCacheDirectory = new File(context.getCacheDir(), "other_cache_dir");
     assertThat(otherCacheDirectory.mkdirs()).isTrue();
     File encryptedLogFile = new File(context.getFilesDir(), "encrypted_log.bin");
-    Files.writeString(encryptedLogFile.toPath(), "encrypted log content");
+    Files.write(encryptedLogFile.toPath(), "encrypted log content".getBytes(UTF_8));
 
     CrumblesReEncryptedCache.sweep(context);
 

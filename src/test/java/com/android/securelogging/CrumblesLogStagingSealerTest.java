@@ -27,6 +27,7 @@ import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.common.truth.Expect;
 import com.google.testing.junit.testparameterinjector.TestParameter;
 import java.security.GeneralSecurityException;
+import java.security.ProviderException;
 import java.security.Security;
 import java.util.Arrays;
 import javax.crypto.AEADBadTagException;
@@ -55,10 +56,12 @@ public final class CrumblesLogStagingSealerTest {
     FakeAndroidKeyStoreSpi.isStrongBoxSupported = true;
     FakeAndroidKeyStoreSpi.isStrongBoxFailing = false;
     FakeAndroidKeyStoreSpi.isStrongBoxThrowingGeneralSecurityException = false;
+    FakeAndroidKeyStoreSpi.strongBoxFailure = null;
   }
 
   @After
   public void tearDown() {
+    FakeAndroidKeyStoreSpi.strongBoxFailure = null;
     Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
   }
 
@@ -147,6 +150,66 @@ public final class CrumblesLogStagingSealerTest {
         .that(FakeAndroidKeyStoreSpi.getLatestKeyGenParameterSpec().isStrongBoxBacked())
         .isFalse();
     expect.that(CrumblesLogStagingSealer.unseal(sealed, NAME)).isEqualTo(logs);
+  }
+
+  @Test
+  public void seal_whenStrongBoxThrowsOtherUncheckedException_createsATeeWrappingKey()
+      throws Exception {
+    FakeAndroidKeyStoreSpi.strongBoxFailure = new IllegalStateException("StrongBox failed");
+
+    byte[] sealed = CrumblesLogStagingSealer.seal(logs, NAME);
+
+    expect
+        .that(FakeAndroidKeyStoreSpi.getLatestKeyGenParameterSpec().isStrongBoxBacked())
+        .isFalse();
+    expect.that(CrumblesLogStagingSealer.unseal(sealed, NAME)).isEqualTo(logs);
+  }
+
+  /** Unchecked exceptions that Keystore throws on some devices. */
+  private enum UncheckedKeystoreFailure {
+    PROVIDER_EXCEPTION {
+      @Override
+      RuntimeException create() {
+        return new ProviderException("Keystore cannot be reached.");
+      }
+    },
+    OTHER_UNCHECKED_EXCEPTION {
+      @Override
+      RuntimeException create() {
+        return new IllegalStateException("Keystore failed.");
+      }
+    };
+
+    abstract RuntimeException create();
+  }
+
+  @Test
+  public void seal_whenKeystoreThrowsUncheckedException_throwsGeneralSecurityException(
+      @TestParameter UncheckedKeystoreFailure keystoreFailure) {
+    RuntimeException failure = keystoreFailure.create();
+    FakeAndroidKeyStoreSpi.failKeyLookup(CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS, failure);
+
+    GeneralSecurityException thrown =
+        assertThrows(
+            GeneralSecurityException.class, () -> CrumblesLogStagingSealer.seal(logs, NAME));
+
+    expect.that(thrown).hasCauseThat().isSameInstanceAs(failure);
+  }
+
+  @Test
+  public void unseal_whenKeystoreThrowsUnchecked_throwsGeneralSecurityExceptionNotBadTag(
+      @TestParameter UncheckedKeystoreFailure keystoreFailure) throws Exception {
+    byte[] sealed = CrumblesLogStagingSealer.seal(logs, NAME);
+    RuntimeException failure = keystoreFailure.create();
+    FakeAndroidKeyStoreSpi.failKeyLookup(CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS, failure);
+
+    GeneralSecurityException thrown =
+        assertThrows(
+            GeneralSecurityException.class, () -> CrumblesLogStagingSealer.unseal(sealed, NAME));
+
+    // An AEADBadTagException would get the staged batch deleted as unreadable.
+    expect.that(thrown).isNotInstanceOf(AEADBadTagException.class);
+    expect.that(thrown).hasCauseThat().isSameInstanceAs(failure);
   }
 
   /** Bytes of a sealed batch, by offset. */

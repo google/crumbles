@@ -22,6 +22,7 @@ import static com.android.securelogging.CrumblesDeviceAdminReceiver.DEFERRED_TOK
 import static com.android.securelogging.CrumblesDeviceAdminReceiver.MIN_NETWORK_USABLE_SPACE_BYTES;
 import static com.android.securelogging.CrumblesDeviceAdminReceiver.MIN_SECURITY_USABLE_SPACE_BYTES;
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Comparator.comparingLong;
@@ -37,6 +38,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -46,6 +48,7 @@ import android.app.KeyguardManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.admin.ConnectEvent;
 import android.app.admin.DeviceAdminReceiver;
 import android.app.admin.DevicePolicyManager;
@@ -59,6 +62,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Looper;
@@ -84,6 +88,7 @@ import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.common.collect.ImmutableList;
 import com.google.common.truth.Expect;
 import com.google.protobuf.ExtensionRegistryLite;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.KeyEncryptionType;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.SealedLogs;
 import java.io.File;
@@ -100,6 +105,7 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
+import java.security.ProviderException;
 import java.security.PublicKey;
 import java.security.Security;
 import java.security.Signature;
@@ -107,9 +113,11 @@ import java.security.interfaces.RSAPrivateCrtKey;
 import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.RSAPublicKeySpec;
 import java.time.Duration;
+import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -138,6 +146,7 @@ import org.junit.runner.RunWith;
 import org.mockito.InOrder;
 import org.robolectric.Robolectric;
 import org.robolectric.Shadows;
+import org.robolectric.shadows.ShadowBuild;
 import org.robolectric.shadows.ShadowEventLog;
 import org.robolectric.util.ReflectionHelpers;
 
@@ -161,6 +170,19 @@ public final class CrumblesDeviceAdminReceiverTest {
       Pattern.compile("--- Crumbles activity log since record (\\S+) ---");
   private static final Pattern CHAIN_HEAD_PATTERN =
       Pattern.compile("--- Crumbles activity log chain head: (\\S+) ---");
+  // The value of the hidden UserManager.DISALLOW_ADD_CLONE_PROFILE.
+  private static final String DISALLOW_ADD_CLONE_PROFILE = "no_add_clone_profile";
+  // Android applies these restrictions to any device owner.
+  private static final ImmutableList<String> DEVICE_OWNER_PROFILE_RESTRICTIONS =
+      ImmutableList.of(
+          UserManager.DISALLOW_ADD_MANAGED_PROFILE,
+          DISALLOW_ADD_CLONE_PROFILE,
+          UserManager.DISALLOW_ADD_PRIVATE_PROFILE);
+  private static final ImmutableList<String> MANAGED_USER_RESTRICTIONS =
+      ImmutableList.<String>builder()
+          .add(UserManager.DISALLOW_ADD_USER)
+          .addAll(DEVICE_OWNER_PROFILE_RESTRICTIONS)
+          .build();
 
   private static FakeAndroidKeyStoreProvider fakeProviderInstance;
 
@@ -203,7 +225,9 @@ public final class CrumblesDeviceAdminReceiverTest {
     new File(context.getNoBackupFilesDir(), DEFERRED_TOKENS_FILE + ".unreadable").delete();
     CrumblesAppAuditLogger.setInstanceForTest(null);
     CrumblesMain.getLogsEncryptorInstance().deleteExistingKeyPair();
+    FakeAndroidKeyStoreSpi.certificateChainFailuresLeft = 0;
     FakeAndroidKeyStoreSpi.keystoreEntries.remove(CrumblesBatchSigningKey.ALIAS);
+    FakeAndroidKeyStoreSpi.keystoreEntries.remove(CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS);
     CrumblesExternalPublicKeyManager.getInstance(context).clearActiveExternalPublicKey();
     Shadows.shadowOf(Looper.getMainLooper()).idle();
   }
@@ -605,6 +629,58 @@ public final class CrumblesDeviceAdminReceiverTest {
         .contains(CrumblesDeviceAdminReceiver.AUDIT_EVENT_BATCH_SIGNING_FAILED);
   }
 
+  /**
+   * Tests that a batch whose attestation chain could not be read to seal it is written unsigned,
+   * even when the key signs again by then, rather than signed without the chain that its recipient
+   * checks the signature with.
+   */
+  @Test
+  public void retrieveAndSaveSecurityLogs_whenTheChainCannotBeSealed_writesUnsignedBatch()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    FakeAndroidKeyStoreSpi.certificateChainFailuresLeft = 1;
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+
+    ImmutableList<LogBatch> batches = writtenBatches(context);
+    assertThat(batches).hasSize(1);
+    expect.that(batches.get(0).hasSignature()).isFalse();
+    expect
+        .that(
+            context
+                .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+                .contains(CrumblesBatchSigner.PREF_LAST_SEQUENCE_NUMBER))
+        .isFalse();
+    expect
+        .that(
+            newestAuditMessage(
+                context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_BATCH_SIGNING_FAILED))
+        .isNotEmpty();
+  }
+
+  @Test
+  public void retrieveAndSaveSecurityLogs_whenSigningThrowsUnchecked_writesUnsignedBatch()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    FakeAndroidKeyStoreSpi.failKeyLookup(
+        CrumblesBatchSigningKey.ALIAS, new IllegalStateException("Keystore failed."));
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+
+    ImmutableList<LogBatch> batches = writtenBatches(context);
+    assertThat(batches).hasSize(1);
+    expect.that(batches.get(0).hasSignature()).isFalse();
+    expect
+        .that(
+            newestAuditMessage(
+                context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_BATCH_SIGNING_FAILED))
+        .isEqualTo("Log batch written without a signature or sequence number: signing failed.");
+  }
+
   /** Tests that a batch refused by the storage cap uses no sequence number until it is drained. */
   @Test
   public void retrieveAndSaveSecurityLogs_whenStorageCapReached_usesNoSequenceNumber()
@@ -869,6 +945,22 @@ public final class CrumblesDeviceAdminReceiverTest {
         .isFalse();
   }
 
+  /** Asserts that the alert about possibly lost logs is up until the user opens it. */
+  private static void assertLossNotificationPosted(Context context) {
+    StatusBarNotification posted =
+        Arrays.stream(context.getSystemService(NotificationManager.class).getActiveNotifications())
+            .filter(n -> n.getId() == CrumblesConstants.LOSS_REPORTED_NOTIFICATION_ID)
+            .findFirst()
+            .orElse(null);
+    assertThat(posted).isNotNull();
+    Notification notification = posted.getNotification();
+    int ongoingUntilOpened = Notification.FLAG_ONGOING_EVENT | Notification.FLAG_AUTO_CANCEL;
+    assertThat(notification.visibility).isEqualTo(Notification.VISIBILITY_SECRET);
+    assertThat(notification.flags & ongoingUntilOpened).isEqualTo(ongoingUntilOpened);
+    assertThat(Shadows.shadowOf(notification.contentIntent).getSavedIntent().getComponent())
+        .isEqualTo(new ComponentName(context, CrumblesMain.class));
+  }
+
   private static Context createContextWrapper(Context realContext, DevicePolicyManager mockDpm) {
     return new ContextWrapper(realContext) {
       @Override
@@ -881,10 +973,30 @@ public final class CrumblesDeviceAdminReceiverTest {
     };
   }
 
+  private static void setUserRestrictions(
+      Context context, ImmutableList<String> restrictions, boolean value) {
+    UserManager userManager = context.getSystemService(UserManager.class);
+    for (String restriction : restrictions) {
+      Shadows.shadowOf(userManager)
+          .setUserRestriction(android.os.Process.myUserHandle(), restriction, value);
+    }
+  }
+
   private static void saveNewExternalPublicKey(Context context) throws Exception {
     KeyPair externalKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
     CrumblesExternalPublicKeyManager.getInstance(context)
         .saveActiveExternalPublicKey(externalKeyPair.getPublic());
+  }
+
+  /** Returns the Direct Boot store, remembering the recipient of a batch saved for a new key. */
+  private static CrumblesDirectBootStore directBootStoreWithRecipient(Context context)
+      throws Exception {
+    saveNewExternalPublicKey(context);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+    CrumblesDirectBootStore store = new CrumblesDirectBootStore(context);
+    assertThat(store.canSaveBatch()).isTrue();
+    return store;
   }
 
   /** Delivers the security logs broadcast to {@code receiver} and waits until it is handled. */
@@ -1410,7 +1522,7 @@ public final class CrumblesDeviceAdminReceiverTest {
             "Deferred network log batch (token 2) was lost: discarded by platform before"
                 + " retrieval.",
             "Deferred network log batch (token 1) was lost: deferred queue full.");
-    assertDeferredLogsNotificationPosted(context);
+    assertLossNotificationPosted(context);
   }
 
   @Test
@@ -1559,7 +1671,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
         .contains("their token file could not be read");
-    assertDeferredLogsNotificationPosted(context);
+    assertLossNotificationPosted(context);
   }
 
   @Test
@@ -1721,7 +1833,14 @@ public final class CrumblesDeviceAdminReceiverTest {
             return CrumblesLogStaging.WriteResult.FAILED;
           }
         };
-    Thread drainer = new Thread(() -> expect.that(staging.drain(writer)).isEqualTo(1));
+    Thread drainer =
+        new Thread(
+            () -> {
+              // Like drainStagedBatches, take UPLOAD_LOCK before the staging lock.
+              synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
+                expect.that(staging.drain(writer)).isEqualTo(1);
+              }
+            });
     sealer.setDaemon(true);
     drainer.setDaemon(true);
 
@@ -1730,6 +1849,36 @@ public final class CrumblesDeviceAdminReceiverTest {
     sealer.join(10_000);
 
     expect.that(drainer.isAlive()).isFalse();
+    expect.that(sealer.isAlive()).isFalse();
+  }
+
+  @Test
+  public void sealActivityLogBeforeClear_whileWaitingForTheUploadLock_leavesStagingFree()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesLogStaging staging = new CrumblesLogStaging(context);
+    Thread sealer =
+        new Thread(() -> CrumblesDeviceAdminReceiver.sealActivityLogBeforeClear(context));
+    // Stands for a drain or a wipe, which needs the staging lock while it holds UPLOAD_LOCK.
+    Thread stagingUser = new Thread(() -> expect.that(staging.countBatches()).isEqualTo(0));
+    sealer.setDaemon(true);
+    stagingUser.setDaemon(true);
+    boolean stagingFreeDuringUpload;
+
+    // An upload holds UPLOAD_LOCK when the clear starts.
+    synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
+      sealer.start();
+      while (sealer.isAlive() && sealer.getState() != Thread.State.BLOCKED) {
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+      }
+      stagingUser.start();
+      stagingUser.join(10_000);
+      stagingFreeDuringUpload = !stagingUser.isAlive();
+    }
+    sealer.join(10_000);
+    stagingUser.join(10_000);
+
+    expect.that(stagingFreeDuringUpload).isTrue();
     expect.that(sealer.isAlive()).isFalse();
   }
 
@@ -1815,7 +1964,7 @@ public final class CrumblesDeviceAdminReceiverTest {
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST))
         .isEqualTo("Network log batch of 2 event(s) was lost: storage quota reached.");
     expect.that(new CrumblesLogStaging(context).isEmpty()).isTrue();
-    expect.that(findDeferredLogsNotification(context)).isNotNull();
+    assertLossNotificationPosted(context);
   }
 
   @Test
@@ -1939,7 +2088,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST))
         .isEqualTo("Network log batch of 5 event(s) was lost: the staging area is full.");
-    expect.that(findDeferredLogsNotification(context)).isNotNull();
+    assertLossNotificationPosted(context);
   }
 
   @Test
@@ -1953,7 +2102,65 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST))
         .isEqualTo("Network log batch of 7 event(s) was lost: staging it failed.");
-    expect.that(findDeferredLogsNotification(context)).isNotNull();
+    assertLossNotificationPosted(context);
+  }
+
+  @Test
+  public void retrieveAndSaveSecurityLogs_whenKeystoreFailsWhileStaging_reportsLostLogs() {
+    Context context = ApplicationProvider.getApplicationContext();
+    FakeAndroidKeyStoreSpi.failKeyLookup(
+        CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS,
+        new ProviderException("Keystore cannot be reached."));
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+
+    expect
+        .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
+        .isEqualTo("Security log batch of 0 event(s) was lost: staging it failed.");
+    assertLossNotificationPosted(context);
+  }
+
+  @Test
+  public void retrieveAndSaveSecurityLogs_whenStagingThrowsUnchecked_reportsLostLogs() {
+    Context context = ApplicationProvider.getApplicationContext();
+    FakeAndroidKeyStoreSpi.failKeyLookup(
+        CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS, new IllegalStateException("Keystore failed."));
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+
+    expect
+        .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
+        .isEqualTo("Security log batch of 0 event(s) was lost: staging it failed.");
+    assertLossNotificationPosted(context);
+  }
+
+  @Test
+  public void retrieveAndSaveSecurityLogs_whenSavingThrowsUnchecked_stagesTheLogs()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    CrumblesLogsEncryptor encryptor = spy(new CrumblesLogsEncryptor(context));
+    doThrow(new IllegalStateException("Keystore failed."))
+        .when(encryptor)
+        .encryptLogs(any(Context.class), any(byte[].class), any(PublicKey.class), any(), any());
+    CrumblesMain.setLogsEncryptorInstanceForTest(encryptor);
+    try {
+      CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+          deviceOwnerWithoutSecurityLogs(context));
+    } finally {
+      CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    }
+
+    expect.that(savedBatches(context)).isEmpty();
+    expect.that(new CrumblesLogStaging(context).countBatches()).isEqualTo(1);
+    expect
+        .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_STAGED))
+        .isEqualTo(
+            "Security log batch of 0 event(s) was staged: saving it threw"
+                + " IllegalStateException.");
+    expect.that(auditMessages(context, AUDIT_EVENT_LOGS_LOST)).isEmpty();
   }
 
   @Test
@@ -1989,6 +2196,30 @@ public final class CrumblesDeviceAdminReceiverTest {
 
     verify(mockDpm).setSecurityLoggingEnabled(any(ComponentName.class), eq(true));
     verify(mockDpm).setNetworkLoggingEnabled(any(ComponentName.class), eq(false));
+  }
+
+  @Test
+  public void onProfileProvisioningComplete_whenLoggingIsTurnedOn_recordsEachTypeTurnedOn() {
+    Context realContext = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(realContext.getPackageName())).thenReturn(true);
+    when(mockDpm.isSecurityLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    when(mockDpm.isNetworkLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    Intent intent = new Intent(DeviceAdminReceiver.ACTION_PROFILE_PROVISIONING_COMPLETE);
+    PersistableBundle adminExtras = new PersistableBundle();
+    adminExtras.putBoolean("enable_logging", true);
+    intent.putExtra(DevicePolicyManager.EXTRA_PROVISIONING_ADMIN_EXTRAS_BUNDLE, adminExtras);
+
+    receiver.onProfileProvisioningComplete(createContextWrapper(realContext, mockDpm), intent);
+
+    expect
+        .that(auditMessages(realContext, CrumblesLoggingWatchdogWorker.AUDIT_EVENT_LOGGING_ENABLED))
+        .containsExactly("Security logging was turned on.");
+    expect
+        .that(
+            auditMessages(
+                realContext, CrumblesLoggingWatchdogWorker.AUDIT_EVENT_NETWORK_LOGGING_ENABLED))
+        .containsExactly("Network logging was turned on.");
   }
 
   @Test
@@ -2591,7 +2822,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST))
         .isEqualTo("Security logs lost due to SecurityException.");
-    assertDeferredLogsNotificationPosted(context);
+    assertLossNotificationPosted(context);
   }
 
   @Test
@@ -2611,7 +2842,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST))
         .isEqualTo("Network log batch of 5 event(s) was lost: retrieval threw SecurityException.");
-    assertDeferredLogsNotificationPosted(context);
+    assertLossNotificationPosted(context);
   }
 
   @Test
@@ -2634,7 +2865,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST))
         .isEqualTo("Network log batch of 5 event(s) was lost: retrieval threw SecurityException.");
-    assertDeferredLogsNotificationPosted(context);
+    assertLossNotificationPosted(context);
   }
 
   @Test
@@ -2928,6 +3159,81 @@ public final class CrumblesDeviceAdminReceiverTest {
   }
 
   @Test
+  public void actionNeededAlert_whenDismissedWhileItsProblemLasts_isPostedAgainAndRecorded()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDeviceAdminReceiver.reportInvalidatedKey(context, "AA:BB");
+    PendingIntent deleteIntent =
+        postedAlert(context, CrumblesConstants.KEY_DELETED_NOTIFICATION_ID).deleteIntent;
+    assertThat(deleteIntent).isNotNull();
+    context
+        .getSystemService(NotificationManager.class)
+        .cancel(CrumblesConstants.KEY_DELETED_NOTIFICATION_ID);
+
+    deleteIntent.send();
+    Shadows.shadowOf(Looper.getMainLooper()).idle();
+
+    Notification alert = postedAlert(context, CrumblesConstants.KEY_DELETED_NOTIFICATION_ID);
+    assertThat(alert).isNotNull();
+    expect
+        .that(alert.extras.getCharSequence(Notification.EXTRA_TEXT).toString())
+        .isEqualTo("screen lock removed; built-in key and its batches are lost");
+    expect
+        .that(auditMessages(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_ALERT_DISMISSED))
+        .containsExactly(
+            "Alert \"Action needed to continue background sync\" was dismissed while its problem"
+                + " lasted, so it was posted again: screen lock removed; built-in key and its"
+                + " batches are lost");
+  }
+
+  @Test
+  public void actionNeededAlert_whenDismissedAfterItsProblemIsSolved_staysCancelled()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDeviceAdminReceiver.reportInvalidatedKey(context, "AA:BB");
+    PendingIntent deleteIntent =
+        postedAlert(context, CrumblesConstants.KEY_DELETED_NOTIFICATION_ID).deleteIntent;
+    assertThat(deleteIntent).isNotNull();
+    CrumblesDeviceAdminReceiver.cancelKeyInvalidatedNotification(context);
+
+    deleteIntent.send();
+    Shadows.shadowOf(Looper.getMainLooper()).idle();
+
+    expect.that(postedAlert(context, CrumblesConstants.KEY_DELETED_NOTIFICATION_ID)).isNull();
+    expect
+        .that(auditMessages(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_ALERT_DISMISSED))
+        .isEmpty();
+  }
+
+  @Test
+  public void pauseAlert_whenDismissedWhileCollectionIsPaused_isPostedAgain() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDeviceAdminReceiver.prefs(context)
+        .edit()
+        .putBoolean(CrumblesDeviceAdminReceiver.PREF_PAUSED_BY_SECONDARY_USER, true)
+        .commit();
+    CrumblesDeviceAdminReceiver.notifyCollectionPaused(context);
+    PendingIntent deleteIntent =
+        postedAlert(context, CrumblesConstants.COLLECTION_PAUSED_NOTIFICATION_ID).deleteIntent;
+    assertThat(deleteIntent).isNotNull();
+    context
+        .getSystemService(NotificationManager.class)
+        .cancel(CrumblesConstants.COLLECTION_PAUSED_NOTIFICATION_ID);
+
+    deleteIntent.send();
+    Shadows.shadowOf(Looper.getMainLooper()).idle();
+
+    assertThat(postedAlert(context, CrumblesConstants.COLLECTION_PAUSED_NOTIFICATION_ID))
+        .isNotNull();
+  }
+
+  /** Returns the alert {@code notificationId} that Crumbles shows, or null if none shows. */
+  private static Notification postedAlert(Context context, int notificationId) {
+    return Shadows.shadowOf(context.getSystemService(NotificationManager.class))
+        .getNotification(notificationId);
+  }
+
+  @Test
   public void sealActivityLogBeforeClear_whenNoUnshippedRecords_writesNothingAndRequestsNoUpload()
       throws Exception {
     Context context = ApplicationProvider.getApplicationContext();
@@ -3002,8 +3308,64 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_CLEAR_SEAL_FAILED))
         .contains("Unshipped activity records could not be sealed");
-    // Each attempt asks for an upload; the second one is appended to the first.
-    expect.that(getSendNowWorkInfos(context)).hasSize(2);
+    // Each attempt asks for an upload; the second one replaces the first, which has not started.
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void sealActivityLogBeforeClear_whenSavingThrowsUnchecked_refusesClearAndLogsFailure()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    CrumblesAppAuditLogger logger = CrumblesAppAuditLogger.getInstance(context);
+    logger.logEvent("COERCED_DEST_CHANGE", "Changed destination before clearing.");
+    int unshipped = logger.getUnshippedExcerpt().size();
+    CrumblesLogsEncryptor encryptor = spy(new CrumblesLogsEncryptor(context));
+    doThrow(new IllegalStateException("Keystore failed."))
+        .when(encryptor)
+        .encryptLogs(any(Context.class), any(byte[].class), any(PublicKey.class), any(), any());
+    CrumblesMain.setLogsEncryptorInstanceForTest(encryptor);
+    int unsealed;
+    try {
+      unsealed = CrumblesDeviceAdminReceiver.sealActivityLogBeforeClear(context);
+    } finally {
+      CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    }
+
+    expect.that(unsealed).isEqualTo(unshipped);
+    expect.that(listBatchFiles(context)).isEmpty();
+    expect
+        .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_CLEAR_SEAL_FAILED))
+        .isEqualTo(
+            "Unshipped activity records could not be sealed before clearing the activity log.");
+  }
+
+  @Test
+  public void clearShippedLogs_afterSealActivityLogBeforeClear_keepsRecordsLoggedWhileSealing()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    // The pre-clear batch is then written unsigned, which is recorded after its excerpt was read.
+    FakeAndroidKeyStoreSpi.failKeyLookup(
+        CrumblesBatchSigningKey.ALIAS, new IllegalStateException("Keystore failed."));
+    CrumblesAppAuditLogger logger = CrumblesAppAuditLogger.getInstance(context);
+    logger.logEvent("COERCED_SHARE", "Shared decrypted logs before clearing.");
+    expect.that(CrumblesDeviceAdminReceiver.sealActivityLogBeforeClear(context)).isEqualTo(0);
+
+    int kept = logger.clearShippedLogs();
+
+    expect.that(kept).isEqualTo(1);
+    expect
+        .that(
+            logger.getAllPersistedEventsForDisplay().stream()
+                .map(CrumblesAuditEvent::getEventType)
+                .toList())
+        .containsExactly(
+            CrumblesDeviceAdminReceiver.AUDIT_EVENT_BATCH_SIGNING_FAILED, "AUDIT_LOG_CLEARED")
+        .inOrder();
+    expect
+        .that(new String(logger.getUnshippedExcerpt().toBytes(), UTF_8))
+        .contains(CrumblesDeviceAdminReceiver.AUDIT_EVENT_BATCH_SIGNING_FAILED);
   }
 
   @Test
@@ -3021,15 +3383,11 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect.that(CrumblesDeviceAdminReceiver.hasSecondaryUsers(dpmCtx)).isFalse();
 
     when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
-    UserManager um = context.getSystemService(UserManager.class);
-    Shadows.shadowOf(um)
-        .setUserRestriction(android.os.Process.myUserHandle(), UserManager.DISALLOW_ADD_USER, true);
+    setUserRestrictions(context, MANAGED_USER_RESTRICTIONS, /* value= */ true);
     CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmCtx, /* enabled= */ true);
     CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmCtx, /* enabled= */ false);
     verify(mockDpm, never()).addUserRestriction(any(), any());
-    Shadows.shadowOf(um)
-        .setUserRestriction(
-            android.os.Process.myUserHandle(), UserManager.DISALLOW_ADD_USER, false);
+    setUserRestrictions(context, MANAGED_USER_RESTRICTIONS, /* value= */ false);
 
     doThrow(new SecurityException()).when(mockDpm).addUserRestriction(any(), any());
     CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmCtx, /* enabled= */ true);
@@ -3044,6 +3402,44 @@ public final class CrumblesDeviceAdminReceiverTest {
     CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmCtx, /* enabled= */ false);
     CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmCtx, /* enabled= */ false);
     verify(mockDpm, times(2)).clearUserRestriction(admin, UserManager.DISALLOW_ADD_USER);
+  }
+
+  @Test
+  public void syncDisallowAddUserRestriction_leavesProfileRestrictionsThatAndroidApplied() {
+    Context context = ApplicationProvider.getApplicationContext();
+    ComponentName admin = new ComponentName(context, CrumblesDeviceAdminReceiver.class);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context dpmContext = createContextWrapper(context, mockDpm);
+    setUserRestrictions(context, DEVICE_OWNER_PROFILE_RESTRICTIONS, /* value= */ true);
+
+    CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmContext, /* enabled= */ true);
+    CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmContext, /* enabled= */ false);
+
+    verify(mockDpm).addUserRestriction(any(), any());
+    verify(mockDpm).addUserRestriction(admin, UserManager.DISALLOW_ADD_USER);
+    verify(mockDpm).clearUserRestriction(any(), any());
+    verify(mockDpm).clearUserRestriction(admin, UserManager.DISALLOW_ADD_USER);
+  }
+
+  @Test
+  public void syncDisallowAddUserRestriction_reappliesLiftedProfileRestrictionsAndClearsThem() {
+    Context context = ApplicationProvider.getApplicationContext();
+    ComponentName admin = new ComponentName(context, CrumblesDeviceAdminReceiver.class);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context dpmContext = createContextWrapper(context, mockDpm);
+
+    CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmContext, /* enabled= */ true);
+    CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmContext, /* enabled= */ false);
+    CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(dpmContext, /* enabled= */ false);
+
+    verify(mockDpm, times(MANAGED_USER_RESTRICTIONS.size())).addUserRestriction(any(), any());
+    verify(mockDpm, times(MANAGED_USER_RESTRICTIONS.size())).clearUserRestriction(any(), any());
+    for (String restriction : MANAGED_USER_RESTRICTIONS) {
+      verify(mockDpm).addUserRestriction(admin, restriction);
+      verify(mockDpm).clearUserRestriction(admin, restriction);
+    }
   }
 
   @Test
@@ -3179,7 +3575,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect
         .that(newestAuditMessage(context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_LOGS_LOST))
         .contains("Security log event ID gap detected (2..3 missing)");
-    assertDeferredLogsNotificationPosted(context);
+    assertLossNotificationPosted(context);
 
     CrumblesAppAuditLogger.getInstance(context).clearAllLogs();
     CrumblesDeviceAdminReceiver.bumpNetworkLoggingEnableEpoch(context);
@@ -3263,25 +3659,344 @@ public final class CrumblesDeviceAdminReceiverTest {
         .that(batch)
         .startsWith(
             "Crumbles: security logs that the platform kept from before the device restarted.");
+    expect.that(batch).contains("The platform does not authenticate these records");
     expect.that(batch).contains("ADB shell command: \n\"pm clear com.example\"\n");
   }
 
   @Test
-  public void onReceive_bootCompleted_whenNoLogsWereKeptBeforeTheRestart_reportsNoLoss()
+  public void onReceive_bootCompleted_whenTheDeviceKeepsNoLogsAcrossRestarts_reportsWhatMayBeLost()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class))).thenReturn(null);
+    Context deviceOwnerContext = retrieveInBoot5(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 6);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    String report = newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST);
+    expect
+        .that(report)
+        .startsWith(
+            "The platform kept no security logs from before the restart: this device keeps none"
+                + " across restarts. Security events logged after the last retrieval, at ");
+    expect
+        .that(report)
+        .endsWith(
+            ", and network events not yet handed over (after network batch token 7) may have been"
+                + " lost.");
+    expect.that(new CrumblesLogStaging(context).isEmpty()).isTrue();
+    assertDeferredLogsNotificationNotPosted(context);
+  }
+
+  @Test
+  public void onReceive_bootCompleted_afterAColdBoot_reportsWhatMayBeLost() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of());
+    Context deviceOwnerContext = retrieveInBoot5(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 6);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    String report = newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST);
+    expect
+        .that(report)
+        .startsWith(
+            "The platform kept no security logs from before the restart, as after a cold boot."
+                + " Security events logged after the last retrieval, at ");
+    expect
+        .that(report)
+        .endsWith(
+            ", and network events not yet handed over (after network batch token 7) may have been"
+                + " lost.");
+  }
+
+  @Test
+  public void onReceive_bootCompleted_afterBootsThatNeverHandledTheirLogs_reportsThem()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 7);
+    // Saving the logs of the current boot after the report must not withdraw its alert.
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_ADB_SHELL_CMD, "live")))
+        .thenReturn(null);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
+        .isEqualTo(
+            "Security logs kept from before 1 restart(s) may have been lost: the device restarted"
+                + " again before Crumbles retrieved them.");
+    assertLossNotificationPosted(context);
+  }
+
+  @Test
+  public void onReceive_bootCompleted_whenTheBootCountDidNotGrow_reportsItAndRetrievesAgain()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    verify(mockDpm, times(2)).retrievePreRebootSecurityLogs(any(ComponentName.class));
+    expect
+        .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
+        .isEqualTo(
+            "The boot count did not grow across a restart, as when it is lowered through adb,"
+                + " which can hide a restart whose security logs were lost.");
+    assertLossNotificationPosted(context);
+  }
+
+  @Test
+  public void onReceive_bootCompleted_afterTheBootCountWasDeleted_reportsUntilItGrowsAgain()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    Context deviceOwnerContext =
+        createContextWrapper(context, deviceOwnerWithSecurityLoggingOn(context));
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 3);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    String didNotGrow =
+        "The boot count did not grow across a restart, as when it is lowered through adb, which"
+            + " can hide a restart whose security logs were lost.";
+    expect
+        .that(auditMessages(context, AUDIT_EVENT_LOGS_LOST))
+        .containsExactly(didNotGrow, didNotGrow);
+  }
+
+  @Test
+  public void onReceive_bootCompleted_whenTheBootCountDidNotGrow_reportsWhatMayBeLost()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class))).thenReturn(null);
+    Context deviceOwnerContext = retrieveInBoot5(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    List<String> reports = auditMessages(context, AUDIT_EVENT_LOGS_LOST);
+    assertThat(reports.size()).isAtLeast(2);
+    // Newest first: the window is reported before the boot count that did not grow.
+    expect
+        .that(reports.get(0))
+        .isEqualTo(
+            "The boot count did not grow across a restart, as when it is lowered through adb,"
+                + " which can hide a restart whose security logs were lost.");
+    expect
+        .that(reports.get(1))
+        .startsWith(
+            "The platform kept no security logs from before the restart: this device keeps none"
+                + " across restarts. Security events logged after the last retrieval, at ");
+    expect
+        .that(reports.get(1))
+        .endsWith(
+            ", and network events not yet handed over (after network batch token 7) may have been"
+                + " lost.");
+  }
+
+  @Test
+  public void onReceive_bootCompleted_withAnUnknownBootCount_retrievesThePreRebootLogsEveryBoot()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    verify(mockDpm, times(2)).retrievePreRebootSecurityLogs(any(ComponentName.class));
+  }
+
+  @Test
+  public void onReceive_bootCompleted_afterABootWithAnUnknownCount_reportsNoSkippedBoots()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect.that(auditMessages(context, AUDIT_EVENT_LOGS_LOST)).isEmpty();
+  }
+
+  @Test
+  public void onReceive_bootCompleted_afterABootWithAnUnknownCount_namesItsLastNetworkBatch()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class))).thenReturn(null);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(new ArrayList<>())
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
+    new CrumblesBootRecord(context).recordNetworkBatchToken(/* token= */ 7);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 6);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
+        .endsWith(
+            ", and network events not yet handed over (after network batch token 7) may have been"
+                + " lost.");
+  }
+
+  @Test
+  public void onReceive_bootCompleted_afterTheCountChangedMidBoot_retrievesThePreRebootLogs()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    // The adb shell raises the count during the boot, and the watchdog runs.
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 6);
+    CrumblesDeviceAdminReceiver.savePreRebootLogsIfPending(deviceOwnerContext);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 6);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    verify(mockDpm, times(2)).retrievePreRebootSecurityLogs(any(ComponentName.class));
+  }
+
+  @Test
+  public void onReceive_bootCompleted_withSecurityLoggingOffThroughout_reportsNoSkippedBoots()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    Context deviceOwnerContext = deviceOwnerWithoutSecurityLogs(context);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 7);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect.that(auditMessages(context, AUDIT_EVENT_LOGS_LOST)).isEmpty();
+  }
+
+  @Test
+  public void retrieveAndSaveSecurityLogs_inANewBoot_reportsTheEventIdsMissingSinceItsStart()
       throws Exception {
     Context context = ApplicationProvider.getApplicationContext();
     saveNewExternalPublicKey(context);
     DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
     when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
-    when(mockDpm.isSecurityLoggingEnabled(any(ComponentName.class))).thenReturn(true);
-    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class))).thenReturn(null);
-    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenReturn(null);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEventWithId(0L, SecurityLog.TAG_OS_STARTUP, "")))
+        .thenReturn(ImmutableList.of(securityEventWithId(3L, SecurityLog.TAG_OS_STARTUP, "")));
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
 
-    deliverBootCompleted(receiver, createContextWrapper(context, mockDpm));
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
 
-    expect.that(savedBatches(context)).isEmpty();
-    expect.that(new CrumblesLogStaging(context).isEmpty()).isTrue();
-    expect.that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST)).isEmpty();
+    expect
+        .that(auditMessages(context, AUDIT_EVENT_LOGS_LOST))
+        .contains(
+            "Security log event ID gap detected (0..2 missing): platform logs were lost before"
+                + " retrieval.");
+  }
+
+  @Test
+  public void recordNetworkBatchToken_inANewBootPastTheFirstToken_reportsTheMissingTokens() {
+    Context context = ApplicationProvider.getApplicationContext();
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    CrumblesDeviceAdminReceiver.recordNetworkBatchToken(context, /* batchToken= */ 1);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+
+    CrumblesDeviceAdminReceiver.recordNetworkBatchToken(context, /* batchToken= */ 4);
+
+    expect
+        .that(auditMessages(context, AUDIT_EVENT_LOGS_LOST))
+        .containsExactly(
+            "Network log batch token gap detected (1..3 missing): platform logs were lost before"
+                + " retrieval.");
+  }
+
+  @Test
+  public void onReceive_bootCompleted_withSecurityLoggingOff_stillReportsSkippedBoots()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    deliverBootCompleted(
+        receiver, createContextWrapper(context, deviceOwnerWithSecurityLoggingOn(context)));
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 7);
+
+    deliverBootCompleted(receiver, deviceOwnerWithoutSecurityLogs(context));
+
+    expect
+        .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
+        .isEqualTo(
+            "Security logs kept from before 1 restart(s) may have been lost: the device restarted"
+                + " again before Crumbles retrieved them.");
+    assertLossNotificationPosted(context);
+  }
+
+  @Test
+  public void onUserRemoved_afterTheRetrievalOfPreRebootLogsWasRefused_savesThem()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenThrow(new SecurityException("Not all users are affiliated"))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    deliver(
+        receiver,
+        deviceOwnerContext,
+        new Intent("android.app.action.USER_REMOVED")
+            .putExtra(Intent.EXTRA_USER, UserHandle.getUserHandleForUid(1000000)));
+
+    expect.that(savedBatches(context)).hasLength(1);
+    expect
+        .that(newestAuditMessage(context, "LOG_RETRIEVAL_DEFERRED"))
+        .isEqualTo(
+            "Pre-reboot security log retrieval was refused, as while another user is present. The"
+                + " platform keeps the logs until the device restarts.");
   }
 
   @Test
@@ -3308,16 +4023,19 @@ public final class CrumblesDeviceAdminReceiverTest {
   }
 
   @Test
-  public void onReceive_bootCompleted_whenStorageIsLow_defersTheRetrieval() throws Exception {
+  public void onReceive_bootCompleted_whenStorageIsLow_savesOnlyThePreRebootLogs()
+      throws Exception {
     Context context = ApplicationProvider.getApplicationContext();
     saveNewExternalPublicKey(context);
     DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
     when(mockDpm.isSecurityLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
     long lowSpace = MIN_SECURITY_USABLE_SPACE_BYTES - 1;
 
     deliverBootCompleted(receiver, withUsableSpace(context, mockDpm, () -> lowSpace));
 
-    verify(mockDpm, never()).retrievePreRebootSecurityLogs(any());
+    expect.that(savedBatches(context)).hasLength(1);
     verify(mockDpm, never()).retrieveSecurityLogs(any());
     expect
         .that(newestAuditMessage(context, "LOG_RETRIEVAL_DEFERRED"))
@@ -3374,6 +4092,481 @@ public final class CrumblesDeviceAdminReceiverTest {
                 .getWorkInfosForUniqueWork(CrumblesConstants.SEND_WORK_TAG)
                 .get())
         .hasSize(1);
+  }
+
+  @Test
+  public void onReceive_timeChanged_asDeviceOwner_reschedulesAllPeriodicWorkAndRequestsAnUpload()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID oldUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID oldFileDeletion = scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG);
+    UUID oldWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    UUID oldHeartbeat = scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG);
+    assertThat(getSendNowWorkInfos(context)).isEmpty();
+
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isNotEqualTo(oldUpload);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG))
+        .isNotEqualTo(oldFileDeletion);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isNotEqualTo(oldWatchdog);
+    expect
+        .that(scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG))
+        .isNotEqualTo(oldHeartbeat);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void onReceive_timeChangedBack_replacesUploadRequestedAtForwardClockInsteadOfBlocking()
+      throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    AtomicLong clockMillis = new AtomicLong(baseMillis + Duration.ofDays(10).toMillis());
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    UUID forwardUpload = scheduledWorkId(context, CrumblesConstants.SEND_NOW_WORK_NAME);
+    clockMillis.set(baseMillis);
+
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+
+    WorkInfo upload = onlyWorkInfo(context, CrumblesConstants.SEND_NOW_WORK_NAME);
+    expect.that(upload.getId()).isNotEqualTo(forwardUpload);
+    expect.that(upload.getState()).isEqualTo(WorkInfo.State.ENQUEUED);
+    expect.that(upload.getNextScheduleTimeMillis()).isAtMost(baseMillis);
+  }
+
+  @Test
+  public void onReceive_timeChanged_withoutLoggingAccess_withAWaitingBatch_reschedulesTheUpload()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID oldUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    saveBatchFile(context, "pending.bin");
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isNotEqualTo(oldUpload);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void onReceive_timeChanged_withoutLoggingAccess_withASentBatch_reschedulesFileDeletion()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID oldFileDeletion = scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG);
+    saveBatchFile(context, "uploaded" + CrumblesConstants.SENT_SUFFIX);
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    assertThat(scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG))
+        .isNotEqualTo(oldFileDeletion);
+  }
+
+  @Test
+  public void onReceive_timeChanged_withoutLoggingAccess_withStagedBatch_reschedulesPeriodicWork()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID oldUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID oldFileDeletion = scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG);
+    UUID oldWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    UUID oldHeartbeat = scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG);
+    assertThat(new CrumblesLogStaging(context).stage(/* isNetworkBatch= */ false, new byte[] {1}))
+        .isTrue();
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isNotEqualTo(oldUpload);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG))
+        .isNotEqualTo(oldFileDeletion);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isNotEqualTo(oldWatchdog);
+    expect
+        .that(scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG))
+        .isNotEqualTo(oldHeartbeat);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void
+      onReceive_timeChanged_withoutLoggingAccess_withDirectBootBatch_reschedulesPeriodicWork()
+          throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID oldUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID oldWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    saveDirectBootBatchFile(context, "0000000000000000000.bin");
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isNotEqualTo(oldUpload);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isNotEqualTo(oldWatchdog);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void
+      onReceive_timeChanged_afterDelegatedAccessRevokedBeforeWatchdogRuns_reschedulesPeriodicWork()
+          throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID oldUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID oldWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    CrumblesDeviceAdminReceiver.prefs(context)
+        .edit()
+        .putBoolean(CrumblesConstants.PREF_LAST_OBSERVED_LOGGING_ENABLED, true)
+        .commit();
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isNotEqualTo(oldUpload);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isNotEqualTo(oldWatchdog);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void
+      onReceive_timeChanged_afterNetworkDelegationRevokedBeforeWatchdogRuns_reschedulesWork()
+          throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID oldUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID oldWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    CrumblesDeviceAdminReceiver.prefs(context)
+        .edit()
+        .putBoolean(CrumblesConstants.PREF_LAST_OBSERVED_NETWORK_LOGGING_ENABLED, true)
+        .commit();
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isNotEqualTo(oldUpload);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isNotEqualTo(oldWatchdog);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void
+      onReceive_timeChanged_afterWatchdogRecordedNoAccess_repairsFutureScheduleWithoutUpload()
+          throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    AtomicLong clockMillis = new AtomicLong(baseMillis + Duration.ofDays(10).toMillis());
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID forwardUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID forwardWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    clockMillis.set(baseMillis);
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    WorkInfo uploadInfo = onlyWorkInfo(context, CrumblesConstants.SEND_WORK_TAG);
+    WorkInfo watchdogInfo = onlyWorkInfo(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    expect.that(uploadInfo.getId()).isNotEqualTo(forwardUpload);
+    expect
+        .that(uploadInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesConstants.SEND_REPEAT_INTERVAL.toMillis());
+    expect.that(watchdogInfo.getId()).isNotEqualTo(forwardWatchdog);
+    expect
+        .that(watchdogInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesConstants.LOGGING_WATCHDOG_REPEAT_INTERVAL.toMillis());
+    expect.that(getSendNowWorkInfos(context)).isEmpty();
+  }
+
+  @Test
+  public void onReceive_timeChangedWhileLocked_doesNotModifyWorkManager() throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    AtomicLong clockMillis = new AtomicLong(baseMillis + Duration.ofDays(10).toMillis());
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID forwardUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    clockMillis.set(baseMillis);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isEqualTo(forwardUpload);
+    expect.that(getSendNowWorkInfos(context)).isEmpty();
+  }
+
+  @Test
+  public void
+      onReceive_timeChangedWhileLocked_thenBootCompleted_reschedulesAllWorkWithinOneInterval()
+          throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    long forwardMillis = baseMillis + Duration.ofDays(10).toMillis();
+    AtomicLong clockMillis = new AtomicLong(forwardMillis);
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID forwardUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID forwardDeletion = scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG);
+    UUID forwardWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    UUID forwardHeartbeat = scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG);
+    clockMillis.set(baseMillis);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    WorkInfo uploadInfo = onlyWorkInfo(context, CrumblesConstants.SEND_WORK_TAG);
+    WorkInfo deletionInfo = onlyWorkInfo(context, CrumblesConstants.DELETE_WORK_TAG);
+    WorkInfo watchdogInfo = onlyWorkInfo(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    WorkInfo heartbeatInfo = onlyWorkInfo(context, CrumblesHeartbeatWorker.WORK_TAG);
+    expect.that(uploadInfo.getId()).isNotEqualTo(forwardUpload);
+    expect
+        .that(uploadInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesConstants.SEND_REPEAT_INTERVAL.toMillis());
+    expect.that(deletionInfo.getId()).isNotEqualTo(forwardDeletion);
+    expect
+        .that(deletionInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + Duration.ofHours(25).toMillis());
+    expect.that(watchdogInfo.getId()).isNotEqualTo(forwardWatchdog);
+    expect
+        .that(watchdogInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesConstants.LOGGING_WATCHDOG_REPEAT_INTERVAL.toMillis());
+    expect.that(heartbeatInfo.getId()).isNotEqualTo(forwardHeartbeat);
+    expect
+        .that(heartbeatInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesHeartbeatWorker.CHECK_INTERVAL.toMillis());
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void onReceive_bootCompletedAfterRepairedTimeChange_keepsSchedulesAndSkipsSecondUpload()
+      throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    AtomicLong clockMillis = new AtomicLong(baseMillis + Duration.ofDays(10).toMillis());
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    clockMillis.set(baseMillis);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(true);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID repairedUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG))
+        .isEqualTo(repairedUpload);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void onReceive_unlockedTimeChangedBeforeBootCompleted_skipsSecondReschedule()
+      throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    AtomicLong clockMillis = new AtomicLong(baseMillis + Duration.ofDays(10).toMillis());
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    clockMillis.set(baseMillis);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(true);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    UUID uploadAfterTimeChange = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID deletionAfterTimeChange = scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG);
+    UUID watchdogAfterTimeChange =
+        scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    UUID heartbeatAfterTimeChange = scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG))
+        .isEqualTo(uploadAfterTimeChange);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG))
+        .isEqualTo(deletionAfterTimeChange);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isEqualTo(watchdogAfterTimeChange);
+    expect
+        .that(scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG))
+        .isEqualTo(heartbeatAfterTimeChange);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void
+      onReceive_timeChangedWhileLockedWithSmallShift_thenBootCompleted_reschedulesAndUploads()
+          throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    AtomicLong clockMillis = new AtomicLong(baseMillis + Duration.ofHours(2).toMillis());
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID uploadBeforeCorrection = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID deletionBeforeCorrection = scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG);
+    clockMillis.set(baseMillis);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG))
+        .isNotEqualTo(uploadBeforeCorrection);
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG))
+        .isNotEqualTo(deletionBeforeCorrection);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void onReceive_bootCompleted_afterSilentClockCorrection_repairsAllFourPeriodicWorks()
+      throws Exception {
+    long baseMillis = 1_700_000_000_000L;
+    AtomicLong clockMillis = new AtomicLong(baseMillis + Duration.ofDays(10).toMillis());
+    Context context = ApplicationProvider.getApplicationContext();
+    initializeWorkManagerWithClock(context, clockMillis);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID forwardUpload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+    UUID forwardDeletion = scheduledWorkId(context, CrumblesConstants.DELETE_WORK_TAG);
+    UUID forwardWatchdog = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    UUID forwardHeartbeat = scheduledWorkId(context, CrumblesHeartbeatWorker.WORK_TAG);
+    clockMillis.set(baseMillis);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    WorkInfo uploadInfo = onlyWorkInfo(context, CrumblesConstants.SEND_WORK_TAG);
+    WorkInfo deletionInfo = onlyWorkInfo(context, CrumblesConstants.DELETE_WORK_TAG);
+    WorkInfo watchdogInfo = onlyWorkInfo(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    WorkInfo heartbeatInfo = onlyWorkInfo(context, CrumblesHeartbeatWorker.WORK_TAG);
+    expect.that(uploadInfo.getId()).isNotEqualTo(forwardUpload);
+    expect
+        .that(uploadInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesConstants.SEND_REPEAT_INTERVAL.toMillis());
+    expect.that(deletionInfo.getId()).isNotEqualTo(forwardDeletion);
+    expect
+        .that(deletionInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + Duration.ofHours(25).toMillis());
+    expect.that(watchdogInfo.getId()).isNotEqualTo(forwardWatchdog);
+    expect
+        .that(watchdogInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesConstants.LOGGING_WATCHDOG_REPEAT_INTERVAL.toMillis());
+    expect.that(heartbeatInfo.getId()).isNotEqualTo(forwardHeartbeat);
+    expect
+        .that(heartbeatInfo.getNextScheduleTimeMillis())
+        .isAtMost(baseMillis + CrumblesHeartbeatWorker.CHECK_INTERVAL.toMillis());
+  }
+
+  @Test
+  public void onReceive_timeChanged_withoutLoggingAccessOrBatches_leavesThePeriodicWork()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesWorkScheduler.scheduleAllPeriodicWork(context, WorkManager.getInstance(context));
+    UUID upload = scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG);
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mock(DevicePolicyManager.class)),
+        new Intent(Intent.ACTION_TIME_CHANGED));
+
+    expect.that(scheduledWorkId(context, CrumblesConstants.SEND_WORK_TAG)).isEqualTo(upload);
+    expect.that(getSendNowWorkInfos(context)).isEmpty();
+  }
+
+  /** Returns the ID of the only work that {@code uniqueWorkName} names. */
+  private static UUID scheduledWorkId(Context context, String uniqueWorkName) throws Exception {
+    return onlyWorkInfo(context, uniqueWorkName).getId();
+  }
+
+  /** Returns the only {@link WorkInfo} that {@code uniqueWorkName} names. */
+  private static WorkInfo onlyWorkInfo(Context context, String uniqueWorkName) throws Exception {
+    return getOnlyElement(
+        WorkManager.getInstance(context).getWorkInfosForUniqueWork(uniqueWorkName).get());
+  }
+
+  private static void initializeWorkManagerWithClock(Context context, AtomicLong clockMillis) {
+    Configuration config =
+        new Configuration.Builder()
+            .setMinimumLoggingLevel(Log.DEBUG)
+            .setExecutor(new SynchronousExecutor())
+            .setClock(clockMillis::get)
+            .build();
+    WorkManagerTestInitHelper.initializeTestWorkManager(context, config);
+  }
+
+  /** Saves an empty batch file named {@code name} in the logs directory. */
+  private static void saveBatchFile(Context context, String name) throws IOException {
+    File logsDirectory =
+        new File(
+            context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    Files.createDirectories(logsDirectory.toPath());
+    Files.write(new File(logsDirectory, name).toPath(), new byte[0]);
+  }
+
+  /** Saves an empty batch file named {@code name} in the Direct Boot store directory. */
+  private static void saveDirectBootBatchFile(Context context, String name) throws IOException {
+    File directBootDirectory =
+        new File(context.createDeviceProtectedStorageContext().getFilesDir(), "logs_before_unlock");
+    Files.createDirectories(directBootDirectory.toPath());
+    Files.write(new File(directBootDirectory, name).toPath(), new byte[0]);
   }
 
   @Test
@@ -3533,6 +4726,7 @@ public final class CrumblesDeviceAdminReceiverTest {
         .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
     when(mockDpm.retrieveSecurityLogs(admin)).thenReturn(new ArrayList<>());
     Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
 
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
@@ -3555,7 +4749,10 @@ public final class CrumblesDeviceAdminReceiverTest {
     Context deviceOwnerContext = createContextWrapper(context, mockDpm);
     Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
-    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    @SuppressWarnings("unused")
+    var unusedRecorded =
+        new CrumblesBootRecord(context)
+            .recordRestart(/* bootCount= */ 2, /* beforeUnlock= */ false);
 
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
 
@@ -3592,6 +4789,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     when(mockDpm.retrievePreRebootSecurityLogs(admin)).thenReturn(null);
     when(mockDpm.retrieveSecurityLogs(admin)).thenReturn(null);
     Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
 
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
@@ -3610,6 +4808,7 @@ public final class CrumblesDeviceAdminReceiverTest {
     when(mockDpm.retrievePreRebootSecurityLogs(admin)).thenReturn(ImmutableList.of());
     when(mockDpm.retrieveSecurityLogs(admin)).thenReturn(null);
     Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
 
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
     CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
@@ -3669,9 +4868,1034 @@ public final class CrumblesDeviceAdminReceiverTest {
     expect.that(new CrumblesLogStaging(context).countBatches()).isEqualTo(1);
   }
 
+  @Test
+  public void savingABatch_letsTheDirectBootStoreSaveBatchesForTheSameRecipient() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    KeyPair recipientKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(recipientKeyPair.getPublic());
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+    CrumblesDirectBootStore store = new CrumblesDirectBootStore(context);
+
+    boolean saved = store.saveBatch("before the unlock".getBytes(UTF_8));
+
+    assertThat(saved).isTrue();
+    LogBatch batch =
+        LogBatch.parseFrom(
+            Files.readAllBytes(store.batches().get(0).toPath()),
+            ExtensionRegistryLite.getEmptyRegistry());
+    SealedLogs sealedLogs = sealedLogsOf(batch, recipientKeyPair.getPrivate());
+    expect.that(sealedLogs.getLogs().toStringUtf8()).isEqualTo("before the unlock");
+    expect
+        .that(sealedLogs.getMetadata().getDevice().getDeviceId())
+        .isEqualTo(CrumblesDeviceIdManager.getDeviceId(context));
+    expect
+        .that(sealedLogs.getAttestationChainList())
+        .containsExactlyElementsIn(
+            sealedLogsOf(writtenBatches(context).get(0), recipientKeyPair.getPrivate())
+                .getAttestationChainList());
+    expect.that(batch.hasSignature()).isFalse();
+  }
+
+  @Test
+  public void directBootStoreBatches_areNamedInTheOrderTheyWereSaved() throws Exception {
+    CrumblesDirectBootStore store =
+        directBootStoreWithRecipient(ApplicationProvider.getApplicationContext());
+
+    boolean savedFirst = store.saveBatch(new byte[0]);
+    boolean savedSecond = store.saveBatch(new byte[0]);
+
+    expect.that(savedFirst).isTrue();
+    expect.that(savedSecond).isTrue();
+    expect
+        .that(store.batches().stream().map(File::getName).collect(toImmutableList()))
+        .containsExactly("0000000000000000000.bin", "0000000000000000001.bin")
+        .inOrder();
+  }
+
+  @Test
+  public void aRecipientForgottenWhileItsBatchWasSaved_isNotRemembered() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = new CrumblesDirectBootStore(context);
+    long forgottenBefore = CrumblesDirectBootStore.forgottenRecipients();
+    CrumblesDirectBootStore.forgetRecipient(context);
+
+    store.rememberRecipient(
+        forgottenBefore,
+        KeyPairGenerator.getInstance("RSA").generateKeyPair().getPublic(),
+        "device ID",
+        ImmutableList.of());
+
+    expect.that(store.canSaveBatch()).isFalse();
+  }
+
+  @Test
+  public void anInvalidatedInternalKey_makesTheDirectBootStoreForgetTheRecipient()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+
+    CrumblesDeviceAdminReceiver.reportInvalidatedKey(context, "fingerprint");
+
+    expect.that(store.canSaveBatch()).isFalse();
+  }
+
+  @Test
+  public void clearingTheInternalKey_makesTheDirectBootStoreForgetTheRecipient() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+
+    CrumblesDeviceAdminReceiver.clearActivatedInternalKey(context);
+
+    expect.that(store.canSaveBatch()).isFalse();
+  }
+
+  @Test
+  public void deactivatingTheExternalKey_makesTheDirectBootStoreForgetTheRecipient()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+
+    new CrumblesExternalPublicKeyManager(
+            CrumblesDataStoreHolder.getInstance(context),
+            CrumblesMain.getLogsEncryptorInstance(),
+            InstantSource.system(),
+            context)
+        .clearActiveExternalPublicKey();
+
+    expect.that(store.canSaveBatch()).isFalse();
+  }
+
+  @Test
+  public void changingHardwareAttribution_makesTheDirectBootStoreForgetTheRecipient()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    // With a hardware identifier, the change changes the device ID that the batches seal.
+    ShadowBuild.setSerial("hardware_serial_12345");
+
+    CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
+
+    expect.that(store.canSaveBatch()).isFalse();
+  }
+
+  @Test
+  public void savingABatchWithABatchWrappedKey_doesNotLetTheDirectBootStoreSaveBatches()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    Shadows.shadowOf(context.getSystemService(KeyguardManager.class)).setIsDeviceSecure(true);
+    CrumblesLogsEncryptor encryptor = new CrumblesLogsEncryptor(context);
+    CrumblesMain.setLogsEncryptorInstanceForTest(encryptor);
+    try {
+      CrumblesBatchKeyStore.createKeys();
+      CrumblesDeviceAdminReceiver.recordActivatedInternalKey(
+          context, encryptor.generateKeyPair().getPublic());
+
+      CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+          deviceOwnerWithoutSecurityLogs(context));
+
+      // Batches saved before the unlock carry no batch-wrapped key.
+      LogBatch batch = writtenBatches(context).get(0);
+      expect
+          .that(batch.getKey().getKeyEncryptionType())
+          .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
+      expect.that(batch.getKey().getBatchWrappedSymmetricKey().isEmpty()).isFalse();
+      expect.that(new CrumblesDirectBootStore(context).canSaveBatch()).isFalse();
+    } finally {
+      CrumblesBatchKeyStore.deleteKeys();
+      encryptor.deleteExistingKeyPair();
+      CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    }
+  }
+
+  @Test
+  public void activatingAnotherExternalKey_makesTheDirectBootStoreForgetTheRecipient()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+    CrumblesExternalPublicKeyManager keyManager =
+        new CrumblesExternalPublicKeyManager(
+            CrumblesDataStoreHolder.getInstance(context),
+            CrumblesMain.getLogsEncryptorInstance(),
+            InstantSource.system(),
+            context);
+
+    keyManager.saveActiveExternalPublicKey(
+        KeyPairGenerator.getInstance("RSA").generateKeyPair().getPublic());
+
+    CrumblesDirectBootStore store = new CrumblesDirectBootStore(context);
+    expect.that(store.canSaveBatch()).isFalse();
+    expect.that(store.saveBatch(new byte[0])).isFalse();
+    expect.that(store.batches()).isEmpty();
+  }
+
+  @Test
+  public void activatingANewInternalKey_makesTheDirectBootStoreForgetTheRecipient()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+    boolean couldSave = new CrumblesDirectBootStore(context).canSaveBatch();
+
+    CrumblesDeviceAdminReceiver.recordActivatedInternalKey(
+        context, KeyPairGenerator.getInstance("RSA").generateKeyPair().getPublic());
+
+    expect.that(couldSave).isTrue();
+    expect.that(new CrumblesDirectBootStore(context).canSaveBatch()).isFalse();
+  }
+
+  @Test
+  public void receivers_areDirectBootAwareAndTheAdminReceiverGetsTheLockedBootBroadcast()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    PackageManager packageManager = context.getPackageManager();
+
+    List<String> lockedBootReceivers =
+        packageManager
+            .queryBroadcastReceivers(
+                new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED)
+                    .setPackage(context.getPackageName()),
+                /* flags= */ 0)
+            .stream()
+            .map(resolveInfo -> resolveInfo.activityInfo.name)
+            .toList();
+
+    expect.that(lockedBootReceivers).contains(CrumblesDeviceAdminReceiver.class.getName());
+    expect
+        .that(
+            packageManager.getReceiverInfo(
+                    new ComponentName(context, CrumblesDeviceAdminReceiver.class), /* flags= */ 0)
+                .directBootAware)
+        .isTrue();
+    expect
+        .that(
+            packageManager.getReceiverInfo(
+                    new ComponentName(context, CrumblesDelegatedAdminReceiver.class),
+                    /* flags= */ 0)
+                .directBootAware)
+        .isTrue();
+  }
+
+  @Test
+  public void lockedBootCompleted_savesLogsBeforeTheUnlockThatBootCompletedSignsAndSaves()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    KeyPair recipientKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+    CrumblesExternalPublicKeyManager.getInstance(context)
+        .saveActiveExternalPublicKey(recipientKeyPair.getPublic());
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_ADB_SHELL_CMD, "restart")));
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        // The first event of the boot.
+        .thenReturn(
+            ImmutableList.of(securityEventWithId(0L, SecurityLog.TAG_ADB_SHELL_CMD, "unlock")))
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    int batchesBeforeTheUnlock = writtenBatches(context).size();
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    ImmutableList<LogBatch> batches = writtenBatches(context);
+    expect.that(batchesBeforeTheUnlock).isEqualTo(1);
+    assertThat(batches).hasSize(3);
+    expect
+        .that(decryptWithPrivateKey(batches.get(1), recipientKeyPair.getPrivate()))
+        .contains("\"restart\"");
+    String collectedBeforeTheUnlock =
+        decryptWithPrivateKey(batches.get(2), recipientKeyPair.getPrivate());
+    expect
+        .that(collectedBeforeTheUnlock)
+        .startsWith("Crumbles: security logs collected before the first unlock after a restart.");
+    expect.that(collectedBeforeTheUnlock).contains("\"unlock\"");
+    expect.that(isSignedByThisInstallation(batches.get(2))).isTrue();
+    expect.that(new CrumblesDirectBootStore(context).batches()).isEmpty();
+    expect.that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST)).isEmpty();
+  }
+
+  @Test
+  public void securityLogsAvailable_beforeTheUnlockWithoutARecipient_leavesThemWithThePlatform()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    recordLockedBoot(context, /* bootCount= */ 2);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    deliverSecurityLogs(receiver, createContextWrapper(context, mockDpm));
+
+    verify(mockDpm, never()).retrievePreRebootSecurityLogs(any());
+    verify(mockDpm, never()).retrieveSecurityLogs(any());
+  }
+
+  @Test
+  public void securityLogsAvailable_beforeTheUnlockWhenSavingFails_reportsTheLossAfterTheUnlock()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+    // A file in place of the directory of the batches makes saving them fail.
+    assertThat(
+            new File(
+                    context.createDeviceProtectedStorageContext().getFilesDir(),
+                    "logs_before_unlock")
+                .createNewFile())
+        .isTrue();
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")))
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    recordLockedBoot(context, /* bootCount= */ 2);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    deliverSecurityLogs(receiver, deviceOwnerContext);
+    String reportBeforeTheUnlock = newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST);
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect.that(reportBeforeTheUnlock).isEmpty();
+    expect
+        .that(newestAuditMessage(context, AUDIT_EVENT_LOGS_LOST))
+        .isEqualTo(
+            "Security log batch of 1 event(s), retrieved before the first unlock, was lost: saving"
+                + " it failed.");
+    assertLossNotificationPosted(context);
+  }
+
+  @Test
+  public void networkLogsAvailable_beforeTheUnlock_leavesThemWithThePlatform() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    CrumblesCollectionScope.setNetworkCollectionEnabled(context, /* enabled= */ true);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    deliverNetworkLogs(receiver, createContextWrapper(context, mockDpm));
+
+    verify(mockDpm, never()).retrieveNetworkLogs(any(), anyLong());
+  }
+
+  @Test
+  public void lockedBootCompleted_whenTheBootCountDidNotGrow_reportsItAfterTheUnlock()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(auditMessages(context, AUDIT_EVENT_LOGS_LOST))
+        .containsExactly(
+            "The boot count did not grow across a restart, as when it is lowered through adb,"
+                + " which can hide a restart whose security logs were lost.");
+  }
+
+  @Test
+  public void retrievingSecurityLogsAfterTheUnlock_firstSavesTheLogsCollectedBeforeIt()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+
+    expect.that(store.batches()).isEmpty();
+  }
+
+  @Test
+  public void bootCompleted_withSecurityLoggingOff_savesTheLogsCollectedBeforeTheUnlock()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+
+    deliverBootCompleted(receiver, deviceOwnerWithoutSecurityLogs(context));
+
+    expect.that(store.batches()).isEmpty();
+  }
+
+  @Test
+  public void bootCompleted_whileOlderStagedLogsHaveNoKey_keepsTheLogsCollectedBeforeTheUnlock()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+    assertThat(new CrumblesLogStaging(context).stage(/* isNetworkBatch= */ false, new byte[1]))
+        .isTrue();
+    CrumblesExternalPublicKeyManager.getInstance(context).saveActiveExternalPublicKey(null);
+    CrumblesMain.getLogsEncryptorInstance().setExternalEncryptionPublicKey(null);
+
+    deliverBootCompleted(receiver, deviceOwnerWithoutSecurityLogs(context));
+
+    expect.that(store.batches()).hasSize(1);
+  }
+
+  @Test
+  public void bootCompleted_withNoActiveKeyAndNoStagedLogs_savesTheLogsCollectedBeforeTheUnlock()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+    CrumblesExternalPublicKeyManager.getInstance(context).saveActiveExternalPublicKey(null);
+    CrumblesMain.getLogsEncryptorInstance().setExternalEncryptionPublicKey(null);
+
+    deliverBootCompleted(receiver, deviceOwnerWithoutSecurityLogs(context));
+
+    expect.that(store.batches()).isEmpty();
+  }
+
+  @Test
+  public void bootCompleted_whenABatchCollectedBeforeTheUnlockCannotBeRead_keepsTheNewerOnes()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+    // A directory in place of the older batch makes reading it fail.
+    File olderBatch = store.batches().get(0);
+    assertThat(olderBatch.delete() && olderBatch.mkdir()).isTrue();
+
+    deliverBootCompleted(receiver, deviceOwnerWithoutSecurityLogs(context));
+
+    expect.that(store.batches()).hasSize(2);
+  }
+
+  @Test
+  public void directBootStoreLossReports_areTakenOnceWithTheAlertThatOneOfThemAskedFor() {
+    CrumblesDirectBootStore store =
+        new CrumblesDirectBootStore(ApplicationProvider.getApplicationContext());
+    store.deferLossReport("first", /* alertUser= */ false);
+    boolean alertAfterTheFirst = store.isAlertDeferred();
+    store.deferLossReport("second", /* alertUser= */ true);
+
+    ImmutableList<String> reports = store.takeLossReports();
+
+    expect.that(alertAfterTheFirst).isFalse();
+    expect.that(reports).containsExactly("first", "second").inOrder();
+    expect.that(store.takeLossReports()).isEmpty();
+    expect.that(store.isAlertDeferred()).isFalse();
+  }
+
+  @Test
+  public void lockedBootCompleted_withSecurityLoggingOff_reportsNoLoss() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+
+    verify(mockDpm, never()).retrievePreRebootSecurityLogs(any());
+    expect.that(store.takeLossReports()).isEmpty();
+  }
+
+  @Test
+  public void wipingAllBatches_deletesTheLogsCollectedBeforeTheUnlock() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+
+    int deleted = CrumblesUploadAndWipeWorker.wipeAllBatches(context);
+
+    File deviceFiles = context.createDeviceProtectedStorageContext().getFilesDir();
+    expect.that(deleted).isEqualTo(2);
+    expect.that(new File(deviceFiles, "logs_before_unlock").list()).isEmpty();
+  }
+
+  @Test
+  public void uploadingPendingBatches_firstSavesTheLogsCollectedBeforeTheUnlock() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+
+    @SuppressWarnings("unused")
+    var unusedUploaded = CrumblesSendAndMarkProcessingWorker.uploadPendingBatches(context);
+
+    expect.that(store.batches()).isEmpty();
+  }
+
+  @Test
+  public void bootCompleted_afterTheSigningKeyChanged_savesTheLogsBeforeTheUnlockUnsigned()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+    FakeAndroidKeyStoreSpi.keystoreEntries.remove(CrumblesBatchSigningKey.ALIAS);
+
+    deliverBootCompleted(receiver, deviceOwnerWithoutSecurityLogs(context));
+
+    expect.that(store.batches()).isEmpty();
+    expect
+        .that(writtenBatches(context).stream().filter(batch -> !batch.hasSignature()).count())
+        .isEqualTo(1);
+    expect
+        .that(
+            newestAuditMessage(
+                context, CrumblesDeviceAdminReceiver.AUDIT_EVENT_BATCH_SIGNING_FAILED))
+        .isEqualTo(
+            "Security log batch collected before the first unlock written without a signature: it"
+                + " sealed no attestation chain or another one than the batch-signing key's.");
+  }
+
+  @Test
+  public void retrievingSecurityLogsAfterTheUnlock_reportsAGapAfterTheEventsBeforeIt()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    @SuppressWarnings("unused")
+    var unusedStore = directBootStoreWithRecipient(context);
+    recordLockedBoot(context, /* bootCount= */ 2);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEventWithId(2L, SecurityLog.TAG_ADB_SHELL_CMD, "a")))
+        .thenReturn(ImmutableList.of(securityEventWithId(5L, SecurityLog.TAG_ADB_SHELL_CMD, "b")))
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    deliverSecurityLogs(receiver, deviceOwnerContext);
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
+
+    expect
+        .that(auditMessages(context, AUDIT_EVENT_LOGS_LOST))
+        .contains(
+            "Security log event ID gap detected (3..4 missing): platform logs were lost before"
+                + " retrieval.");
+  }
+
+  @Test
+  public void securityLogsAvailable_beforeTheUnlockWithoutRoom_keepsANoticeForTheUnlock()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    File batchesDirectory =
+        new File(context.createDeviceProtectedStorageContext().getFilesDir(), "logs_before_unlock");
+    @SuppressWarnings("unused")
+    var unusedCreated = batchesDirectory.mkdirs();
+    try (RandomAccessFile full =
+        new RandomAccessFile(new File(batchesDirectory, "0000000000000000000.bin"), "rw")) {
+      full.setLength(16L * 1024 * 1024);
+    }
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    recordLockedBoot(context, /* bootCount= */ 2);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    deliverSecurityLogs(receiver, createContextWrapper(context, mockDpm));
+
+    verify(mockDpm, never()).retrieveSecurityLogs(any());
+    expect
+        .that(store.takeLossReports())
+        .containsExactly(
+            "Security logs announced before the first unlock were left with the platform: the"
+                + " batches kept before the unlock had reached their cap, or usable space was low."
+                + " They were lost if the device restarted again before the unlock.");
+  }
+
+  @Test
+  public void securityLogsAvailable_beforeTheUnlockAfterARestart_reportsEventIdsMissingSinceZero()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    recordLockedBoot(context, /* bootCount= */ 2);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEventWithId(3L, SecurityLog.TAG_ADB_SHELL_CMD, "")));
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    deliverSecurityLogs(receiver, createContextWrapper(context, mockDpm));
+
+    expect
+        .that(store.takeLossReports())
+        .contains(
+            "Security log event ID gap detected (0..2 missing): platform logs were lost before"
+                + " retrieval.");
+  }
+
+  @Test
+  public void securityLogsAvailable_afterTwoLockedRestarts_reportsEventIdsMissingSinceZero()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    @SuppressWarnings("unused")
+    var unusedStore = directBootStoreWithRecipient(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        // Nothing to retrieve in boot 1, nor at the locked boots 2 and 3, as when each restart came
+        // before the platform announced logs, or when there was no room for them.
+        .thenReturn(null)
+        .thenReturn(null)
+        .thenReturn(null)
+        // Boot 3, still locked: the platform dropped events 0 to 5119 meanwhile.
+        .thenReturn(
+            ImmutableList.of(
+                securityEventWithId(5120L, SecurityLog.TAG_ADB_SHELL_CMD, "first kept"),
+                securityEventWithId(5200L, SecurityLog.TAG_ADB_SHELL_CMD, "last before unlock")))
+        // Boot 3, once unlocked.
+        .thenReturn(
+            ImmutableList.of(
+                securityEventWithId(5201L, SecurityLog.TAG_ADB_SHELL_CMD, "after unlock")))
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    // Security logging is on in boot 1, which the user unlocks.
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 3);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    deliverSecurityLogs(receiver, deviceOwnerContext);
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(eventIdLossReports(context))
+        .containsExactly(
+            "Security log event ID gap detected (0..5119 missing): platform logs were lost before"
+                + " retrieval.");
+  }
+
+  @Test
+  public void securityLogsAvailable_beforeTheUnlockWhenEventIdsGoBack_reportsAReset()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(
+            ImmutableList.of(
+                securityEventWithId(0L, SecurityLog.TAG_ADB_SHELL_CMD, "first"),
+                securityEventWithId(99L, SecurityLog.TAG_ADB_SHELL_CMD, "last")))
+        .thenReturn(
+            ImmutableList.of(
+                securityEventWithId(40L, SecurityLog.TAG_ADB_SHELL_CMD, "again"),
+                securityEventWithId(60L, SecurityLog.TAG_ADB_SHELL_CMD, "later")))
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+
+    deliverSecurityLogs(receiver, deviceOwnerContext);
+
+    expect
+        .that(store.takeLossReports())
+        .contains(
+            "Security log event IDs reset (40 after 99): platform logs were lost before"
+                + " retrieval.");
+  }
+
+  @Test
+  public void retrieveAndSaveSecurityLogs_beforeTheUnlockWhenPlatformReturnsNull_savesNothing()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "")));
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenReturn(null);
+    recordLockedBoot(context, /* bootCount= */ 2);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        createContextWrapper(context, mockDpm));
+
+    expect.that(store.batches()).hasSize(1);
+  }
+
+  @Test
+  public void securityLogsAvailable_beforeTheLockedBoot_leavesThemForTheLockedBoot()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        // Boot 1, unlocked: nothing to retrieve.
+        .thenReturn(null)
+        // Boot 2, before the unlock: the events announced before the locked boot, then later ones.
+        .thenReturn(
+            ImmutableList.of(
+                securityEventWithId(0L, SecurityLog.TAG_ADB_SHELL_CMD, "first"),
+                securityEventWithId(37L, SecurityLog.TAG_ADB_SHELL_CMD, "announced early")))
+        .thenReturn(
+            ImmutableList.of(securityEventWithId(38L, SecurityLog.TAG_ADB_SHELL_CMD, "later")))
+        // Boot 2, once unlocked.
+        .thenReturn(
+            ImmutableList.of(
+                securityEventWithId(39L, SecurityLog.TAG_ADB_SHELL_CMD, "after unlock")))
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    deliverSecurityLogs(receiver, deviceOwnerContext);
+    int batchesBeforeTheLockedBoot = store.batches().size();
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    deliverSecurityLogs(receiver, deviceOwnerContext);
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect.that(batchesBeforeTheLockedBoot).isEqualTo(0);
+    expect.that(eventIdLossReports(context)).isEmpty();
+  }
+
+  @Test
+  public void lockedBootCompleted_whenTheDeviceKeepsNoPreRebootLogs_reportsTheRestartWindow()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrievePreRebootSecurityLogs(any(ComponentName.class))).thenReturn(null);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+    deliver(
+        receiver,
+        createContextWrapper(context, mockDpm),
+        new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+
+    ImmutableList<String> reports = store.takeLossReports();
+    assertThat(reports).hasSize(1);
+    expect
+        .that(reports.get(0))
+        .startsWith(
+            "The platform kept no security logs from before the restart: this device keeps none"
+                + " across restarts.");
+  }
+
+  @Test
+  public void lockedBootCompleted_afterARetrievalBeforeTheUnlock_reportsTheRestartWindowSinceIt()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = new CrumblesDirectBootStore(context);
+    // Remembered without a retrieval after an unlock, so that the one before the unlock is the
+    // last.
+    store.rememberRecipient(
+        CrumblesDirectBootStore.forgottenRecipients(),
+        KeyPairGenerator.getInstance("RSA").generateKeyPair().getPublic(),
+        "device ID",
+        ImmutableList.of());
+    DevicePolicyManager mockDpm = deviceOwnerWithSecurityLoggingOn(context);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(ImmutableList.of(securityEventWithId(0L, SecurityLog.TAG_ADB_SHELL_CMD, "")))
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 3);
+
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+
+    ImmutableList<String> reports = store.takeLossReports();
+    assertThat(reports).hasSize(1);
+    expect
+        .that(reports.get(0))
+        .startsWith(
+            "The platform kept no security logs from before the restart, as after a cold boot.");
+  }
+
+  @Test
+  public void lockedBootCompleted_withSecurityLoggingOn_countsTheBootForSkippedBootReports()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager loggingOffDpm = mock(DevicePolicyManager.class);
+    when(loggingOffDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context loggingOffContext = createContextWrapper(context, loggingOffDpm);
+    Context loggingOnContext =
+        createContextWrapper(context, deviceOwnerWithSecurityLoggingOn(context));
+    UserManager userManager = context.getSystemService(UserManager.class);
+    // Boot 1 handles its pre-reboot logs while security logging is off.
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    deliverBootCompleted(receiver, loggingOffContext);
+    // Logging is on in locked boot 2, which has no recipient to save logs for.
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    deliver(receiver, loggingOnContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+    // Boots 3 and 4 went by unseen, and logging is off at the unlock of boot 5.
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+
+    deliverBootCompleted(receiver, loggingOffContext);
+
+    expect
+        .that(auditMessages(context, AUDIT_EVENT_LOGS_LOST))
+        .contains(
+            "Security logs kept from before 3 restart(s) may have been lost: the device restarted"
+                + " again before Crumbles retrieved them.");
+  }
+
+  @Test
+  public void savingTheLogsCollectedBeforeTheUnlock_withoutALogsDirectory_createsIt()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    CrumblesDirectBootStore store = directBootStoreWithRecipient(context);
+    assertThat(store.saveBatch(new byte[0])).isTrue();
+    File logsDirectory =
+        new File(
+            context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    for (File file : logsDirectory.listFiles()) {
+      assertThat(file.delete()).isTrue();
+    }
+    assertThat(logsDirectory.delete()).isTrue();
+
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+        deviceOwnerWithoutSecurityLogs(context));
+
+    expect.that(store.batches()).isEmpty();
+  }
+
+  @Test
+  public void networkLogsAvailable_beforeTheUnlock_isReportedAfterTheUnlock() throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    saveNewExternalPublicKey(context);
+    Context deviceOwnerContext =
+        createContextWrapper(context, deviceOwnerWithSecurityLoggingOn(context));
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    deliverNetworkLogs(receiver, deviceOwnerContext, /* token= */ 42);
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(auditMessages(context, AUDIT_EVENT_LOGS_LOST))
+        .contains(
+            "Network log batch (token 42, 5 events) was announced before the first unlock and"
+                + " could not be retrieved while locked.");
+  }
+
+  @Test
+  public void lockedBootCompleted_forDeviceKeyWithoutBatchKeys_marksEmptyBatchWrapKeyId()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    Shadows.shadowOf(context.getSystemService(KeyguardManager.class)).setIsDeviceSecure(true);
+    CrumblesLogsEncryptor encryptor = new CrumblesLogsEncryptor(context);
+    CrumblesMain.setLogsEncryptorInstanceForTest(encryptor);
+    try {
+      PublicKey devicePublicKey = encryptor.generateKeyPair().getPublic();
+      CrumblesBatchKeyStore.deleteKeys();
+      CrumblesDeviceAdminReceiver.recordActivatedInternalKey(context, devicePublicKey);
+      Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+      CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+          deviceOwnerWithoutSecurityLogs(context));
+      DevicePolicyManager devicePolicyManager = deviceOwnerWithSecurityLoggingOn(context);
+      when(devicePolicyManager.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+          .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "restart")));
+      Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+      Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+      deliver(
+          receiver,
+          createContextWrapper(context, devicePolicyManager),
+          new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+
+      ImmutableList<File> waitingFiles = new CrumblesDirectBootStore(context).batches();
+      assertThat(waitingFiles).hasSize(1);
+      LogBatch waitingBatch = encryptor.deserializeFile(waitingFiles.get(0).toPath());
+      expect.that(waitingBatch.getKey().hasBatchWrapKeyId()).isTrue();
+      expect.that(waitingBatch.getKey().getBatchWrapKeyId()).isEmpty();
+      expect.that(waitingBatch.getKey().hasBatchWrappedSymmetricKey()).isFalse();
+    } finally {
+      CrumblesBatchKeyStore.deleteKeys();
+      encryptor.deleteExistingKeyPair();
+      CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    }
+  }
+
+  @Test
+  public void lockedBootCompleted_whenKeystoreCertificateLookupFails_stillSavesPreUnlockBatch()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    Shadows.shadowOf(context.getSystemService(KeyguardManager.class)).setIsDeviceSecure(true);
+    CrumblesLogsEncryptor encryptor = new CrumblesLogsEncryptor(context);
+    CrumblesMain.setLogsEncryptorInstanceForTest(encryptor);
+    try {
+      PublicKey devicePublicKey = encryptor.generateKeyPair().getPublic();
+      CrumblesBatchKeyStore.deleteKeys();
+      CrumblesDeviceAdminReceiver.recordActivatedInternalKey(context, devicePublicKey);
+      Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+      CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(
+          deviceOwnerWithoutSecurityLogs(context));
+      DevicePolicyManager devicePolicyManager = deviceOwnerWithSecurityLoggingOn(context);
+      when(devicePolicyManager.retrievePreRebootSecurityLogs(any(ComponentName.class)))
+          .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN, "restart")));
+      Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+      Shadows.shadowOf(context.getSystemService(UserManager.class)).setUserUnlocked(false);
+
+      FakeAndroidKeyStoreSpi.certificateLookupFailure =
+          new ProviderException("Keystore certificate lookup failed");
+      try {
+        deliver(
+            receiver,
+            createContextWrapper(context, devicePolicyManager),
+            new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+      } finally {
+        FakeAndroidKeyStoreSpi.certificateLookupFailure = null;
+      }
+
+      CrumblesDirectBootStore directBootStore = new CrumblesDirectBootStore(context);
+      ImmutableList<File> waitingFiles = directBootStore.batches();
+      assertThat(waitingFiles).hasSize(1);
+      LogBatch waitingBatch = encryptor.deserializeFile(waitingFiles.get(0).toPath());
+      expect.that(waitingBatch.getKey().hasBatchWrapKeyId()).isFalse();
+      expect.that(directBootStore.takeLossReports()).isEmpty();
+    } finally {
+      CrumblesBatchKeyStore.deleteKeys();
+      encryptor.deleteExistingKeyPair();
+      CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    }
+  }
+
+  @Test
+  public void timeChanged_beforeTheFirstUnlock_whenWorkManagerIsUninitialized_keepsFlagForNextBoot()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager devicePolicyManager = mock(DevicePolicyManager.class);
+    when(devicePolicyManager.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, devicePolicyManager);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID oldWatchdogId = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+    Class<?> workManagerImplClass = Class.forName("androidx.work.impl.WorkManagerImpl");
+    Object previousDelegated =
+        ReflectionHelpers.getStaticField(workManagerImplClass, "sDelegatedInstance");
+    Object previousDefault =
+        ReflectionHelpers.getStaticField(workManagerImplClass, "sDefaultInstance");
+    ReflectionHelpers.setStaticField(workManagerImplClass, "sDelegatedInstance", null);
+    ReflectionHelpers.setStaticField(workManagerImplClass, "sDefaultInstance", null);
+    try {
+      deliverBootCompleted(receiver, deviceOwnerContext);
+    } finally {
+      ReflectionHelpers.setStaticField(
+          workManagerImplClass, "sDelegatedInstance", previousDelegated);
+      ReflectionHelpers.setStaticField(workManagerImplClass, "sDefaultInstance", previousDefault);
+    }
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 3);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isNotEqualTo(oldWatchdogId);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
+  @Test
+  public void timeChanged_beforeAnExtraLockedRestart_stillReschedulesAtFirstUnlock()
+      throws Exception {
+    Context context = ApplicationProvider.getApplicationContext();
+    DevicePolicyManager devicePolicyManager = mock(DevicePolicyManager.class);
+    when(devicePolicyManager.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    Context deviceOwnerContext = createContextWrapper(context, devicePolicyManager);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
+    deliverBootCompleted(receiver, deviceOwnerContext);
+    UUID oldWatchdogId = scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG);
+    UserManager userManager = context.getSystemService(UserManager.class);
+    Shadows.shadowOf(userManager).setUserUnlocked(false);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 2);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_TIME_CHANGED));
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 3);
+    deliver(receiver, deviceOwnerContext, new Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED));
+    Shadows.shadowOf(userManager).setUserUnlocked(true);
+
+    deliverBootCompleted(receiver, deviceOwnerContext);
+
+    expect
+        .that(scheduledWorkId(context, CrumblesConstants.LOGGING_WATCHDOG_WORK_TAG))
+        .isNotEqualTo(oldWatchdogId);
+    expect.that(getSendNowWorkInfos(context)).hasSize(1);
+  }
+
   /** Delivers the boot completed broadcast to {@code receiver} and waits until it is handled. */
   private static void deliverBootCompleted(BroadcastReceiver receiver, Context context) {
     deliver(receiver, context, new Intent(Intent.ACTION_BOOT_COMPLETED));
+  }
+
+  /** Returns a mock DevicePolicyManager of a device owner whose security logging is on. */
+  private static DevicePolicyManager deviceOwnerWithSecurityLoggingOn(Context context) {
+    DevicePolicyManager mockDpm = mock(DevicePolicyManager.class);
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    when(mockDpm.isSecurityLoggingEnabled(any(ComponentName.class))).thenReturn(true);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class))).thenReturn(null);
+    return mockDpm;
+  }
+
+  /**
+   * Records the restart into boot {@code bootCount} before the first unlock, as its locked boot
+   * broadcast does before the platform announces security logs.
+   */
+  private static void recordLockedBoot(Context context, int bootCount) {
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, bootCount);
+    @SuppressWarnings("unused")
+    var unusedRecorded =
+        new CrumblesBootRecord(context).recordRestart(bootCount, /* beforeUnlock= */ true);
+  }
+
+  /** Returns the recorded losses found in the security event IDs, newest first. */
+  private static ImmutableList<String> eventIdLossReports(Context context) {
+    return auditMessages(context, AUDIT_EVENT_LOGS_LOST).stream()
+        .filter(message -> message.startsWith("Security log event ID"))
+        .collect(toImmutableList());
+  }
+
+  /**
+   * Retrieves an empty set of security logs and network batch 7 in boot 5, with {@code mockDpm} as
+   * the DevicePolicyManager, and returns the context that has it.
+   */
+  private static Context retrieveInBoot5(Context context, DevicePolicyManager mockDpm)
+      throws Exception {
+    saveNewExternalPublicKey(context);
+    when(mockDpm.retrieveSecurityLogs(any(ComponentName.class)))
+        .thenReturn(new ArrayList<>())
+        .thenReturn(null);
+    Context deviceOwnerContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 5);
+    CrumblesDeviceAdminReceiver.retrieveAndSaveSecurityLogs(deviceOwnerContext);
+    CrumblesDeviceAdminReceiver.recordNetworkBatchToken(context, /* batchToken= */ 7);
+    new CrumblesBootRecord(context).recordNetworkBatchToken(/* token= */ 7);
+    return deviceOwnerContext;
   }
 
   private static Notification findPausedNotification(Context context) {

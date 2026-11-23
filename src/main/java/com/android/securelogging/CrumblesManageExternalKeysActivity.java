@@ -30,16 +30,12 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
-import android.support.annotation.NonNull;
-import android.support.annotation.Nullable;
-import android.support.annotation.VisibleForTesting;
-import android.support.v7.app.AlertDialog;
-import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.view.MenuItem;
 import android.view.View;
@@ -49,7 +45,12 @@ import android.widget.TextView;
 import android.widget.Toast;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.StringRes;
+import androidx.annotation.VisibleForTesting;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
@@ -58,7 +59,12 @@ import com.android.securelogging.CrumblesLogsEncryptor.DecryptedLogBatch;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.protobuf.ByteString;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.KeyEncryptionType;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogKey;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -67,21 +73,25 @@ import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.NoSuchAlgorithmException;
 import java.security.PublicKey;
+import java.security.interfaces.RSAPublicKey;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /** Activity for managing external keys. */
@@ -93,7 +103,10 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
   private static final String AUDIT_EVENT_KEY_CHANGE_REQUESTED = "KEY_CHANGE_REQUESTED";
   private static final String AUDIT_EVENT_KEY_CHANGE_REFUSED = "KEY_CHANGE_REFUSED";
   private static final String AUDIT_EVENT_KEY_CHANGE_AUTH_FAILED = "KEY_CHANGE_AUTH_FAILED";
+  private static final String AUDIT_EVENT_KEY_CHANGE_ABANDONED = "KEY_CHANGE_ABANDONED";
   private static final String AUDIT_EVENT_LOGS_LOST = "LOGS_LOST";
+  static final String AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE =
+      "LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE";
   static final String AUDIT_EVENT_RE_ENCRYPT_FAILED = "RE_ENCRYPT_FAILED";
 
   private record PendingUpload(ImmutableList<File> logFiles, Runnable keyChange) {}
@@ -118,12 +131,22 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
 
   @SuppressLint("UsableSpace")
   private LongSupplier usableSpaceSupplier = () -> getFilesDir().getUsableSpace();
+
   private CrumblesExternalPublicKeyManager publicKeyManager;
   private boolean isStopped;
   private int activeBackgroundTasks;
   private boolean pendingChangeDeletesInternalKey;
   private boolean reEncryptChosen;
   private ImmutableList<File> pendingLogsSnapshot = ImmutableList.of();
+
+  /**
+   * The pending files, as last read for a key change, that are of no use to the holder of an
+   * external key: batches encrypted to a built-in key, which never leaves this device, and files
+   * that hold no batch. The key change tries the built-in key on no other batch, as one that may be
+   * encrypted to an external key would only bring a prompt that cannot decrypt it.
+   */
+  private ImmutableSet<File> builtInKeyOrUnreadableFiles = ImmutableSet.of();
+
   @Nullable private PublicKey pendingCandidatePublicKey;
   private TextView tvCurrentExternalKeyStatus;
   @Nullable private PendingUpload pendingUpload;
@@ -136,6 +159,8 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
 
   @Nullable private List<PendingLogData> logsBeingDecrypted;
   @Nullable private AlertDialog reEncryptConfirmationDialog;
+  @Nullable private AlertDialog decryptionErrorDialog;
+  @Nullable private AlertDialog logsNotCopiedDialog;
   @Nullable private AlertDialog exportChoiceDialog;
   @Nullable private byte[] pendingExportChoiceKeyBytes;
 
@@ -263,6 +288,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
+    CrumblesLauncherEntry.applyToTask(this);
     // The system can restore this activity in a process where CrumblesMain.onCreate never ran.
     // Caching the context lets key changes record their events in the activity log.
     CrumblesLogsEncryptor.setApplicationContext(this);
@@ -334,11 +360,38 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
       pendingCandidatePublicKey = null;
       exportChoiceDialog.dismiss();
     }
-    if (reEncryptConfirmationDialog != null) {
-      reEncryptConfirmationDialog.dismiss();
-    }
+    abandonKeyChangeChoice();
     if (activeBackgroundTasks == 0) {
       dropHeldLogs();
+    }
+  }
+
+  /**
+   * Closes the dialogs that continue a key change after the device credential was confirmed, so
+   * that whoever unlocks the phone next cannot discard the pending logs or change the key, and
+   * records that the change was abandoned.
+   */
+  private void abandonKeyChangeChoice() {
+    if (isShowing(reEncryptConfirmationDialog)
+        || isShowing(decryptionErrorDialog)
+        || isShowing(logsNotCopiedDialog)) {
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              AUDIT_EVENT_KEY_CHANGE_ABANDONED,
+              "Key unchanged because the screen was left before the change was confirmed.");
+    }
+    dismiss(reEncryptConfirmationDialog);
+    dismiss(decryptionErrorDialog);
+    dismiss(logsNotCopiedDialog);
+  }
+
+  private static boolean isShowing(@Nullable AlertDialog dialog) {
+    return dialog != null && dialog.isShowing();
+  }
+
+  private static void dismiss(@Nullable AlertDialog dialog) {
+    if (dialog != null) {
+      dialog.dismiss();
     }
   }
 
@@ -407,18 +460,21 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
     }
   }
 
-  /** Container holding a pending log file, the batch it held, its decrypted bytes and device ID. */
+  /**
+   * Container holding a pending log file, the batch it held, its decrypted bytes and the decrypted
+   * metadata, with the device ID and the time that the batch recorded.
+   */
   private static class PendingLogData {
     final File file;
     final LogBatch batch;
     final byte[] plainBytes;
-    final String deviceId;
+    final LogMetadata metadata;
 
-    PendingLogData(File file, LogBatch batch, byte[] plainBytes, String deviceId) {
+    PendingLogData(File file, LogBatch batch, byte[] plainBytes, LogMetadata metadata) {
       this.file = file;
       this.batch = batch;
       this.plainBytes = plainBytes;
-      this.deviceId = deviceId;
+      this.metadata = metadata;
     }
 
     /** Names the batch in the activity log: by its sequence number if signed, else by its file. */
@@ -436,11 +492,10 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
       return ImmutableList.of();
     }
     File[] files =
-        directory.listFiles(
-            (dir, name) ->
-                name.endsWith(".bin")
-                    && !name.endsWith(CrumblesConstants.SENT_SUFFIX)
-                    && !name.endsWith(CrumblesConstants.PROCESSING_SUFFIX));
+        directory.listFiles((dir, name) ->
+            name.endsWith(".bin")
+                && !name.endsWith(CrumblesConstants.SENT_SUFFIX)
+                && !name.endsWith(CrumblesConstants.PROCESSING_SUFFIX));
     if (files == null) {
       return ImmutableList.of();
     }
@@ -477,6 +532,59 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
     return false;
   }
 
+  /** Returns whether pending batches may be encrypted to an external key, as one is or was set. */
+  private boolean mayHaveExternalKeyBatches() {
+    return publicKeyManager.isExternalKeySelected()
+        || !CrumblesSendAndMarkProcessingWorker.readUserPreferences(this)
+            .getExternalPublicKeysMap()
+            .isEmpty();
+  }
+
+  /**
+   * Returns which pending batches are encrypted to a built-in key: every batch that carries a
+   * batch-wrap key id, which this version gives each batch for a built-in key and none for an
+   * external key. A batch that an earlier version wrote without one is also for a built-in key if
+   * no external key is or was set, if its key is wrapped with PKCS#1 v1.5 padding, which only a
+   * built-in key uses, or if its wrapped key does not have the size of any saved external key's
+   * modulus.
+   */
+  private Predicate<LogBatch> builtInKeyBatches() {
+    if (!mayHaveExternalKeyBatches()) {
+      return logBatch -> true;
+    }
+    Optional<ImmutableSet<Integer>> externalKeySizes = savedExternalKeySizes();
+    return logBatch -> {
+      LogKey key = logBatch.getKey();
+      return key.hasBatchWrapKeyId()
+          || key.getKeyEncryptionType().equals(KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC)
+          || externalKeySizes
+              .map(sizes -> !sizes.contains(key.getEncryptedSymmetricKey().size()))
+              .orElse(false);
+    };
+  }
+
+  /**
+   * Returns the sizes in bytes of the moduli of the saved external keys, which are also those of
+   * the keys that they wrap, or empty if there are none or they cannot all be read.
+   */
+  private Optional<ImmutableSet<Integer>> savedExternalKeySizes() {
+    ImmutableList<PublicKey> externalKeys;
+    try {
+      externalKeys = publicKeyManager.getSavedExternalPublicKeys();
+    } catch (CrumblesKeysException e) {
+      Log.w(TAG, "Failed to read the saved external keys.", e);
+      return Optional.empty();
+    }
+    ImmutableSet.Builder<Integer> sizes = ImmutableSet.builder();
+    for (PublicKey externalKey : externalKeys) {
+      if (!(externalKey instanceof RSAPublicKey rsaKey)) {
+        return Optional.empty();
+      }
+      sizes.add((rsaKey.getModulus().bitLength() + Byte.SIZE - 1) / Byte.SIZE);
+    }
+    return externalKeys.isEmpty() ? Optional.empty() : Optional.of(sizes.build());
+  }
+
   /** Container holding decryption results for pending log files. */
   private static class DecryptionResult {
     final ImmutableList<PendingLogData> decryptedLogs;
@@ -501,30 +609,55 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
     IdentityHashMap<LogBatch, File> files = new IdentityHashMap<>();
     List<File> failedFiles = new ArrayList<>();
     List<String> failureReasons = new ArrayList<>();
+    Set<File> builtInKeyOrUnreadable = new HashSet<>();
     CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
     runInBackground(
         R.string.dialog_message_preparing_key_change,
         () -> {
+          // Batches collected before the unlock that still wait change key with the others.
+          CrumblesDeviceAdminReceiver.saveLogsCollectedBeforeUnlock(this);
           synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
             pendingLogsSnapshot = snapshotPendingAndInFlightFiles();
             String proc = CrumblesConstants.PROCESSING_SUFFIX;
+            Predicate<LogBatch> isForBuiltInKey = builtInKeyBatches();
             for (File file : pendingLogsSnapshot) {
               try {
                 File src = file.exists() ? file : siblingWithSuffix(file, proc);
                 LogBatch logBatch = encryptor.deserializeFile(src.toPath());
                 logBatches.add(logBatch);
                 files.put(logBatch, file);
+                if (isForBuiltInKey.test(logBatch)) {
+                  builtInKeyOrUnreadable.add(file);
+                }
               } catch (RuntimeException e) {
                 Log.e(TAG, "Failed to read pending log file: " + file.getName(), e);
+                builtInKeyOrUnreadable.add(file);
                 failedFiles.add(file);
                 failureReasons.add(file.getName() + ": " + getSpecificFailureReason(e));
               }
             }
+            // Batches collected before the unlock that still wait, as for a full quota, cannot
+            // change key here, but the user can discard them with the others.
+            for (File waiting : new CrumblesDirectBootStore(this).batches()) {
+              try {
+                if (isForBuiltInKey.test(encryptor.deserializeFile(waiting.toPath()))) {
+                  builtInKeyOrUnreadable.add(waiting);
+                }
+              } catch (RuntimeException e) {
+                // Match pending-file handling above: corrupt or unreadable waiting batches cannot
+                // be decrypted by an external key holder either.
+                Log.w(TAG, "Failed to read waiting Direct Boot log file: " + waiting.getName(), e);
+                builtInKeyOrUnreadable.add(waiting);
+              }
+              failedFiles.add(waiting);
+              failureReasons.add(waiting.getName() + ": collected before the first unlock");
+            }
           }
           return () -> {
+            builtInKeyOrUnreadableFiles = ImmutableSet.copyOf(builtInKeyOrUnreadable);
             if (!canUpdateUi() || getSupportFragmentManager().isStateSaved()) {
               dropHeldLogs();
-            } else if (pendingLogsSnapshot.isEmpty()) {
+            } else if (pendingLogsSnapshot.isEmpty() && failedFiles.isEmpty()) {
               onEmpty.run();
             } else {
               authorizePendingLogs(logBatches, files, failedFiles, failureReasons, onDecrypted);
@@ -541,7 +674,14 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
       Consumer<DecryptionResult> onDecrypted) {
     logsBeingDecrypted = new ArrayList<>();
     CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
-    new CrumblesAuthorizedLogDecryptor(this, encryptor)
+    // The key change has just asked for the device credential. A batch that may be encrypted to an
+    // external key fails without a prompt of its own, as the built-in key would most likely not
+    // decrypt it.
+    CrumblesAuthorizedLogDecryptor.forKeyChange(
+            this,
+            encryptor,
+            /* mayBeForAnExternalKey= */ logBatch ->
+                !builtInKeyOrUnreadableFiles.contains(files.get(logBatch)))
         .decrypt(
             logBatches,
             new CrumblesAuthorizedLogDecryptor.Callback() {
@@ -553,7 +693,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
                           files.get(logBatch),
                           logBatch,
                           decryptedBatch.logs(),
-                          decryptedBatch.metadata().getDevice().getDeviceId()));
+                          decryptedBatch.metadata()));
                 } else {
                   Arrays.fill(decryptedBatch.logs(), (byte) 0);
                 }
@@ -589,8 +729,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
                     wipePlaintext(res);
                     return;
                   }
-                  onDecrypted.accept(
-                      new DecryptionResult(res, failedFiles, failureReasons));
+                  onDecrypted.accept(new DecryptionResult(res, failedFiles, failureReasons));
                 }
               }
             });
@@ -688,26 +827,30 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
 
   /**
    * Returns the logs of {@code item} encrypted to {@code recipient} (the Keystore key when null),
-   * or null without a key. A batch signed by this installation is signed again under its sequence
-   * number and this device's current ID, and seals the attestation chain of the batch-signing key,
-   * so that re-encrypting leaves the recipient no gap. Any other batch keeps the device ID written
-   * in it and stays unsigned, without an attestation chain and without creating a batch-signing
-   * key, as does a batch that cannot be signed again, which is reported in the activity log.
+   * or null without a key. The new batch keeps the time recorded in {@code item}. A batch signed by
+   * this installation is signed again under its sequence number and this device's current ID, and
+   * seals the attestation chain of the batch-signing key, so that re-encrypting leaves the
+   * recipient no gap. Any other batch keeps the device ID written in it and stays unsigned, without
+   * an attestation chain and without creating a batch-signing key, as does a batch that cannot be
+   * signed again, which is reported in the activity log.
    */
   @Nullable
   private LogBatch reEncrypt(PendingLogData item, @Nullable PublicKey recipient) {
     CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
     if (!item.batch.hasSignature()) {
-      return encryptor.encryptLogsAttributedTo(item.deviceId, item.plainBytes, recipient);
+      return encryptor.encryptLogsAttributedTo(item.metadata, item.plainBytes, recipient);
     }
     CrumblesBatchSigner batchSigner = new CrumblesBatchSigner(this);
     if (batchSigner.isSignedByThisInstallation(item.batch)) {
-      LogBatch localBatch = encryptor.encryptLogs(this, item.plainBytes, recipient);
+      ImmutableList<ByteString> attestationChain = batchSigner.attestationChainToSeal();
+      LogBatch localBatch =
+          encryptor.encryptLogsForSigningAgain(
+              this, item.metadata, item.plainBytes, recipient, attestationChain);
       if (localBatch == null) {
         return null;
       }
       try {
-        return batchSigner.signAgain(item.batch, localBatch);
+        return batchSigner.signAgain(item.batch, localBatch, attestationChain);
       } catch (CrumblesKeysException e) {
         Log.e(TAG, "Failed to sign a re-encrypted log batch again; writing it unsigned.", e);
       }
@@ -718,7 +861,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
             "Re-encrypted log batch "
                 + item.batch.getSequenceNumber()
                 + " written without a signature: signing it again failed.");
-    return encryptor.encryptLogsAttributedTo(item.deviceId, item.plainBytes, recipient);
+    return encryptor.encryptLogsAttributedTo(item.metadata, item.plainBytes, recipient);
   }
 
   /**
@@ -766,50 +909,148 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
             showReEncryptConfirmationDialog(
                 pendingLogFiles, result.decryptedLogs, performKeyChangeAction);
           } else {
-            // None of the choices that the dialog offers re-encrypts the logs.
-            wipePlaintext(result.decryptedLogs);
-            showDecryptionErrorDialog(result, pendingLogFiles, performKeyChangeAction);
+            decryptionErrorDialog =
+                showDecryptionErrorDialog(result, pendingLogFiles, performKeyChangeAction);
           }
         });
   }
 
-  private void showDecryptionErrorDialog(
+  private AlertDialog showDecryptionErrorDialog(
       DecryptionResult result, List<File> pendingLogFiles, Runnable performKeyChangeAction) {
     int failedCount = result.failedFiles.size();
-    int totalCount = pendingLogFiles.size();
+    int totalCount =
+        pendingLogFiles.size()
+            + (int) result.failedFiles.stream().filter(f -> !pendingLogFiles.contains(f)).count();
     StringBuilder detailsBuilder = new StringBuilder();
     for (String reason : result.failureReasons) {
       detailsBuilder.append("\n• ").append(reason);
     }
+    // Deleting the built-in key only leaves the files that it alone could decrypt unreadable for
+    // good. The others may be encrypted to an external key, whose holder can still read them.
+    ImmutableList<File> unreadableFiles =
+        result.failedFiles.stream()
+            .filter(builtInKeyOrUnreadableFiles::contains)
+            .collect(toImmutableList());
+    int keptCount = failedCount - unreadableFiles.size();
     String message =
-        String.format(
-            Locale.getDefault(),
-            "Failed to decrypt %d out of %d pending log file(s) with your current key pair:%s\n\n"
-                + "Changing your key pair now will prevent those logs from being decrypted in the"
-                + " future. Would you like to upload all remaining logs as-is, discard them, or"
-                + " cancel the key change?",
-            failedCount,
-            totalCount,
-            detailsBuilder);
+        pendingChangeDeletesInternalKey
+            ? String.format(
+                Locale.getDefault(),
+                "Failed to decrypt %d out of %d pending log file(s) with your current key"
+                    + " pair:%s\n\n%s",
+                failedCount,
+                totalCount,
+                detailsBuilder,
+                questionBeforeBuiltInKeyDeletion(unreadableFiles.size(), keptCount))
+            : getResources()
+                .getQuantityString(
+                    R.plurals.dialog_message_logs_not_decrypted,
+                    failedCount,
+                    failedCount,
+                    totalCount,
+                    detailsBuilder);
 
-    new AlertDialog.Builder(this)
-        .setTitle("Log Decryption Warning")
-        .setMessage(message)
-        .setPositiveButton(
-            "Upload As-Is",
-            (dialog, which) -> {
-              wipePlaintext(result.decryptedLogs);
-              uploadPendingLogsThenChangeKey(pendingLogFiles, performKeyChangeAction);
-            })
+    AlertDialog.Builder warning =
+        new AlertDialog.Builder(this).setTitle("Log Decryption Warning").setMessage(message);
+    if (pendingChangeDeletesInternalKey) {
+      // The change deletes the built-in key that the decrypted logs are encrypted to: hold them to
+      // re-encrypt them to the new key, and refuse the change if they are dropped before then.
+      logsToReEncryptAfterKeyChange = result.decryptedLogs;
+      warning.setPositiveButton(
+          unreadableFiles.isEmpty()
+              ? R.string.dialog_button_keep_queued_for_upload
+              : R.string.dialog_button_discard_unreadable_logs,
+          (dialog, which) -> {
+            reEncryptChosen = !result.decryptedLogs.isEmpty();
+            discardUnreadableThenChangeKey(
+                unreadableFiles, keptCount, totalCount, performKeyChangeAction);
+          });
+    } else {
+      // None of the choices that the dialog offers re-encrypts the logs.
+      wipePlaintext(result.decryptedLogs);
+      warning.setPositiveButton(
+          R.string.dialog_button_keep_queued_for_upload,
+          (dialog, which) -> {
+            // The files stay as they are, so the upload worker sends them to the destination.
+            CrumblesAppAuditLogger.getInstance(this)
+                .logEvent(
+                    AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+                    failedCount
+                        + " of "
+                        + totalCount
+                        + " pending log file(s) could not be decrypted on this device; all were"
+                        + " kept queued for upload before key rotation.");
+            performKeyChangeAction.run();
+          });
+    }
+    return warning
         .setNeutralButton(
             "Discard Logs",
             (dialog, which) -> {
-              wipePlaintext(result.decryptedLogs);
-              discardPendingLogs(pendingLogFiles, performKeyChangeAction);
+              dropHeldLogs();
+              // With the batches collected before the unlock that the warning lists.
+              discardPendingLogs(
+                  ImmutableSet.<File>builder()
+                      .addAll(pendingLogFiles)
+                      .addAll(result.failedFiles)
+                      .build()
+                      .asList(),
+                  performKeyChangeAction);
             })
-        .setNegativeButton("Cancel", (dialog, which) -> wipePlaintext(result.decryptedLogs))
-        .setOnCancelListener(dialog -> wipePlaintext(result.decryptedLogs))
+        .setNegativeButton("Cancel", (dialog, which) -> dropHeldLogs())
+        .setOnCancelListener(dialog -> dropHeldLogs())
         .show();
+  }
+
+  /**
+   * Returns the question that ends the decryption warning before a change that deletes the built-in
+   * key, when {@code unreadableCount} of the files that failed to decrypt are no use to anyone and
+   * the other {@code keptCount} stay queued.
+   */
+  private String questionBeforeBuiltInKeyDeletion(int unreadableCount, int keptCount) {
+    if (keptCount == 0) {
+      return getString(R.string.dialog_message_unreadable_logs_before_keystore_key_change);
+    }
+    if (unreadableCount == 0) {
+      return getString(R.string.dialog_message_logs_kept_before_keystore_key_change);
+    }
+    return getResources()
+        .getQuantityString(
+            R.plurals.dialog_message_some_logs_kept_before_keystore_key_change,
+            keptCount,
+            keptCount);
+  }
+
+  /**
+   * Discards {@code unreadableFiles}, if any, then changes the key, recording that the other {@code
+   * keptCount} of the {@code totalCount} pending files that failed to decrypt stay queued.
+   */
+  private void discardUnreadableThenChangeKey(
+      ImmutableList<File> unreadableFiles,
+      int keptCount,
+      int totalCount,
+      Runnable performKeyChangeAction) {
+    Runnable keepOthersQueuedThenChangeKey =
+        () -> {
+          if (keptCount > 0) {
+            CrumblesAppAuditLogger.getInstance(this)
+                .logEvent(
+                    AUDIT_EVENT_LOGS_KEPT_QUEUED_BEFORE_KEY_CHANGE,
+                    keptCount
+                        + " of "
+                        + totalCount
+                        + " pending log file(s) could not be decrypted on this device and may be"
+                        + " encrypted to an external key or, if an older version of the app wrote"
+                        + " them, to the replaced built-in key; they were kept queued for upload"
+                        + " before key rotation.");
+          }
+          performKeyChangeAction.run();
+        };
+    if (unreadableFiles.isEmpty()) {
+      keepOthersQueuedThenChangeKey.run();
+    } else {
+      discardPendingLogs(unreadableFiles, keepOthersQueuedThenChangeKey);
+    }
   }
 
   private void showReEncryptConfirmationDialog(
@@ -817,27 +1058,37 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
       ImmutableList<PendingLogData> decryptedLogs,
       Runnable performKeyChangeAction) {
     logsToReEncryptAfterKeyChange = decryptedLogs;
-    CharSequence[] options = new CharSequence[] {"Re-encrypt", "Upload As-Is", "Discard Logs"};
+    ImmutableList.Builder<CharSequence> options = ImmutableList.builder();
+    ImmutableList.Builder<Runnable> choices = ImmutableList.builder();
+    options.add("Re-encrypt");
+    choices.add(() -> {
+      // Re-encrypting now would target the outgoing key: the change may still wait for the
+      // user (custody of an exportable key) or fail. Each change re-encrypts these logs itself
+      // once the new key is active.
+      reEncryptChosen = true;
+      performKeyChangeAction.run();
+    });
+    // Every log here was decrypted with the built-in key, even while an external key is selected,
+    // so copies left encrypted to it could never be decrypted once the change deletes it.
+    if (!pendingChangeDeletesInternalKey) {
+      options.add("Upload As-Is");
+      choices.add(() -> {
+        dropHeldLogs();
+        uploadPendingLogsThenChangeKey(pendingLogFiles, performKeyChangeAction);
+      });
+    }
+    options.add("Discard Logs");
+    choices.add(() -> {
+      dropHeldLogs();
+      discardPendingLogs(pendingLogFiles, performKeyChangeAction);
+    });
+    ImmutableList<Runnable> actions = choices.build();
     reEncryptConfirmationDialog =
         new AlertDialog.Builder(this)
             .setTitle("Re-encrypt Existing Logs?")
             .setItems(
-                options,
-                (dialog, which) -> {
-                  if (which == 0) {
-                    // Re-encrypting now would target the outgoing key: the change may still wait
-                    // for the user (custody of an exportable key) or fail. Each change re-encrypts
-                    // these logs itself once the new key is active.
-                    reEncryptChosen = true;
-                    performKeyChangeAction.run();
-                  } else if (which == 1) {
-                    dropHeldLogs();
-                    uploadPendingLogsThenChangeKey(pendingLogFiles, performKeyChangeAction);
-                  } else if (which == 2) {
-                    dropHeldLogs();
-                    discardPendingLogs(pendingLogFiles, performKeyChangeAction);
-                  }
-                })
+                options.build().toArray(new CharSequence[0]),
+                (dialog, which) -> actions.get(which).run())
             .setNegativeButton("Cancel", (dialog, which) -> dropHeldLogs())
             .setOnCancelListener(dialog -> dropHeldLogs())
             .show();
@@ -882,7 +1133,10 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
     }
   }
 
-  /** Deletes the specified pending log files from the device, then runs {@code afterDiscard}. */
+  /**
+   * Deletes the specified pending log files from the device, then runs {@code afterDiscard}.
+   * Batches collected before the unlock that still wait are deleted only if they are specified.
+   */
   private void discardPendingLogs(List<File> pendingLogFiles, Runnable afterDiscard) {
     runInBackground(
         R.string.dialog_message_preparing_key_change,
@@ -892,6 +1146,8 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
             if (hasNewInternalKeyLogsSinceSnapshot()) {
               return abortBecausePendingLogsChanged();
             }
+            // Each with the attestation chain that it sealed.
+            deleteCount += new CrumblesDirectBootStore(this).deleteBatches(pendingLogFiles);
             for (File file : pendingLogFiles) {
               // Deletes both files, even when the first deletion succeeds.
               boolean deletedProcessingFile =
@@ -912,6 +1168,9 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
           return () -> {
             if (canUpdateUi() && !getSupportFragmentManager().isStateSaved()) {
               afterDiscard.run();
+            } else {
+              // No key change follows to re-encrypt the logs held for it.
+              dropHeldLogs();
             }
           };
         });
@@ -947,7 +1206,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
     }
     PendingUpload upload = pendingUpload;
     pendingUpload = null;
-    runInBackground(
+    runUploadInBackground(
         R.string.dialog_message_preparing_key_change,
         () -> {
           int failedCount = upload.logFiles().size() - copyToFolder(upload.logFiles(), folderUri);
@@ -974,8 +1233,10 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
   }
 
   /**
-   * Copies {@code logFiles} into the folder at {@code folderUri} and marks each copied file as
-   * sent, so that the upload worker neither uploads it again nor keeps it.
+   * Copies {@code logFiles} into the folder at {@code folderUri}. Unless that folder is the upload
+   * folder, they stay pending, so that the upload worker still sends them to the configured
+   * destination. It stops at the first failure in transit: the folder's provider would hold the
+   * next files for the same deadline.
    *
    * @return the number of files copied
    */
@@ -990,14 +1251,41 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
       return 0;
     }
     RemoteStorageUploader uploader = new GoogleDriveStorageUploader(folder);
+    // Copied to the upload folder, a file is uploaded: marked as sent, it is not uploaded twice.
+    boolean isUploadFolder = folderUri.toString().equals(configuredUploadFolder());
     int copiedCount = 0;
     for (File file : logFiles) {
-      if (CrumblesSendAndMarkProcessingWorker.uploadSingleFile(
-          this, uploader, file, file.getParentFile())) {
+      boolean copied;
+      if (isUploadFolder) {
+        copied =
+            CrumblesSendAndMarkProcessingWorker.uploadSingleFile(
+                this, uploader, file, file.getParentFile());
+      } else {
+        // An upload run that has started on the file holds it under its processing name.
+        File source =
+            file.exists() ? file : siblingWithSuffix(file, CrumblesConstants.PROCESSING_SUFFIX);
+        copied = uploader.uploadFile(this, source, file.getName());
+      }
+      if (copied) {
         copiedCount++;
+      } else if (uploader.transportFailed()) {
+        break;
       }
     }
     return copiedCount;
+  }
+
+  /** Returns the URI of the folder that the upload worker uploads to, or "" if it uses none. */
+  private String configuredUploadFolder() {
+    RemoteStorageConfig config =
+        CrumblesSendAndMarkProcessingWorker.readUserPreferences(this).getRemoteStorageConfig();
+    if (config.getStorageType().equals(StorageType.STORAGE_TYPE_WEBDAV)) {
+      return "";
+    }
+    return config.getUploadDestinationUri().isEmpty()
+        ? getSharedPreferences(CrumblesConstants.PREFS_NAME, MODE_PRIVATE)
+            .getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, /* defValue= */ "")
+        : config.getUploadDestinationUri();
   }
 
   /** Records that some pending log files were not copied and asks whether to change the key. */
@@ -1009,13 +1297,14 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
                 + " of "
                 + totalCount
                 + " pending log file(s) could not be copied before key rotation; kept on device.");
-    new AlertDialog.Builder(this)
-        .setTitle(R.string.dialog_logs_not_copied_title)
-        .setMessage(R.string.dialog_logs_not_copied_message)
-        .setPositiveButton(
-            R.string.dialog_logs_not_copied_confirm, (dialog, which) -> keyChange.run())
-        .setNegativeButton(android.R.string.cancel, /* listener= */ null)
-        .show();
+    logsNotCopiedDialog =
+        new AlertDialog.Builder(this)
+            .setTitle(R.string.dialog_logs_not_copied_title)
+            .setMessage(R.string.dialog_logs_not_copied_message)
+            .setPositiveButton(
+                R.string.dialog_logs_not_copied_confirm, (dialog, which) -> keyChange.run())
+            .setNegativeButton(android.R.string.cancel, /* listener= */ null)
+            .show();
   }
 
   private void onGenerateKeystoreKey() {
@@ -1025,22 +1314,25 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
       return;
     }
     requestCredentialForKeyChange("generate a new Keystore key pair", this::switchToNewKeystoreKey);
-    pendingChangeDeletesInternalKey = true;
+    // Generating a key pair deletes the built-in key, if there is one: clearing an external key on
+    // an install that never had a built-in key deletes nothing.
+    pendingChangeDeletesInternalKey = CrumblesMain.getLogsEncryptorInstance().doesPrivateKeyExist();
   }
 
   /** Generates a Keystore key pair before dropping the external key, so failures keep that key. */
   private void switchToNewKeystoreKey() {
     CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
-    runInBackground(R.string.dialog_message_generating_key, () -> generateKeystoreKey(encryptor));
+    // Generating the key starts with a handover, which uploads.
+    runUploadInBackground(
+        R.string.dialog_message_generating_key, () -> generateKeystoreKey(encryptor));
   }
 
   private void postUi(Runnable action) {
-    runOnUiThread(
-        () -> {
-          if (canUpdateUi()) {
-            action.run();
-          }
-        });
+    runOnUiThread(() -> {
+      if (canUpdateUi()) {
+        action.run();
+      }
+    });
   }
 
   /**
@@ -1048,38 +1340,63 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
    * progressMessageId}, then runs the continuation it returns on the main thread even if the screen
    * closed meanwhile.
    *
-   * <p>Generating an RSA key takes up to several seconds, in StrongBox or for 3072-bit keys, and a
-   * handover waits for its upload. The orientation is locked meanwhile, so that rotating the phone
-   * does not recreate the screen and drop the logs held for the key change.
+   * <p>Generating an RSA key takes up to several seconds, in StrongBox or for 3072-bit keys. The
+   * orientation is locked meanwhile, so that rotating the phone does not recreate the screen and
+   * drop the logs held for the key change.
    */
   private void runInBackground(@StringRes int progressMessageId, Supplier<Runnable> task) {
+    runBehind(newProgressDialog(progressMessageId).show(), task);
+  }
+
+  /**
+   * Runs {@code task}, which uploads, as {@link #runInBackground} does, but its progress dialog
+   * lets the user stop waiting for the upload. Stopping ends the task's calls into documents
+   * providers and its transfers as their deadlines would: the task then finishes at once, as after
+   * a failed upload. The dialog stays until it has, so that nothing else starts meanwhile.
+   */
+  private void runUploadInBackground(@StringRes int progressMessageId, Supplier<Runnable> task) {
+    CrumblesTransferDeadline.Budget budget = CrumblesTransferDeadline.Budget.untilStopped();
+    AlertDialog progressDialog =
+        newProgressDialog(progressMessageId)
+            .setNegativeButton(R.string.dialog_button_stop_waiting, /* listener= */ null)
+            .show();
+    // Set on the button rather than on the dialog, which would close with the first click.
+    Button stopWaiting = progressDialog.getButton(DialogInterface.BUTTON_NEGATIVE);
+    stopWaiting.setOnClickListener(v -> {
+      stopWaiting.setEnabled(false);
+      budget.stop();
+    });
+    runBehind(progressDialog, () -> CrumblesTransferDeadline.within(budget, task));
+  }
+
+  private AlertDialog.Builder newProgressDialog(@StringRes int progressMessageId) {
+    return new AlertDialog.Builder(this).setMessage(progressMessageId).setCancelable(false);
+  }
+
+  private void runBehind(AlertDialog progressDialog, Supplier<Runnable> task) {
     activeBackgroundTasks++;
     setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LOCKED);
-    AlertDialog progressDialog =
-        new AlertDialog.Builder(this).setMessage(progressMessageId).setCancelable(false).show();
-    keyGenerationExecutor.execute(
-        () -> {
-          Runnable continuation = this::dropHeldLogs;
+    keyGenerationExecutor.execute(() -> {
+      Runnable continuation = this::dropHeldLogs;
+      try {
+        continuation = task.get();
+      } finally {
+        Runnable finalContinuation = continuation;
+        runOnUiThread(() -> {
+          if (isDestroyed()) {
+            Log.w(TAG, "Key management screen closed before its background task ended.");
+          } else {
+            progressDialog.dismiss();
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+          }
           try {
-            continuation = task.get();
+            finalContinuation.run();
           } finally {
-            Runnable finalContinuation = continuation;
-            runOnUiThread(
-                () -> {
-                  if (isDestroyed()) {
-                    Log.w(TAG, "Key management screen closed before its background task ended.");
-                  } else {
-                    progressDialog.dismiss();
-                    setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-                  }
-                  try {
-                    finalContinuation.run();
-                  } finally {
-                    activeBackgroundTasks--;
-                  }
-                });
+            activeBackgroundTasks--;
           }
         });
+      }
+    });
   }
 
   /**
@@ -1091,6 +1408,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
         "Changing to a new on-device key",
         () -> {
           try {
+            recordLogsCollectedBeforeUnlockLeftWaiting();
             PublicKey newPublicKey = encryptor.generateKeyPair().getPublic();
             finishSwitchToNewKeystoreKey(
                 encryptor, newPublicKey, fingerprintForAudit(newPublicKey));
@@ -1124,6 +1442,28 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
     postUi(this::finish);
   }
 
+  /**
+   * Records that batches collected before the first unlock that are unreadable or may be encrypted
+   * to the replaced on-device key still wait, as for a full quota, before the key is deleted.
+   */
+  private void recordLogsCollectedBeforeUnlockLeftWaiting() {
+    if (!pendingChangeDeletesInternalKey) {
+      return;
+    }
+    long waiting =
+        new CrumblesDirectBootStore(this)
+            .batches().stream().filter(builtInKeyOrUnreadableFiles::contains).count();
+    if (waiting > 0) {
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              AUDIT_EVENT_LOGS_LOST,
+              waiting
+                  + " security log batch(es) collected before the first unlock may be unreadable:"
+                  + " they still wait on this device, and may be encrypted to the on-device key"
+                  + " that the key change deletes.");
+    }
+  }
+
   private void onKeystoreKeySwitchFailed(CrumblesKeysException e) {
     Log.e(TAG, "Failed to switch to a new internal key pair.", e);
     // generateKeyPair() deletes the previous Keystore key first, so the held logs can no longer
@@ -1145,8 +1485,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
                 : item.file.getName());
         boolean staged = false;
         try {
-          staged =
-              new CrumblesLogStaging(this).stage(/* isNetworkBatch= */ false, item.plainBytes);
+          staged = new CrumblesLogStaging(this).stage(/* isNetworkBatch= */ false, item.plainBytes);
         } catch (GeneralSecurityException | IOException | RuntimeException ex) {
           Log.e(TAG, "Failed to stage log batch after re-encryption failure.", ex);
         }
@@ -1313,20 +1652,19 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
                   pendingExportChoiceKeyBytes = null;
                   showPrivateKeyViewer(privateKeyBytes, /* showQrInitially= */ true);
                 })
-            .setOnDismissListener(
-                dialog -> {
-                  if (!handedToViewer[0]) {
-                    wipePendingExportChoiceKey();
-                    pendingCandidatePublicKey = null;
-                    dropHeldLogs();
-                    Log.d(
-                        TAG,
-                        "Defensive copy cleared after user dismissed export choice; active key"
-                            + " preserved.");
-                    showToast(getString(R.string.toast_key_export_cancelled_active_key_preserved));
-                    updateStatusUi();
-                  }
-                })
+            .setOnDismissListener(dialog -> {
+              if (!handedToViewer[0]) {
+                wipePendingExportChoiceKey();
+                pendingCandidatePublicKey = null;
+                dropHeldLogs();
+                Log.d(
+                    TAG,
+                    "Defensive copy cleared after user dismissed export choice; active key"
+                        + " preserved.");
+                showToast(getString(R.string.toast_key_export_cancelled_active_key_preserved));
+                updateStatusUi();
+              }
+            })
             .create();
     exportChoiceDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     exportChoiceDialog.show();
@@ -1464,7 +1802,7 @@ public class CrumblesManageExternalKeysActivity extends AppCompatActivity
    * keyChange} on the main thread.
    */
   private void handOverToOutgoingKeyInBackground(String changeDescription, Runnable keyChange) {
-    runInBackground(
+    runUploadInBackground(
         R.string.dialog_message_handing_over_key,
         () -> handOverToOutgoingKey(changeDescription, keyChange));
   }

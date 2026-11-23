@@ -23,8 +23,9 @@ public class FakeAndroidKeyStoreProvider extends Provider {
   public static final String PROVIDER_NAME =
       "AndroidKeyStore"; // Match what CrumblesLogsEncryptor expects.
 
+  @SuppressWarnings("deprecation") // Android lacks Provider(String, String, String).
   public FakeAndroidKeyStoreProvider() {
-    super(PROVIDER_NAME, "1.0", "Fake AndroidKeyStore Provider for Testing");
+    super(PROVIDER_NAME, 1.0, "Fake AndroidKeyStore Provider for Testing");
 
     // Register the KeyStoreSpi.
     put("KeyStore." + PROVIDER_NAME, FakeAndroidKeyStoreSpi.class.getName());

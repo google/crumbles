@@ -39,5 +39,6 @@ public final class CrumblesConstantsTest {
     assertThat(ids.add(CrumblesConstants.NO_SCREEN_LOCK_NOTIFICATION_ID)).isTrue();
     assertThat(ids.add(CrumblesConstants.KEY_DELETED_NOTIFICATION_ID)).isTrue();
     assertThat(ids.add(CrumblesConstants.COLLECTION_PAUSED_NOTIFICATION_ID)).isTrue();
+    assertThat(ids.add(CrumblesConstants.LOSS_REPORTED_NOTIFICATION_ID)).isTrue();
   }
 }

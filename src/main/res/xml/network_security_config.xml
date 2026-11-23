@@ -14,17 +14,13 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 -->
-<!-- TLS is validated against the system CAs only. Cleartext is permitted only to a WebDAV server on
-     this device, matching the loopback exception in WebDavStorageUploader. Other loopback literals,
-     such as ::1, stay blocked. -->
+<!-- TLS is validated against the system CAs only, and cleartext is never permitted: any app can
+     listen on a loopback port and impersonate a WebDAV server on this device. Debug builds replace
+     this file with src/debug/res/xml/network_security_config.xml, which permits it for testing. -->
 <network-security-config>
   <base-config cleartextTrafficPermitted="false">
     <trust-anchors>
       <certificates src="system" />
     </trust-anchors>
   </base-config>
-  <domain-config cleartextTrafficPermitted="true">
-    <domain includeSubdomains="false">localhost</domain>
-    <domain includeSubdomains="false">127.0.0.1</domain>
-  </domain-config>
 </network-security-config>

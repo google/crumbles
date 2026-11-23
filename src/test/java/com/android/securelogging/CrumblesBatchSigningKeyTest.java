@@ -21,6 +21,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertThrows;
 
 import android.content.Context;
+import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import androidx.test.core.app.ApplicationProvider;
@@ -80,8 +81,11 @@ public final class CrumblesBatchSigningKeyTest {
     FakeAndroidKeyStoreSpi.isStrongBoxSupported = true;
     FakeAndroidKeyStoreSpi.isStrongBoxFailing = false;
     FakeAndroidKeyStoreSpi.isStrongBoxThrowingGeneralSecurityException = false;
+    FakeAndroidKeyStoreSpi.strongBoxFailure = null;
     FakeAndroidKeyStoreSpi.isCertificateChainNull = false;
+    FakeAndroidKeyStoreSpi.certificateLookupFailure = null;
     FakeAndroidKeyStoreSpi.isDeleteFailing = false;
+    FakeAndroidKeyStoreSpi.deleteFailure = null;
     context = ApplicationProvider.getApplicationContext();
     context
         .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
@@ -136,6 +140,12 @@ public final class CrumblesBatchSigningKeyTest {
       void simulate() {
         FakeAndroidKeyStoreSpi.isStrongBoxThrowingGeneralSecurityException = true;
       }
+    },
+    OTHER_UNCHECKED_EXCEPTION {
+      @Override
+      void simulate() {
+        FakeAndroidKeyStoreSpi.strongBoxFailure = new IllegalStateException("StrongBox failed");
+      }
     };
 
     abstract void simulate();
@@ -156,7 +166,8 @@ public final class CrumblesBatchSigningKeyTest {
   public void sign_again_keepsTheKey() throws Exception {
     BatchSignature first = signingKey.sign(DATA.getBytes(UTF_8));
 
-    var _ = new CrumblesBatchSigningKey(context).sign(DATA.getBytes(UTF_8));
+    @SuppressWarnings("unused")
+    var unusedSignature = new CrumblesBatchSigningKey(context).sign(DATA.getBytes(UTF_8));
 
     assertThat(verifies(first, keystorePublicKey())).isTrue();
   }
@@ -165,10 +176,12 @@ public final class CrumblesBatchSigningKeyTest {
   public void sign_afterHardwareAttributionIsEnabled_createsKeyAttestedToTheNewDeviceId()
       throws Exception {
     ShadowBuild.setSerial(SERIAL);
-    var _ = signingKey.sign(DATA.getBytes(UTF_8));
+    @SuppressWarnings("unused")
+    var unusedInitialSignature = signingKey.sign(DATA.getBytes(UTF_8));
 
     CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
-    var _ = signingKey.sign(DATA.getBytes(UTF_8));
+    @SuppressWarnings("unused")
+    var unusedRotatedSignature = signingKey.sign(DATA.getBytes(UTF_8));
 
     expect.that(keystoreSpec().getAttestationChallenge()).isEqualTo(SERIAL.getBytes(UTF_8));
     expect.that(CrumblesDeviceIdManager.getDeviceId(context)).isEqualTo(SERIAL);
@@ -182,10 +195,26 @@ public final class CrumblesBatchSigningKeyTest {
     BatchSignature first = signingKey.sign(DATA.getBytes(UTF_8));
 
     CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
-    var _ = signingKey.sign(DATA.getBytes(UTF_8));
+    @SuppressWarnings("unused")
+    var unusedKeptSignature = signingKey.sign(DATA.getBytes(UTF_8));
 
     expect.that(verifies(first, keystorePublicKey())).isTrue();
     expect.that(countAuditEvents("BATCH_SIGNING_KEY_ROTATED")).isEqualTo(1);
+  }
+
+  @Test
+  public void sign_afterHardwareAttributionIsEnabledWithoutHardwareIds_keepsTheKey()
+      throws Exception {
+    Settings.Secure.putString(context.getContentResolver(), Settings.Secure.ANDROID_ID, "");
+    BatchSignature first = signingKey.sign(DATA.getBytes(UTF_8));
+
+    CrumblesDeviceIdManager.setHardwareAttributionEnabled(context, /* enabled= */ true);
+    @SuppressWarnings("unused")
+    var unusedKeptSignature = signingKey.sign(DATA.getBytes(UTF_8));
+
+    expect.that(verifies(first, keystorePublicKey())).isTrue();
+    expect.that(countAuditEvents("BATCH_SIGNING_KEY_ROTATED")).isEqualTo(0);
+    expect.that(countAuditEvents("BATCH_SIGNING_KEY_KEPT")).isEqualTo(1);
   }
 
   @Test
@@ -254,31 +283,89 @@ public final class CrumblesBatchSigningKeyTest {
     assertThrows(CrumblesKeysException.class, signingKey::attestationChain);
   }
 
+  /** Unchecked exceptions that Keystore throws on some devices. */
+  private enum UncheckedKeystoreFailure {
+    PROVIDER_EXCEPTION {
+      @Override
+      RuntimeException create() {
+        return new ProviderException("Keystore failed");
+      }
+    },
+    OTHER_UNCHECKED_EXCEPTION {
+      @Override
+      RuntimeException create() {
+        return new IllegalStateException("Keystore failed");
+      }
+    };
+
+    abstract RuntimeException create();
+  }
+
   @Test
-  public void attestationChain_whenKeystoreThrowsProviderException_throwsCrumblesKeysException() {
+  public void sign_whenKeystoreThrowsUncheckedException_throwsCrumblesKeysException(
+      @TestParameter UncheckedKeystoreFailure keystoreFailure) {
+    RuntimeException failure = keystoreFailure.create();
+    FakeAndroidKeyStoreSpi.failKeyLookup(CrumblesBatchSigningKey.ALIAS, failure);
+
+    CrumblesKeysException thrown =
+        assertThrows(CrumblesKeysException.class, () -> signingKey.sign(DATA.getBytes(UTF_8)));
+
+    assertThat(thrown).hasCauseThat().isSameInstanceAs(failure);
+  }
+
+  @Test
+  public void attestationChain_whenKeystoreThrowsUncheckedException_throwsCrumblesKeysException(
+      @TestParameter UncheckedKeystoreFailure keystoreFailure) {
+    RuntimeException failure = keystoreFailure.create();
     FakeAndroidKeyStoreSpi.keystoreEntries.put(
         CrumblesBatchSigningKey.ALIAS,
         new FakeAndroidKeyStoreSpi.PrivateKeyEntry(
             /* privateKey= */ null, /* certificateChain= */ null, /* spec= */ null) {
           @Override
           public Certificate[] getCertificateChain() {
-            throw new ProviderException("Keystore failed");
+            throw failure;
           }
         });
 
     CrumblesKeysException thrown =
         assertThrows(CrumblesKeysException.class, signingKey::attestationChain);
 
-    assertThat(thrown).hasCauseThat().isInstanceOf(ProviderException.class);
+    assertThat(thrown).hasCauseThat().isSameInstanceAs(failure);
   }
 
   @Test
-  public void delete_whenKeystoreThrowsProviderException_throwsCrumblesKeysException()
-      throws Exception {
-    var _ = signingKey.sign(DATA.getBytes(UTF_8));
-    FakeAndroidKeyStoreSpi.isDeleteFailing = true;
+  public void verifies_whenKeystoreThrowsUncheckedException_throwsCrumblesKeysException(
+      @TestParameter UncheckedKeystoreFailure keystoreFailure) throws Exception {
+    BatchSignature signature = signingKey.sign(DATA.getBytes(UTF_8));
+    RuntimeException failure = keystoreFailure.create();
+    FakeAndroidKeyStoreSpi.certificateLookupFailure = failure;
 
-    assertThrows(CrumblesKeysException.class, signingKey::delete);
+    CrumblesKeysException thrown;
+    try {
+      thrown =
+          assertThrows(
+              CrumblesKeysException.class,
+              () ->
+                  signingKey.verifies(
+                      DATA.getBytes(UTF_8), signature.getSignature().toByteArray()));
+    } finally {
+      FakeAndroidKeyStoreSpi.certificateLookupFailure = null;
+    }
+
+    assertThat(thrown).hasCauseThat().isSameInstanceAs(failure);
+  }
+
+  @Test
+  public void delete_whenKeystoreThrowsUncheckedException_throwsCrumblesKeysException(
+      @TestParameter UncheckedKeystoreFailure keystoreFailure) throws Exception {
+    @SuppressWarnings("unused")
+    var unusedSignature = signingKey.sign(DATA.getBytes(UTF_8));
+    RuntimeException failure = keystoreFailure.create();
+    FakeAndroidKeyStoreSpi.deleteFailure = failure;
+
+    CrumblesKeysException thrown = assertThrows(CrumblesKeysException.class, signingKey::delete);
+
+    assertThat(thrown).hasCauseThat().isSameInstanceAs(failure);
   }
 
   private static boolean verifies(BatchSignature signature, PublicKey publicKey) throws Exception {

@@ -18,16 +18,18 @@ package com.android.securelogging;
 
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertThrows;
 
 import android.content.Context;
+import android.security.NetworkSecurityPolicy;
 import androidx.documentfile.provider.DocumentFile;
 import androidx.test.core.app.ApplicationProvider;
 import com.android.securelogging.WebDavStorageUploader.ConnectionTestResult;
 import com.google.common.net.InetAddresses;
-import com.google.common.time.Sleeper;
 import com.google.common.truth.Expect;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.testing.junit.testparameterinjector.TestParameter;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpServer;
@@ -38,7 +40,11 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.Proxy;
+import java.net.ProxySelector;
 import java.net.ServerSocket;
+import java.net.SocketAddress;
+import java.net.URI;
 import java.nio.file.Files;
 import java.security.GeneralSecurityException;
 import java.security.KeyPairGenerator;
@@ -47,15 +53,18 @@ import java.security.PublicKey;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLEngine;
@@ -70,8 +79,12 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestParameterInjector;
+import org.robolectric.Shadows;
 import org.robolectric.shadows.ShadowLog;
+import org.robolectric.shadows.ShadowLooper;
 import org.robolectric.shadows.ShadowSystemClock;
+import org.robolectric.util.ReflectionHelpers;
+import org.robolectric.util.ReflectionHelpers.ClassParameter;
 
 /** Unit tests for {@link WebDavStorageUploader}. */
 @RunWith(RobolectricTestParameterInjector.class)
@@ -112,7 +125,7 @@ public final class WebDavStorageUploaderTest {
     serverAuthority = InetAddresses.toUriString(loopback) + ":" + server.getAddress().getPort();
     serverBaseUrl = "http://" + serverAuthority + "/webdav";
     testFile = new File(context.getFilesDir(), "test_log.bin");
-    Files.writeString(testFile.toPath(), FILE_CONTENT);
+    Files.write(testFile.toPath(), FILE_CONTENT.getBytes(UTF_8));
     testUploader =
         new WebDavStorageUploader(
             serverBaseUrl, USERNAME.getBytes(UTF_8), PASSWORD.getBytes(UTF_8));
@@ -120,6 +133,8 @@ public final class WebDavStorageUploaderTest {
 
   @After
   public void tearDown() {
+    // As permitted by default; a test may have refused cleartext, as a release build does.
+    setCleartextTrafficPermitted(true);
     if (testUploader != null) {
       testUploader.close();
     }
@@ -220,6 +235,7 @@ public final class WebDavStorageUploaderTest {
 
       expect.that(uploaded).isFalse();
       expect.that(testUploader.transportFailed()).isTrue();
+      expect.that(testUploader.failedMidBody()).isFalse();
     } finally {
       release.countDown();
       uploadThread.shutdown();
@@ -227,8 +243,125 @@ public final class WebDavStorageUploaderTest {
   }
 
   @Test
-  public void uploadFile_givesALargerBatchMoreTimeBeforeItsDeadline() throws Exception {
-    // At the slowest rate that the deadline allows for, a mebibyte takes 16 s on top of the minute.
+  public void uploadFile_withinAStoppedBudget_failsBeforeConnecting() {
+    AtomicInteger requests = new AtomicInteger();
+    server.createContext(
+        "/webdav/stopped.bin",
+        exchange -> {
+          requests.incrementAndGet();
+          exchange.sendResponseHeaders(201, -1);
+          exchange.close();
+        });
+    CrumblesTransferDeadline.Budget budget = CrumblesTransferDeadline.Budget.untilStopped();
+    budget.stop();
+
+    boolean uploaded =
+        CrumblesTransferDeadline.within(
+            budget, () -> testUploader.uploadFile(context, testFile, "stopped.bin"));
+
+    expect.that(uploaded).isFalse();
+    expect.that(testUploader.transportFailed()).isTrue();
+    expect.that(testUploader.failedMidBody()).isFalse();
+    expect.that(requests.get()).isEqualTo(0);
+  }
+
+  @Test
+  public void uploadFile_whenTheServerStopsReadingTheBody_failsMidBody() throws Exception {
+    // More than the socket buffers hold, so that the upload blocks once the server stops reading.
+    Files.write(testFile.toPath(), new byte[32 << 20]);
+    CountDownLatch release = new CountDownLatch(1);
+    stallRequests("/webdav/unread.bin", new CountDownLatch(1), release);
+    ExecutorService uploadThread = Executors.newSingleThreadExecutor();
+    try {
+      Future<Boolean> upload =
+          uploadThread.submit(() -> testUploader.uploadFile(context, testFile, "unread.bin"));
+
+      boolean uploaded = awaitPastDeadline(upload);
+
+      expect.that(uploaded).isFalse();
+      expect.that(testUploader.transportFailed()).isTrue();
+      expect.that(testUploader.failedMidBody()).isTrue();
+    } finally {
+      release.countDown();
+      uploadThread.shutdown();
+    }
+  }
+
+  @Test
+  public void uploadFile_afterAnUploadFailedInTransit_reportsOnlyItsOwnOutcome() throws Exception {
+    CountDownLatch release = new CountDownLatch(1);
+    stallRequests("/webdav/stalled.bin", new CountDownLatch(1), release);
+    respondWithStatusCode("/webdav/ok.bin", 201);
+    ExecutorService uploadThread = Executors.newSingleThreadExecutor();
+    try {
+      assertThat(
+              awaitPastDeadline(
+                  uploadThread.submit(
+                      () -> testUploader.uploadFile(context, testFile, "stalled.bin"))))
+          .isFalse();
+      release.countDown();
+
+      boolean uploaded = testUploader.uploadFile(context, testFile, "ok.bin");
+
+      expect.that(uploaded).isTrue();
+      expect.that(testUploader.transportFailed()).isFalse();
+    } finally {
+      release.countDown();
+      uploadThread.shutdown();
+    }
+  }
+
+  @Test
+  public void uploadFile_afterAnUploadFailedMidBody_resetsFailedMidBody() throws Exception {
+    Files.write(testFile.toPath(), new byte[32 << 20]);
+    CountDownLatch release = new CountDownLatch(1);
+    stallRequests("/webdav/unread.bin", new CountDownLatch(1), release);
+    respondWithStatusCode("/webdav/ok.bin", /* statusCode= */ 201);
+    ExecutorService uploadThread = Executors.newSingleThreadExecutor();
+    try {
+      assertThat(
+              awaitPastDeadline(
+                  uploadThread.submit(
+                      () -> testUploader.uploadFile(context, testFile, "unread.bin"))))
+          .isFalse();
+      assertThat(testUploader.failedMidBody()).isTrue();
+      release.countDown();
+      Files.write(testFile.toPath(), FILE_CONTENT.getBytes(UTF_8));
+
+      boolean uploaded = testUploader.uploadFile(context, testFile, "ok.bin");
+
+      expect.that(uploaded).isTrue();
+      expect.that(testUploader.transportFailed()).isFalse();
+      expect.that(testUploader.failedMidBody()).isFalse();
+    } finally {
+      release.countDown();
+      uploadThread.shutdown();
+    }
+  }
+
+  @Test
+  public void uploadFile_afterCompleting_disarmsTransferDeadline() {
+    CrumblesTransferDeadline.arm(() -> {}).close();
+    ShadowLooper watchdog =
+        ShadowLooper.getAllLoopers().stream()
+            .filter(looper -> looper.getThread().getName().equals("CrumblesTransferDeadline"))
+            .map(Shadows::shadowOf)
+            .findFirst()
+            .orElseThrow();
+    Duration before = watchdog.getNextScheduledTaskTime();
+    respondWithStatusCode("/webdav/ok.bin", /* statusCode= */ 201);
+
+    boolean uploaded = testUploader.uploadFile(context, testFile, "ok.bin");
+
+    expect.that(uploaded).isTrue();
+    expect.that(before).isEqualTo(Duration.ZERO);
+    expect.that(watchdog.getNextScheduledTaskTime()).isEqualTo(Duration.ZERO);
+  }
+
+  @Test
+  public void uploadFile_whenTheServerTakesNoMore_givesUpAMinuteAfterTheLastProgress()
+      throws Exception {
+    // At the slowest rate that the deadline allows for, a mebibyte would get 128 s more.
     Files.write(testFile.toPath(), new byte[1 << 20]);
     CountDownLatch requestReceived = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
@@ -238,13 +371,16 @@ public final class WebDavStorageUploaderTest {
       Future<Boolean> upload =
           uploadThread.submit(() -> testUploader.uploadFile(context, testFile, "large.bin"));
       assertThat(requestReceived.await(10, SECONDS)).isTrue();
+      // Lets the upload fill the socket buffers before the clock moves past its last progress.
+      Uninterruptibles.sleepUninterruptibly(500, MILLISECONDS);
 
-      ShadowSystemClock.advanceBy(Duration.ofSeconds(70));
-      Sleeper.defaultSleeper().sleep(Duration.ofMillis(500));
-      boolean endedBeforeItsDeadline = upload.isDone();
-      boolean uploaded = awaitPastDeadline(upload);
+      ShadowSystemClock.advanceBy(Duration.ofSeconds(59));
+      Uninterruptibles.sleepUninterruptibly(500, MILLISECONDS);
+      boolean endedEarly = upload.isDone();
+      ShadowSystemClock.advanceBy(Duration.ofSeconds(2));
+      boolean uploaded = upload.get(/* timeout= */ 5, SECONDS);
 
-      expect.that(endedBeforeItsDeadline).isFalse();
+      expect.that(endedEarly).isFalse();
       expect.that(uploaded).isFalse();
     } finally {
       release.countDown();
@@ -282,9 +418,9 @@ public final class WebDavStorageUploaderTest {
   }
 
   @Test
-  public void uploadFile_sendsCrumblesUserAgent() {
+  public void uploadFile_sendsUserAgentThatDoesNotNameTheApp() {
     assertThat(captureUploadRequestHeaders("user_agent.bin").getFirst("User-Agent"))
-        .isEqualTo("Crumbles-Android");
+        .isEqualTo("Mozilla/5.0");
   }
 
   @Test
@@ -331,6 +467,44 @@ public final class WebDavStorageUploaderTest {
       nonLoopbackServer.stop(0);
     }
   }
+
+  @Test
+  public void uploadFile_whenCleartextIsNotPermitted_refusesLoopbackHttpWithoutContactingServer() {
+    AtomicBoolean serverWasContacted = recordWhetherServerIsContacted();
+    setCleartextTrafficPermitted(false);
+
+    boolean uploaded = testUploader.uploadFile(context, testFile, "remote_log.bin");
+
+    expect.that(uploaded).isFalse();
+    expect.that(serverWasContacted.get()).isFalse();
+  }
+
+  @Test
+  public void uploadFile_toLoopbackServer_bypassesTheConfiguredProxy() {
+    respondWithStatusCode("/webdav/direct.bin", 201);
+    List<URI> proxiedUris = new ArrayList<>();
+    ProxySelector defaultProxySelector = ProxySelector.getDefault();
+    ProxySelector.setDefault(
+        new ProxySelector() {
+          @Override
+          public List<Proxy> select(URI uri) {
+            proxiedUris.add(uri);
+            return Collections.singletonList(Proxy.NO_PROXY);
+          }
+
+          @Override
+          public void connectFailed(URI uri, SocketAddress address, IOException e) {}
+        });
+    try {
+      boolean uploaded = testUploader.uploadFile(context, testFile, "direct.bin");
+
+      expect.that(uploaded).isTrue();
+      expect.that(proxiedUris).isEmpty();
+    } finally {
+      ProxySelector.setDefault(defaultProxySelector);
+    }
+  }
+
   @Test
   public void constructor_whenCallerWipesItsOwnArrays_uploaderKeepsWorkingCredentials() {
     AtomicReference<String> receivedAuth = new AtomicReference<>();
@@ -464,7 +638,7 @@ public final class WebDavStorageUploaderTest {
   public void testConnection_whenHttpsUrlHasNoHost_returnsInvalidUrl() {
     assertThat(
             WebDavStorageUploader.testConnection(
-                "https:///webdav", USERNAME.getBytes(UTF_8), PASSWORD.getBytes(UTF_8)))
+                "https:///webdav", USERNAME.getBytes(UTF_8), PASSWORD.getBytes(UTF_8))) // NOTYPO
         .isEqualTo(ConnectionTestResult.INVALID_URL);
   }
 
@@ -554,7 +728,7 @@ public final class WebDavStorageUploaderTest {
     // never fall back to a method that could read or alter a stored batch.
     assertThat(receivedMethod.get()).isEqualTo("OPTIONS");
     assertThat(receivedAuth.get()).isEqualTo(expectedAuthHeader());
-    assertThat(receivedUserAgent.get()).isEqualTo("Crumbles-Android");
+    assertThat(receivedUserAgent.get()).isEqualTo("Mozilla/5.0");
   }
 
   @Test
@@ -824,7 +998,7 @@ public final class WebDavStorageUploaderTest {
   private static <T> T awaitPastDeadline(Future<T> transfer) throws Exception {
     for (int attempt = 0; attempt < 100 && !transfer.isDone(); attempt++) {
       ShadowSystemClock.advanceBy(Duration.ofHours(1));
-      Sleeper.defaultSleeper().sleep(Duration.ofMillis(50));
+      Uninterruptibles.sleepUninterruptibly(50, MILLISECONDS);
     }
     return transfer.get(/* timeout= */ 1, SECONDS);
   }
@@ -840,6 +1014,14 @@ public final class WebDavStorageUploaderTest {
           exchange.close();
         });
     return serverWasContacted;
+  }
+
+  /** Sets the cleartext policy, which the platform takes from the network security config. */
+  private static void setCleartextTrafficPermitted(boolean permitted) {
+    ReflectionHelpers.callInstanceMethod(
+        NetworkSecurityPolicy.getInstance(),
+        "setCleartextTrafficPermitted",
+        ClassParameter.from(boolean.class, permitted));
   }
 
   /**

@@ -27,6 +27,7 @@ import androidx.core.app.NotificationCompat;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
+import com.google.common.truth.Expect;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.File;
 import java.io.FileFilter;
@@ -51,6 +52,7 @@ public final class CrumblesLogStorageQuotaTest {
   private static final long OLDEST_MILLIS = 1_700_000_000_000L;
 
   @Rule public final TemporaryFolder temporaryFolder = new TemporaryFolder();
+  @Rule public final Expect expect = Expect.create();
 
   private Context context;
   private Path logsDirectory;
@@ -116,7 +118,8 @@ public final class CrumblesLogStorageQuotaTest {
     assertThat(Files.exists(reserved)).isTrue();
     assertThat(Files.exists(pending)).isTrue();
     assertThat(Files.exists(uploaded)).isFalse();
-    assertThat(hasAuditMessage("Reclaimed 1 uploaded copy(ies) (250 bytes): batch_3_sent.bin.")).isTrue();
+    assertThat(hasAuditMessage("Reclaimed 1 uploaded copy(ies) (250 bytes): batch_3_sent.bin."))
+        .isTrue();
   }
 
   @Test
@@ -130,6 +133,44 @@ public final class CrumblesLogStorageQuotaTest {
                 context, logsDirectory.toFile(), CAP_BYTES, false, 0L))
         .isTrue();
     assertThat(Files.exists(overrunning)).isFalse();
+  }
+
+  @Test
+  public void admitNewBatch_afterClockIsSetBack_keepsEarliestAdmittedCopyInTheReserve()
+      throws Exception {
+    Path first = writeBatch("batch_1.bin", /* sizeBytes= */ 250, OLDEST_MILLIS);
+    assertThat(
+            CrumblesLogStorageQuota.admitNewBatch(
+                context,
+                logsDirectory.toFile(),
+                CAP_BYTES,
+                /* isNetworkBatch= */ false,
+                /* incomingBytes= */ 0L))
+        .isTrue();
+    expect
+        .that(
+            context
+                .getSharedPreferences("CrumblesBatchAdmissionOrder", Context.MODE_PRIVATE)
+                .getLong("batch_1", 0))
+        .isEqualTo(1L);
+    Files.move(first, logsDirectory.resolve("batch_1" + CrumblesConstants.SENT_SUFFIX));
+    long setBackMillis = OLDEST_MILLIS - 10_000;
+    writeBatch("batch_2" + CrumblesConstants.SENT_SUFFIX, /* sizeBytes= */ 250, setBackMillis);
+    writeBatch("batch_3.bin", /* sizeBytes= */ 500, setBackMillis + 1000);
+
+    boolean admitted =
+        CrumblesLogStorageQuota.admitNewBatch(
+            context,
+            logsDirectory.toFile(),
+            CAP_BYTES,
+            /* isNetworkBatch= */ false,
+            /* incomingBytes= */ 0L);
+
+    expect.that(admitted).isTrue();
+    expect
+        .that(logsDirectory.toFile().list())
+        .asList()
+        .containsExactly("batch_1" + CrumblesConstants.SENT_SUFFIX, "batch_3.bin");
   }
 
   @Test
@@ -217,7 +258,10 @@ public final class CrumblesLogStorageQuotaTest {
                 context, logsDirectory.toFile(), CAP_BYTES, /* isNetworkBatch= */ true, 300L))
         .isTrue();
     assertThat(Files.exists(reclaimable)).isFalse();
-    assertThat(hasAuditMessage("Reclaimed 2 uploaded copy(ies) (550 bytes): batch_2_sent.bin, batch_3_sent.bin.")).isTrue();
+    assertThat(
+            hasAuditMessage(
+                "Reclaimed 2 uploaded copy(ies) (550 bytes): batch_2_sent.bin, batch_3_sent.bin."))
+        .isTrue();
     assertThat(hasAuditMessage("NETWORK_LOGS_COLLECTION_STOPPED")).isFalse();
   }
 

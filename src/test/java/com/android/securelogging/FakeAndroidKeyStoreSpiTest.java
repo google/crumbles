@@ -25,6 +25,7 @@ import android.security.keystore.UserNotAuthenticatedException;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
+import java.security.InvalidKeyException;
 import java.security.Key;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -87,7 +88,17 @@ public final class FakeAndroidKeyStoreSpiTest {
     FakeAndroidKeyStoreSpi.setUserAuthenticated(ALIAS, true);
 
     initDecryptCipher();
-    assertThat(keyStoreSpi.engineGetKey(ALIAS, /* password= */ null)).isEqualTo(secretKey);
+  }
+
+  @Test
+  public void cipherInit_withAnotherProvider_refusesKeyThatRequiresAuthentication()
+      throws Exception {
+    Key key = keyStoreSpi.engineGetKey(ALIAS, /* password= */ null);
+    Cipher cipher = Cipher.getInstance("AES/CBC/NoPadding", "SunJCE");
+
+    assertThrows(
+        InvalidKeyException.class,
+        () -> cipher.init(Cipher.DECRYPT_MODE, key, new IvParameterSpec(new byte[16])));
   }
 
   @Test

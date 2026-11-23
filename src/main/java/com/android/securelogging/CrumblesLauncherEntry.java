@@ -16,6 +16,8 @@
 
 package com.android.securelogging;
 
+import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.PackageManager;
@@ -40,6 +42,23 @@ public final class CrumblesLauncherEntry {
             .getPackageManager()
             .getComponentEnabledSetting(new ComponentName(context, NEUTRAL_ALIAS))
         == PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
+  }
+
+  /**
+   * Shows the task of {@code activity} in Recents under the neutral name and icon while the neutral
+   * entry is enabled, and otherwise under those of the activity at the root of the task.
+   *
+   * <p>Recents takes them from the root activity unless the task has a description. A task that a
+   * notification starts has {@link CrumblesMain} itself at its root, not the neutral entry.
+   */
+  public static void applyToTask(Activity activity) {
+    activity.setTaskDescription(
+        isNeutral(activity)
+            ? new ActivityManager.TaskDescription.Builder()
+                .setLabel(activity.getString(R.string.neutral_launcher_label))
+                .setIcon(R.mipmap.ic_launcher_neutral)
+                .build()
+            : new ActivityManager.TaskDescription.Builder().build());
   }
 
   /** Shows Crumbles in the launcher under the neutral name and icon. */

@@ -29,11 +29,13 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.audit.CrumblesAuditEvent;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
+import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.common.truth.Expect;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
+import java.security.ProviderException;
 import java.security.Security;
 import java.util.ArrayList;
 import java.util.List;
@@ -66,6 +68,7 @@ public final class CrumblesLogStagingTest {
 
   @After
   public void tearDown() {
+    FakeAndroidKeyStoreSpi.keystoreEntries.remove(CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS);
     Security.removeProvider(FakeAndroidKeyStoreProvider.PROVIDER_NAME);
   }
 
@@ -162,6 +165,34 @@ public final class CrumblesLogStagingTest {
   }
 
   @Test
+  public void drain_whenKeystoreThrowsProviderException_keepsTheBatches() throws Exception {
+    stageAll("first", "second");
+    FakeAndroidKeyStoreSpi.failKeyLookup(
+        CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS,
+        new ProviderException("Keystore cannot be reached."));
+
+    List<String> written = drainAll();
+
+    expect.that(written).isEmpty();
+    expect.that(directory.list()).asList().containsExactly(FIRST_BATCH, SECOND_BATCH);
+    expect.that(auditMessages(CrumblesLogStaging.AUDIT_EVENT_STAGED_LOGS_UNREADABLE)).isEmpty();
+  }
+
+  @Test
+  public void drain_whenKeystoreThrowsOtherUncheckedException_keepsTheBatches() throws Exception {
+    stageAll("first", "second");
+    // As Keystore does on some OEM builds.
+    FakeAndroidKeyStoreSpi.failKeyLookup(
+        CrumblesLogStagingSealer.WRAPPING_KEY_ALIAS, new IllegalStateException("Keystore failed."));
+
+    List<String> written = drainAll();
+
+    expect.that(written).isEmpty();
+    expect.that(directory.list()).asList().containsExactly(FIRST_BATCH, SECOND_BATCH);
+    expect.that(auditMessages(CrumblesLogStaging.AUDIT_EVENT_STAGED_LOGS_UNREADABLE)).isEmpty();
+  }
+
+  @Test
   public void stage_whenBatchFillsStagingExactly_stagesIt() throws Exception {
     long sealedBytes = stageAndMeasure("batch");
     fillStaging(CrumblesLogStaging.CAP_BYTES - 2 * sealedBytes);
@@ -194,6 +225,38 @@ public final class CrumblesLogStagingTest {
     expect
         .that(notification.extras.getString(Notification.EXTRA_TEXT))
         .isEqualTo(context.getString(R.string.notification_text_storage_stopped));
+  }
+
+  @Test
+  public void stage_afterAFloodOfNetworkBatches_stillStagesASecurityBatch() throws Exception {
+    // Sixteen batches of this size fill staging exactly.
+    byte[] logs =
+        new byte[(int) (CrumblesLogStaging.CAP_BYTES / 16 - CrumblesLogStagingSealer.OVERHEAD_BYTES)];
+    for (int i = 0; i < 16; i++) {
+      var unused = staging.stage(/* isNetworkBatch= */ true, logs);
+    }
+
+    boolean staged = staging.stage(/* isNetworkBatch= */ false, logs);
+
+    expect.that(staged).isTrue();
+    expect.that(staging.countBatches()).isEqualTo(13);
+  }
+
+  @Test
+  public void stage_whenNetworkBatchWouldUseTheSecurityReserve_refusesItAndSaysWhy()
+      throws Exception {
+    long sealedBytes = stageAndMeasure("batch");
+    fillStaging(
+        CrumblesLogStaging.CAP_BYTES - CrumblesLogStaging.SECURITY_RESERVE_BYTES - sealedBytes);
+
+    boolean staged = staging.stage(/* isNetworkBatch= */ true, "batch".getBytes(UTF_8));
+
+    expect.that(staged).isFalse();
+    expect
+        .that(auditMessages(CrumblesLogStaging.AUDIT_EVENT_STAGING_FULL))
+        .containsExactly(
+            "Staged log batches use 12582912 of 12582912 permitted bytes; a batch of 94 bytes was"
+                + " refused. Network batches leave the last 4194304 bytes to security batches.");
   }
 
   private void stageAll(String... batches) throws Exception {

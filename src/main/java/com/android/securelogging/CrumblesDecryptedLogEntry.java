@@ -19,6 +19,7 @@ package com.android.securelogging;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import androidx.annotation.Nullable;
+import com.google.protobuf.Timestamp;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.io.Serializable;
 import java.util.Arrays;
@@ -27,6 +28,7 @@ import java.util.Arrays;
 public class CrumblesDecryptedLogEntry implements Serializable {
   private final String fileName;
   @Nullable private final String deviceId;
+  @Nullable private final Timestamp timestamp;
   private byte[] rawBytes;
   @Nullable private final LogBatch originalBatch;
 
@@ -36,21 +38,36 @@ public class CrumblesDecryptedLogEntry implements Serializable {
   }
 
   /**
-   * Constructs a new entry decrypted from a batch, retaining the original batch.
-   *
-   * @param fileName the name of the file the entry was decrypted from
-   * @param rawBytes the optional mutable raw bytes buffer
-   * @param deviceId the device id recorded in the original batch's metadata, or {@code null}
-   * @param originalBatch the original parsed LogBatch, or {@code null}
+   * As {@link #CrumblesDecryptedLogEntry(String, byte[], String, Timestamp, LogBatch)}, for a batch
+   * whose time is unknown.
    */
   public CrumblesDecryptedLogEntry(
       String fileName,
       @Nullable byte[] rawBytes,
       @Nullable String deviceId,
       @Nullable LogBatch originalBatch) {
+    this(fileName, rawBytes, deviceId, /* timestamp= */ null, originalBatch);
+  }
+
+  /**
+   * Constructs a new entry decrypted from a batch, retaining the original batch.
+   *
+   * @param fileName the name of the file the entry was decrypted from
+   * @param rawBytes the optional mutable raw bytes buffer
+   * @param deviceId the device id recorded in the original batch's metadata, or {@code null}
+   * @param timestamp the time recorded in the original batch's metadata, or {@code null}
+   * @param originalBatch the original parsed LogBatch, or {@code null}
+   */
+  public CrumblesDecryptedLogEntry(
+      String fileName,
+      @Nullable byte[] rawBytes,
+      @Nullable String deviceId,
+      @Nullable Timestamp timestamp,
+      @Nullable LogBatch originalBatch) {
     this.fileName = fileName;
     this.rawBytes = rawBytes;
     this.deviceId = deviceId;
+    this.timestamp = timestamp;
     this.originalBatch = originalBatch;
   }
 
@@ -62,6 +79,12 @@ public class CrumblesDecryptedLogEntry implements Serializable {
   @Nullable
   public String getDeviceId() {
     return deviceId;
+  }
+
+  /** Returns the time recorded in the original batch, or {@code null} if unknown. */
+  @Nullable
+  public Timestamp getTimestamp() {
+    return timestamp;
   }
 
   /** Returns the original batch if retained, or {@code null}. */

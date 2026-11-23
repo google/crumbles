@@ -17,11 +17,11 @@
 package com.android.securelogging;
 
 import android.app.Activity;
-import android.support.v7.app.AlertDialog;
 import android.util.Log;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.Toast;
+import androidx.appcompat.app.AlertDialog;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import java.security.PublicKey;

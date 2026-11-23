@@ -16,6 +16,7 @@
 
 package com.android.securelogging;
 
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.util.Log;
 import androidx.annotation.Nullable;
@@ -26,6 +27,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.UncheckedExecutionException;
+import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.PublicKey;
 import java.security.spec.X509EncodedKeySpec;
@@ -54,6 +56,13 @@ public class CrumblesExternalPublicKeyManager {
   private final GuavaDataStore<UserKeyPreferences> dataStore;
   private final CrumblesLogsEncryptor cryptoManager;
   private final InstantSource clock;
+
+  /** The context whose device-encrypted storage keeps the recipient for Direct Boot, if any. */
+  @Nullable private final Context context;
+
+  // Suppress "StaticFieldLeak" because the manager only holds the application context, or none,
+  // so retaining it in a static field does not cause an Activity leak.
+  @SuppressLint("StaticFieldLeak")
   private static volatile CrumblesExternalPublicKeyManager instance;
 
   /** A saved re-encryption public key alongside its DataStore entry ID and import timestamp. */
@@ -85,7 +94,8 @@ public class CrumblesExternalPublicKeyManager {
     this(
         CrumblesDataStoreHolder.getInstance(context.getApplicationContext()),
         CrumblesMain.getLogsEncryptorInstance(),
-        InstantSource.system());
+        InstantSource.system(),
+        context.getApplicationContext());
   }
 
   @VisibleForTesting
@@ -99,9 +109,19 @@ public class CrumblesExternalPublicKeyManager {
       GuavaDataStore<UserKeyPreferences> testDataStore,
       CrumblesLogsEncryptor testCryptoManager,
       InstantSource clock) {
-    this.dataStore = testDataStore;
-    this.cryptoManager = testCryptoManager;
+    this(testDataStore, testCryptoManager, clock, /* context= */ null);
+  }
+
+  @VisibleForTesting
+  CrumblesExternalPublicKeyManager(
+      GuavaDataStore<UserKeyPreferences> dataStore,
+      CrumblesLogsEncryptor cryptoManager,
+      InstantSource clock,
+      @Nullable Context context) {
+    this.dataStore = dataStore;
+    this.cryptoManager = cryptoManager;
     this.clock = clock;
+    this.context = context;
   }
 
   public static CrumblesExternalPublicKeyManager getInstance(Context context) {
@@ -125,6 +145,7 @@ public class CrumblesExternalPublicKeyManager {
       Futures.getChecked(
           dataStore.updateDataAsync(prefs -> prefs.toBuilder().clearActiveKeyId().build()),
           CrumblesKeysException.class);
+      forgetDirectBootRecipient();
     } catch (CrumblesKeysException | UncheckedExecutionException e) {
       Log.e(TAG, "Failed to clear active external public key.", e);
       if (e instanceof CrumblesKeysException keysException) {
@@ -159,6 +180,7 @@ public class CrumblesExternalPublicKeyManager {
                       .setActiveKeyId(keyId)
                       .build()),
           CrumblesKeysException.class);
+      forgetDirectBootRecipient();
       Log.i(TAG, "Successfully saved and set active public key with ID: " + keyId);
     } catch (CrumblesKeysException | UncheckedExecutionException e) {
       Log.e(TAG, "Failed to save and encrypt public key.", e);
@@ -166,6 +188,16 @@ public class CrumblesExternalPublicKeyManager {
         throw keysException;
       }
       throw new CrumblesKeysException("Failed to save and encrypt public key", e);
+    }
+  }
+
+  /**
+   * Forgets the recipient that security logs collected before the first unlock after a restart are
+   * encrypted to, once the active key has changed, so that none are encrypted to the replaced key.
+   */
+  private void forgetDirectBootRecipient() {
+    if (context != null) {
+      CrumblesDirectBootStore.forgetRecipient(context);
     }
   }
 
@@ -251,6 +283,39 @@ public class CrumblesExternalPublicKeyManager {
     } catch (CrumblesKeysException | UncheckedExecutionException e) {
       Log.w(TAG, "Could not move the active key to its full ID; it stays under the older one.", e);
     }
+  }
+
+  /**
+   * Retrieves and decrypts every saved external public key, active or not: clearing the active key
+   * keeps it saved, as batches encrypted to it may still be waiting for upload.
+   *
+   * @throws CrumblesKeysException if the preferences cannot be read, if no key is saved under the
+   *     active key ID, or if a saved key cannot be decrypted or parsed
+   */
+  public ImmutableList<PublicKey> getSavedExternalPublicKeys() throws CrumblesKeysException {
+    UserKeyPreferences prefs;
+    try {
+      prefs = Futures.getChecked(dataStore.getDataAsync(), CrumblesKeysException.class);
+    } catch (UncheckedExecutionException e) {
+      throw new CrumblesKeysException("Failed to read the saved external keys.", e);
+    }
+    String activeKeyId = prefs.getActiveKeyId();
+    if (!activeKeyId.isEmpty() && !prefs.containsExternalPublicKeys(activeKeyId)) {
+      throw new CrumblesKeysException("No key is saved under the active key ID.");
+    }
+    ImmutableList.Builder<PublicKey> keys = ImmutableList.builder();
+    for (Map.Entry<String, EncryptedPayload> entry : prefs.getExternalPublicKeysMap().entrySet()) {
+      byte[] decryptedBytes =
+          cryptoManager.decryptDataStoreEntry(
+              entry.getValue(), EXTERNAL_KEY_ENTRY_PREFIX + entry.getKey());
+      try {
+        keys.add(
+            KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(decryptedBytes)));
+      } catch (GeneralSecurityException e) {
+        throw new CrumblesKeysException("Failed to parse a saved external key.", e);
+      }
+    }
+    return keys.build();
   }
 
   /**

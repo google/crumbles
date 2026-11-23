@@ -18,11 +18,11 @@ package com.android.securelogging;
 
 import android.icu.text.MessageFormat;
 import android.security.keystore.UserNotAuthenticatedException;
-import android.support.v4.app.FragmentActivity;
 import android.util.Log;
 import androidx.annotation.Nullable;
 import androidx.biometric.BiometricManager.Authenticators;
 import androidx.biometric.BiometricPrompt;
+import androidx.fragment.app.FragmentActivity;
 import com.android.securelogging.CrumblesLogsEncryptor.BulkDecryptPartition;
 import com.android.securelogging.CrumblesLogsEncryptor.DecryptedLogBatch;
 import com.android.securelogging.exceptions.CrumblesKeysException;
@@ -33,6 +33,7 @@ import com.google.common.collect.Iterables;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Predicate;
 import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
 import javax.security.auth.DestroyFailedException;
@@ -42,11 +43,13 @@ import javax.security.auth.DestroyFailedException;
  * it through {@link BiometricPrompt}.
  *
  * <p>One prompt covers all the batches that the batch-unwrap key covers: its {@code CryptoObject}
- * authorizes the one Keystore operation that unwraps all their keys. Whenever the time window of
- * the Keystore RSA key is closed, another prompt opens it for the other batches. If that key needs
- * an authentication for each operation instead, each of the other batches gets its own prompt, and
- * cancelling one stops the decryption. Batches that no key on this device can decrypt fail without
- * a prompt.
+ * authorizes the one Keystore operation that unwraps all their keys. Without that prompt, a prompt
+ * opens the time window of the Keystore RSA key before its first batch, even if the window is
+ * already open, as after a biometric unlock of the phone. Whenever that window is closed, another
+ * prompt opens it for the other batches. If that key needs an authentication for each operation
+ * instead, each of the other batches gets its own prompt, and cancelling one stops the decryption,
+ * or skips the batches left for a key change, see {@link #forKeyChange}. Batches that no key on
+ * this device can decrypt fail without a prompt.
  */
 final class CrumblesAuthorizedLogDecryptor {
   private static final String TAG = "CrumblesAuthorizedLogDecryptor";
@@ -66,9 +69,9 @@ final class CrumblesAuthorizedLogDecryptor {
     void onDecryptionFailed(LogBatch logBatch, Exception exception);
 
     /**
-     * Called when the user did not authorize the decryption, with the {@link BiometricPrompt}
-     * error code (such as {@link BiometricPrompt#ERROR_USER_CANCELED}) and its message. The
-     * batches not reported yet stay encrypted.
+     * Called when the user did not authorize the decryption, with the {@link BiometricPrompt} error
+     * code (such as {@link BiometricPrompt#ERROR_USER_CANCELED}) and its message. The batches not
+     * reported yet stay encrypted.
      */
     void onNotAuthorized(int errorCode, CharSequence errorMessage);
 
@@ -76,13 +79,51 @@ final class CrumblesAuthorizedLogDecryptor {
     void onFinished();
   }
 
+  /** Handles a prompt that closed without an authentication, given its error code and message. */
+  private interface RefusalHandler {
+    void onRefused(int errorCode, CharSequence errorMessage);
+  }
+
   private final FragmentActivity activity;
   private final CrumblesLogsEncryptor logsEncryptor;
+  private final boolean forKeyChange;
+  private final Predicate<LogBatch> mayBeForAnExternalKey;
   private boolean cancelled;
 
   CrumblesAuthorizedLogDecryptor(FragmentActivity activity, CrumblesLogsEncryptor logsEncryptor) {
+    this(
+        activity,
+        logsEncryptor,
+        /* forKeyChange= */ false,
+        /* mayBeForAnExternalKey= */ logBatch -> false);
+  }
+
+  private CrumblesAuthorizedLogDecryptor(
+      FragmentActivity activity,
+      CrumblesLogsEncryptor logsEncryptor,
+      boolean forKeyChange,
+      Predicate<LogBatch> mayBeForAnExternalKey) {
     this.activity = activity;
     this.logsEncryptor = logsEncryptor;
+    this.forKeyChange = forKeyChange;
+    this.mayBeForAnExternalKey = mayBeForAnExternalKey;
+  }
+
+  /**
+   * Returns a decryptor for the pending logs of a key change, right after the change asked for the
+   * device credential, which opened the time window of the Keystore RSA key: the batches that this
+   * key decrypts need no prompt of their own while that window stays open. The batches that {@link
+   * CrumblesLogsEncryptor#partitionForKeyChange} takes to be for another key, including those that
+   * {@code mayBeForAnExternalKey} accepts, fail without a prompt. Cancelling the prompt that a
+   * batch needs of its own skips it and the batches left, as that prompt says, instead of stopping
+   * the change, which then asks what to do with them.
+   */
+  static CrumblesAuthorizedLogDecryptor forKeyChange(
+      FragmentActivity activity,
+      CrumblesLogsEncryptor logsEncryptor,
+      Predicate<LogBatch> mayBeForAnExternalKey) {
+    return new CrumblesAuthorizedLogDecryptor(
+        activity, logsEncryptor, /* forKeyChange= */ true, mayBeForAnExternalKey);
   }
 
   void cancel() {
@@ -91,7 +132,10 @@ final class CrumblesAuthorizedLogDecryptor {
 
   /** Decrypts {@code logBatches}, asking the user to authorize it as few times as possible. */
   void decrypt(List<LogBatch> logBatches, Callback callback) {
-    BulkDecryptPartition partition = logsEncryptor.partitionForBulkDecrypt(logBatches);
+    BulkDecryptPartition partition =
+        forKeyChange
+            ? logsEncryptor.partitionForKeyChange(logBatches, mayBeForAnExternalKey)
+            : logsEncryptor.partitionForBulkDecrypt(logBatches);
     CrumblesLogsDecryptionException noKey =
         new CrumblesLogsDecryptionException("No key on this device can decrypt this log batch.");
     for (LogBatch logBatch : partition.undecryptable()) {
@@ -108,13 +152,24 @@ final class CrumblesAuthorizedLogDecryptor {
           /* description= */ null,
           unwrapCipher.get(),
           () -> decryptBatchUnwrappable(partition, unwrapCipher.get(), callback),
-          callback);
+          callback::onNotAuthorized);
       return;
     }
     // Without a batch-unwrap cipher, the RSA-wrapped keys still decrypt every batch.
     ImmutableList<LogBatch> rsaBatches =
         ImmutableList.copyOf(Iterables.concat(partition.batchUnwrappable(), partition.rsaOnly()));
-    postToCallback(() -> decryptAllWithRsaKey(rsaBatches, callback));
+    if (forKeyChange || rsaBatches.isEmpty() || logsEncryptor.isKeystoreKeyBoundToEachOperation()) {
+      postToCallback(() -> decryptAllWithRsaKey(rsaBatches, callback));
+      return;
+    }
+    // The device credential reopens the time window of the RSA key first: a biometric that someone
+    // can force onto the sensor may have opened it.
+    authenticate(
+        rsaBatches.size(),
+        /* description= */ null,
+        /* cipher= */ null,
+        () -> decryptWithRsaKey(rsaBatches, /* windowJustOpened= */ true, callback),
+        callback::onNotAuthorized);
   }
 
   /** Returns a cipher for {@code batchUnwrappable}, or empty if there are none or it fails. */
@@ -184,9 +239,9 @@ final class CrumblesAuthorizedLogDecryptor {
 
   /**
    * Decrypts each of {@code rsaBatches} after its own prompt, whose {@code CryptoObject} authorizes
-   * the one RSA operation that unwraps its key. Cancelling a prompt stops the decryption. If the
-   * key turns out to have a time window, which is closed, the batches left are decrypted within its
-   * time window instead.
+   * the one RSA operation that unwraps its key. Cancelling a prompt stops the decryption, or skips
+   * the batches left for a key change. If the key turns out to have a time window, which is closed,
+   * the batches left are decrypted within its time window instead.
    */
   private void decryptEachAfterItsOwnPrompt(List<LogBatch> rsaBatches, Callback callback) {
     for (int i = 0; i < rsaBatches.size(); i++) {
@@ -205,6 +260,7 @@ final class CrumblesAuthorizedLogDecryptor {
         callback.onDecryptionFailed(logBatch, e);
         continue;
       }
+      List<LogBatch> batchesLeft = rsaBatches.subList(i, rsaBatches.size());
       List<LogBatch> later = rsaBatches.subList(i + 1, rsaBatches.size());
       authenticate(
           /* batchCount= */ 1,
@@ -222,8 +278,28 @@ final class CrumblesAuthorizedLogDecryptor {
             }
             decryptEachAfterItsOwnPrompt(later, callback);
           },
-          callback);
+          (errorCode, errorMessage) ->
+              onOwnPromptRefused(batchesLeft, errorCode, errorMessage, callback));
       return;
+    }
+    callback.onFinished();
+  }
+
+  /**
+   * Handles the refusal of the prompt that the first of {@code batchesLeft} needs of its own, which
+   * says that cancelling it skips them all: a key change then goes on without them. Any other
+   * refusal stops the decryption.
+   */
+  private void onOwnPromptRefused(
+      List<LogBatch> batchesLeft, int errorCode, CharSequence errorMessage, Callback callback) {
+    if (!forKeyChange || errorCode != BiometricPrompt.ERROR_USER_CANCELED) {
+      callback.onNotAuthorized(errorCode, errorMessage);
+      return;
+    }
+    CrumblesLogsDecryptionException skipped =
+        new CrumblesLogsDecryptionException("Not decrypted: " + errorMessage);
+    for (LogBatch logBatch : batchesLeft) {
+      callback.onDecryptionFailed(logBatch, skipped);
     }
     callback.onFinished();
   }
@@ -250,7 +326,7 @@ final class CrumblesAuthorizedLogDecryptor {
             /* description= */ null,
             /* cipher= */ null,
             () -> decryptWithRsaKey(remaining, /* windowJustOpened= */ true, callback),
-            callback);
+            callback::onNotAuthorized);
         return;
       } catch (CrumblesKeysException | CrumblesLogsDecryptionException e) {
         callback.onDecryptionFailed(logBatch, e);
@@ -261,15 +337,20 @@ final class CrumblesAuthorizedLogDecryptor {
 
   /**
    * Shows a prompt for {@code batchCount} log batches, with {@code description} if not null, and
-   * runs {@code onAuthorized} once the user authenticates. The prompt authorizes {@code cipher}, or
-   * opens the time window of the RSA key if it is {@code null}.
+   * runs {@code onAuthorized} once the user authenticates, or {@code onRefused} if the prompt
+   * closes without an authentication. The prompt authorizes {@code cipher}, or opens the time
+   * window of the RSA key if it is {@code null}.
+   *
+   * <p>The prompt asks for the device credential only, like {@link CrumblesDeviceCredentialGate}
+   * before every setting change: the keys also accept a strong biometric, but a finger or face that
+   * someone can force onto the sensor must not unlock every batch the phone holds.
    */
   private void authenticate(
       int batchCount,
       @Nullable String description,
       @Nullable Cipher cipher,
       Runnable onAuthorized,
-      Callback callback) {
+      RefusalHandler onRefused) {
     BiometricPrompt.PromptInfo.Builder promptInfo =
         new BiometricPrompt.PromptInfo.Builder()
             .setTitle(activity.getString(R.string.decrypt_logs_prompt_title))
@@ -278,8 +359,7 @@ final class CrumblesAuthorizedLogDecryptor {
                     activity.getString(R.string.decrypt_logs_prompt_subtitle),
                     ImmutableMap.of("count", batchCount)))
             .setDescription(description)
-            .setAllowedAuthenticators(
-                Authenticators.BIOMETRIC_STRONG | Authenticators.DEVICE_CREDENTIAL);
+            .setAllowedAuthenticators(Authenticators.DEVICE_CREDENTIAL);
     BiometricPrompt prompt =
         new BiometricPrompt(
             activity,
@@ -291,7 +371,7 @@ final class CrumblesAuthorizedLogDecryptor {
 
               @Override
               public void onAuthenticationError(int errorCode, CharSequence errorMessage) {
-                postToCallback(() -> callback.onNotAuthorized(errorCode, errorMessage));
+                postToCallback(() -> onRefused.onRefused(errorCode, errorMessage));
               }
             });
     if (cipher == null) {
@@ -312,11 +392,10 @@ final class CrumblesAuthorizedLogDecryptor {
   private void postToCallback(Runnable callbackInvocation) {
     activity
         .getMainExecutor()
-        .execute(
-            () -> {
-              if (!cancelled && !activity.isFinishing() && !activity.isDestroyed()) {
-                callbackInvocation.run();
-              }
-            });
+        .execute(() -> {
+          if (!cancelled && !activity.isFinishing() && !activity.isDestroyed()) {
+            callbackInvocation.run();
+          }
+        });
   }
 }

@@ -24,9 +24,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.support.v4.i18n.DateTimeFormatter;
-import android.support.v4.i18n.DateTimeFormatterSkeletonOptions;
-import android.support.v7.app.AppCompatActivity;
+import android.text.format.DateUtils;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.MenuItem;
@@ -43,6 +41,7 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
+import androidx.appcompat.app.AppCompatActivity;
 import androidx.biometric.BiometricManager.Authenticators;
 import androidx.biometric.BiometricPrompt;
 import androidx.biometric.BiometricPrompt.PromptInfo;
@@ -64,14 +63,6 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
   private static final String TAG = "CrumblesReEncryptKeys";
   public static final String EXTRA_SELECTED_KEY_ALIAS = "selected_key_alias";
   public static final String EXTRA_SELECTED_KEY_IS_INTERNAL = "is_internal_key";
-
-  private static final DateTimeFormatterSkeletonOptions IMPORTED_AT_FORMAT_OPTIONS =
-      new DateTimeFormatterSkeletonOptions.Builder()
-          .setYear(DateTimeFormatterSkeletonOptions.Year.NUMERIC)
-          .setMonth(DateTimeFormatterSkeletonOptions.Month.ABBREVIATED)
-          .setDay(DateTimeFormatterSkeletonOptions.Day.NUMERIC)
-          .setHour(DateTimeFormatterSkeletonOptions.Hour.NUMERIC)
-          .setMinute(DateTimeFormatterSkeletonOptions.Minute.NUMERIC).build();
 
   private CrumblesExternalPublicKeyManager publicKeyManager;
   private List<KeyInfo> availableKeys;
@@ -285,6 +276,7 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
+    CrumblesLauncherEntry.applyToTask(this);
     setContentView(R.layout.activity_re_encrypt_keys);
     CrumblesWindowInsets.applySystemBarPadding(this);
     credentialPrompt = createCredentialPrompt();
@@ -390,8 +382,15 @@ public class CrumblesReEncryptKeysActivity extends AppCompatActivity {
     if (importedAt.isEmpty()) {
       return getString(R.string.re_encrypt_key_imported_time_unknown);
     }
-    DateTimeFormatter f = new DateTimeFormatter(this, IMPORTED_AT_FORMAT_OPTIONS, getResources().getConfiguration().getLocales().get(0));
-    return getString(R.string.re_encrypt_key_imported_at, f.format(importedAt.get().toEpochMilli()));
+    String formatted =
+        DateUtils.formatDateTime(
+            this,
+            importedAt.get().toEpochMilli(),
+            DateUtils.FORMAT_SHOW_DATE
+                | DateUtils.FORMAT_SHOW_YEAR
+                | DateUtils.FORMAT_SHOW_TIME
+                | DateUtils.FORMAT_ABBREV_MONTH);
+    return getString(R.string.re_encrypt_key_imported_at, formatted);
   }
 
   private void startQrScan() {

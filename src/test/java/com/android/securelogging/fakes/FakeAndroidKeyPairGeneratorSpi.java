@@ -126,6 +126,10 @@ public class FakeAndroidKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
     if (this.keyGenParameterSpec.isStrongBoxBacked() && FakeAndroidKeyStoreSpi.isStrongBoxFailing) {
       throw new ProviderException("Failed to generate key pair.");
     }
+    if (this.keyGenParameterSpec.isStrongBoxBacked()
+        && FakeAndroidKeyStoreSpi.strongBoxFailure != null) {
+      throw FakeAndroidKeyStoreSpi.strongBoxFailure;
+    }
 
     KeyPair keyPair = this.standardGenerator.generateKeyPair();
     String alias = this.keyGenParameterSpec.getKeystoreAlias();

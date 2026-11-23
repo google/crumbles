@@ -72,8 +72,26 @@ public final class CrumblesConstants {
    */
   public static final long MAX_DECRYPTION_INPUT_FILE_SIZE_BYTES = 64L * 1024 * 1024;
 
+  /**
+   * Most files that one decryption reads, so that selecting thousands of files cannot keep the app
+   * reading and prompting for a long time.
+   */
+  public static final int MAX_DECRYPTION_FILES_PER_SESSION = 100;
+
+  /**
+   * Most bytes that one decryption reads in total: two of the largest files, so that the batches of
+   * a large selection, and the logs decrypted from them, cannot exhaust the heap together.
+   */
+  public static final long MAX_DECRYPTION_SESSION_BYTES = 2 * MAX_DECRYPTION_INPUT_FILE_SIZE_BYTES;
+
   public static final String PREFS_NAME = "CrumblesPrefs";
   public static final String PREF_UPLOAD_DESTINATION_URI = "uploadDestinationUri";
+
+  /**
+   * Display name of the upload folder, escaped, or empty if its storage provider reported none.
+   * Absent until the provider has been asked, off the UI thread, after the folder was chosen.
+   */
+  public static final String PREF_UPLOAD_FOLDER_NAME = "uploadFolderName";
 
   /** DataStore entry ID that the WebDAV server URL is sealed with. */
   public static final String WEBDAV_SERVER_URL_ENTRY_ID = "remote_storage_config/webdav_server_url";
@@ -145,6 +163,7 @@ public final class CrumblesConstants {
   public static final int NO_SCREEN_LOCK_NOTIFICATION_ID = 2006;
   public static final int KEY_DELETED_NOTIFICATION_ID = 2007;
   public static final int COLLECTION_PAUSED_NOTIFICATION_ID = 2008;
+  public static final int LOSS_REPORTED_NOTIFICATION_ID = 2009;
 
   private CrumblesConstants() {}
 }

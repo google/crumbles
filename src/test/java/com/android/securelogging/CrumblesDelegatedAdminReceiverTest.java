@@ -39,6 +39,7 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Looper;
+import android.provider.Settings;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.work.Configuration;
@@ -149,6 +150,7 @@ public final class CrumblesDelegatedAdminReceiverTest {
     when(mockDpm.retrievePreRebootSecurityLogs(isNull()))
         .thenReturn(ImmutableList.of(securityEvent(SecurityLog.TAG_OS_SHUTDOWN)));
     Context delegateContext = createContextWrapper(context, mockDpm);
+    Settings.Global.putInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 1);
 
     deliverSecurityLogs(delegateContext);
     deliverSecurityLogs(delegateContext);

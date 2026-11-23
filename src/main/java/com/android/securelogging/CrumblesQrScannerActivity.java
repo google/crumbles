@@ -21,11 +21,11 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.view.WindowManager;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
@@ -69,6 +69,7 @@ public class CrumblesQrScannerActivity extends AppCompatActivity {
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
+    CrumblesLauncherEntry.applyToTask(this);
     setContentView(R.layout.activity_qr_scanner);
     CrumblesWindowInsets.applySystemBarPadding(this);
 

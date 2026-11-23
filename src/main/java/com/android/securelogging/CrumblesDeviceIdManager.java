@@ -68,24 +68,42 @@ public final class CrumblesDeviceIdManager {
    * Enables or disables hardware-backed attribution, which stays disabled by default because the
    * resolved identifier is not covered by the batch ciphertext.
    *
-   * <p>A change of the setting changes the device ID, which is the attestation challenge of {@link
-   * CrumblesBatchSigningKey}, so the key is then deleted and the next batch is signed with a new
-   * key attested to the new ID.
+   * <p>A change of the setting that changes the device ID, which is the attestation challenge of
+   * {@link CrumblesBatchSigningKey}, deletes the key, so that the next batch is signed with a new
+   * key attested to the new ID. Without a hardware identifier, the device ID stays the same and so
+   * does the key.
    */
   public static void setHardwareAttributionEnabled(Context ctx, boolean enabled) {
-    Optional<SharedPreferences> prefs = getPreferences(ctx);
-    if (prefs.isEmpty() || isHardwareAttributionEnabled(ctx) == enabled) {
-      return;
+    // Batches are written under UPLOAD_LOCK, so that none pairs the device ID from before the
+    // change with the batch-signing key from after it, or the reverse.
+    synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
+      Optional<SharedPreferences> prefs = getPreferences(ctx);
+      if (prefs.isEmpty() || isHardwareAttributionEnabled(ctx) == enabled) {
+        return;
+      }
+      String formerDeviceId = getDeviceId(ctx);
+      prefs.get().edit().putBoolean(PREF_USE_HARDWARE_SERIAL, enabled).apply();
+      String change = "Hardware attribution " + (enabled ? "enabled" : "disabled");
+      if (getDeviceId(ctx).equals(formerDeviceId)) {
+        CrumblesAppAuditLogger.getInstance(ctx)
+            .logEvent(
+                "BATCH_SIGNING_KEY_KEPT",
+                change + ", but the device ID is unchanged, so the batch-signing key is kept.");
+        return;
+      }
+      rotateBatchSigningKey(ctx, change);
     }
-    prefs.get().edit().putBoolean(PREF_USE_HARDWARE_SERIAL, enabled).apply();
-    rotateBatchSigningKey(ctx, enabled);
   }
 
-  /** Deletes the batch-signing key attested to the former device ID and logs the rotation. */
-  private static void rotateBatchSigningKey(Context ctx, boolean hardwareAttributionEnabled) {
-    String change = "Hardware attribution " + (hardwareAttributionEnabled ? "enabled" : "disabled");
+  /**
+   * Deletes the batch-signing key attested to the former device ID and logs the rotation. The
+   * recipient remembered for the batches collected before the next first unlock is forgotten, since
+   * they would seal the former device ID and attestation chain.
+   */
+  private static void rotateBatchSigningKey(Context ctx, String change) {
+    CrumblesDirectBootStore.forgetRecipient(ctx);
     try {
-      new CrumblesBatchSigningKey(ctx).delete();
+      CrumblesBatchSigner.deleteSigningKey(ctx);
     } catch (CrumblesKeysException e) {
       Log.e(TAG, "Failed to delete the batch-signing key", e);
       CrumblesAppAuditLogger.getInstance(ctx)
@@ -123,8 +141,10 @@ public final class CrumblesDeviceIdManager {
   }
 
   // Suppress "HardwareIds" because Crumbles is an enterprise Device Owner security tool
-  // collecting audit telemetry and requires a hardware identifier for log attribution.
-  @SuppressLint("HardwareIds")
+  // collecting audit telemetry and requires a hardware identifier for log attribution, and
+  // "MissingPermission" because a Device Owner reads the serial number without
+  // READ_PRIVILEGED_PHONE_STATE, which apps cannot hold: other callers get a SecurityException.
+  @SuppressLint({"HardwareIds", "MissingPermission"})
   private static Optional<String> getHardwareSerial() {
     try {
       String serial = Build.getSerial();

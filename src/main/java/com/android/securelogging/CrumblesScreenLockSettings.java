@@ -18,9 +18,7 @@ package com.android.securelogging;
 
 import android.app.admin.DevicePolicyManager;
 import android.content.Intent;
-import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
-import android.content.pm.PackageManager.ResolveInfoFlags;
 import java.util.Optional;
 
 /** Finds the system screen where the user sets a screen lock. */
@@ -33,16 +31,8 @@ final class CrumblesScreenLockSettings {
    * offered instead.
    */
   static Optional<Intent> intent(PackageManager packageManager) {
-    Intent intent = new Intent(DevicePolicyManager.ACTION_SET_NEW_PASSWORD);
-    return packageManager
-        .queryIntentActivities(intent, ResolveInfoFlags.of(PackageManager.MATCH_SYSTEM_ONLY))
-        .stream()
-        .findFirst()
-        .map(
-            resolveInfo -> {
-              ActivityInfo activity = resolveInfo.activityInfo;
-              return intent.setClassName(activity.packageName, activity.name);
-            });
+    return CrumblesSystemActivity.resolve(
+        packageManager, new Intent(DevicePolicyManager.ACTION_SET_NEW_PASSWORD));
   }
 
   private CrumblesScreenLockSettings() {}

@@ -35,8 +35,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Uploads every pending batch now, then deletes from this device every batch that a WebDAV server
  * confirmed, so that the user can clear the device quickly.
  *
- * <p>Batches that could not be uploaded stay on the device, and their number is kept until a later
- * run uploads them or {@link #wipeAllBatches} deletes them.
+ * <p>Batches that could not be uploaded in the two minutes that the upload gets stay on the device,
+ * and their number is kept until a later run uploads them or {@link #wipeAllBatches} deletes them.
  *
  * <p>Batches uploaded to a Storage Access Framework folder stay too. Offline, its provider can
  * accept a batch into its local cache and report it uploaded, and clearing the provider's storage
@@ -54,6 +54,13 @@ public final class CrumblesUploadAndWipeWorker extends Worker {
 
   /** How long an upload and wipe waits for uploads in progress elsewhere to mark their batches. */
   private static final Duration UPLOAD_WAIT = Duration.ofMinutes(1);
+
+  /**
+   * How long the upload of an upload and wipe may take. Past it, the batch in transit and any later
+   * ones stay on the device, so that a destination that paces or stalls the uploads cannot keep the
+   * user waiting for the wipe.
+   */
+  private static final Duration UPLOAD_BUDGET = Duration.ofMinutes(2);
 
   /** How long {@link #wipeAllBatches}, which runs on the main thread, waits for them. */
   static final Duration WIPE_ALL_UPLOAD_WAIT = Duration.ofSeconds(2);
@@ -88,15 +95,17 @@ public final class CrumblesUploadAndWipeWorker extends Worker {
   }
 
   /**
-   * Returns how many batches on this device were never uploaded: pending, being uploaded, or staged
-   * until an encryption key is available.
+   * Returns how many batches on this device were never uploaded: pending, being uploaded, staged
+   * until an encryption key is available, or collected before the first unlock.
    */
   public static int countPendingBatches(Context context) {
     File[] notUploaded =
         listBatches(
             context,
             (dir, name) -> name.endsWith(".bin") && !name.endsWith(CrumblesConstants.SENT_SUFFIX));
-    return notUploaded.length + new CrumblesLogStaging(context).countBatches();
+    return notUploaded.length
+        + new CrumblesLogStaging(context).countBatches()
+        + new CrumblesDirectBootStore(context).batches().size();
   }
 
   /**
@@ -121,15 +130,31 @@ public final class CrumblesUploadAndWipeWorker extends Worker {
         .getInt(PREF_BATCHES_LEFT, /* defValue= */ 0);
   }
 
-  
   @NonNull
   @Override
   public Result doWork() {
     Context context = getApplicationContext();
+    CrumblesTransferDeadline.Budget budget = CrumblesTransferDeadline.Budget.lasting(UPLOAD_BUDGET);
+    try {
+      // Batches that the upload leaves behind, whatever the reason, are counted below.
+      @SuppressWarnings("unused")
+      var unusedUploaded =
+          CrumblesTransferDeadline.within(
+              budget,
+              () ->
+                  CrumblesSendAndMarkProcessingWorker.uploadPendingBatches(
+                      context, () -> isStopped() || budget.isSpent()));
+    } finally {
+      wipeUploadedBatches(context);
+    }
+    return Result.success();
+  }
 
-    // Batches that the upload leaves behind, whatever the reason, are counted below.
-    var _ = CrumblesSendAndMarkProcessingWorker.uploadPendingBatches(context);
-
+  /**
+   * Deletes the batches that a WebDAV server confirmed, and records how many batches stay on the
+   * device.
+   */
+  private static void wipeUploadedBatches(Context context) {
     synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
       // An upload in progress elsewhere would mark its batch as sent only after the wipe.
       CrumblesSendAndMarkProcessingWorker.awaitNoUploadInFlight(UPLOAD_WAIT);
@@ -160,7 +185,9 @@ public final class CrumblesUploadAndWipeWorker extends Worker {
       }
 
       int notUploadedCount = binFiles.length - deletedCount - keptSentCount;
-      int batchesLeft = notUploadedCount + stagedCount;
+      // Batches collected before the unlock that could not be saved yet, as for a full quota.
+      int batchesLeft =
+          notUploadedCount + stagedCount + new CrumblesDirectBootStore(context).batches().size();
       setBatchesLeft(context, batchesLeft);
       CrumblesAppAuditLogger.getInstance(context)
           .logEvent(
@@ -170,7 +197,6 @@ public final class CrumblesUploadAndWipeWorker extends Worker {
                   + " uploaded batch(es). "
                   + batchesLeft
                   + " batch(es) could not be uploaded and are still on this device.");
-      return Result.success();
     }
   }
 
@@ -190,6 +216,7 @@ public final class CrumblesUploadAndWipeWorker extends Worker {
       // Wiping staging first waits for a drain in progress, so the listing sees the files it wrote.
       int deletedCount = new CrumblesLogStaging(context).wipeAllBatches();
       deletedCount += deleteBatches(context, (dir, name) -> name.endsWith(".bin"));
+      deletedCount += new CrumblesDirectBootStore(context).deleteAllBatches();
       setBatchesLeft(context, 0);
       CrumblesAppAuditLogger.getInstance(context)
           .logEvent(

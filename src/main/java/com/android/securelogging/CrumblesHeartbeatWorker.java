@@ -53,8 +53,12 @@ public class CrumblesHeartbeatWorker extends Worker {
   public Result doWork() {
     Context context = getApplicationContext();
     Optional<Instant> lastSignedAt = new CrumblesBatchSigner(context).lastSignedAt();
+    Instant now = InstantSource.system().instant();
+    // A batch signed later than now is overdue too: otherwise setting the clock forward while a
+    // batch is signed, then back, would silence the heartbeats until the clock caught up.
     if (lastSignedAt.isPresent()
-        && InstantSource.system().instant().isBefore(lastSignedAt.get().plus(HEARTBEAT_INTERVAL))) {
+        && !lastSignedAt.get().isAfter(now)
+        && now.isBefore(lastSignedAt.get().plus(HEARTBEAT_INTERVAL))) {
       return Result.success();
     }
     CrumblesDeviceAdminReceiver.saveHeartbeatBatch(context);

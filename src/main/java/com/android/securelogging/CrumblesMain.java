@@ -39,8 +39,6 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
-import android.support.v4.app.FragmentActivity;
-import android.support.v7.app.AlertDialog;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.util.Log;
@@ -56,25 +54,30 @@ import android.widget.Toast;
 import androidx.annotation.Nullable;
 import androidx.annotation.StringRes;
 import androidx.annotation.VisibleForTesting;
+import androidx.appcompat.app.AlertDialog;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.documentfile.provider.DocumentFile;
+import androidx.fragment.app.FragmentActivity;
+import androidx.lifecycle.LiveData;
+import androidx.work.WorkInfo;
 import androidx.work.WorkManager;
 import com.android.securelogging.CrumblesLogsEncryptor.DecryptedLogBatch;
+import com.android.securelogging.CrumblesSendAndMarkProcessingWorker.UploadDestination;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.audit.CrumblesAuditLogViewerActivity;
 import com.android.securelogging.exceptions.CrumblesKeysException;
-import com.google.android.libraries.security.content.SafeContentResolver;
-import com.google.android.libraries.security.content.SafeContentResolver.SourcePolicy;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.google.common.base.Ascii;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.ByteStreams;
 import com.google.common.util.concurrent.Futures;
 import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -93,6 +96,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import javax.net.ssl.SSLSocketFactory;
 
@@ -103,23 +107,67 @@ public class CrumblesMain extends FragmentActivity {
 
   private final ExecutorService webDavProbeExecutor = Executors.newSingleThreadExecutor();
   private final ExecutorService keyProbeExecutor = Executors.newSingleThreadExecutor();
+  private final ExecutorService destinationHandoverExecutor = Executors.newSingleThreadExecutor();
+  private final ExecutorService decryptionInputExecutor = Executors.newSingleThreadExecutor();
   @Nullable @VisibleForTesting AlertDialog webDavDialog;
+  @Nullable private AlertDialog storageTypeDialog;
   @Nullable private AlertDialog serverKeyPinDialog;
   private CrumblesExternalPublicKeyManager publicKeyManager;
   private TextView encryptionKeyStatusTextView;
+
+  /** Reads the upload folder's name off the UI thread, as its storage provider may never answer. */
+  private final ExecutorService folderNameExecutor = Executors.newSingleThreadExecutor();
+
+  private boolean isReadingFolderName;
   private TextView uploadDestinationStatusTextView;
+
+  /** What WorkManager reports of the upload and wipe, queued, running or finished. */
+  private LiveData<List<WorkInfo>> uploadAndWipeWork;
+
   @Nullable private SelectedLogsCallback selectedLogsCallback;
+
+  /** Counts selections to decrypt and stops, so that files read for an earlier one are dropped. */
+  private int decryptionInputGeneration;
+
   @Nullable private ConfirmedServerKey lastConfirmedPin;
 
+  /** Whether the destination change that runs now was handed over to the current destination. */
+  private boolean destinationHandedOver;
+
+  /** Asks whether to change the destination although the current one missed the notice. */
+  @Nullable private AlertDialog handoverFailedDialog;
+
+  /** Shows that a notice of the destination change is being sent, while the screen waits for it. */
+  @Nullable private AlertDialog handoverProgressDialog;
+
+  /**
+   * Counts the times that the screen was left while it waited for a destination hand-over, which
+   * then neither asks about nor makes the change.
+   */
+  private int destinationChangeGeneration;
+
+  /** Counts the destination hand-overs whose outcome the main thread has not received yet. */
+  private int handoversInFlight;
+
   private static final class ConfirmedServerKey {
-    final String serverUrl;
+    final String serverOrigin;
     final WebDavServerKeyPin pin;
 
     ConfirmedServerKey(String serverUrl, WebDavServerKeyPin pin) {
-      this.serverUrl = serverUrl;
+      this.serverOrigin = WebDavStorageUploader.serverOrigin(serverUrl);
       this.pin = pin;
     }
+
+    /** Returns whether {@code serverUrl} names the server, at the same port, that confirmed it. */
+    boolean isFor(String serverUrl) {
+      return serverOrigin.equals(WebDavStorageUploader.serverOrigin(serverUrl));
+    }
   }
+
+  /**
+   * A server key that the user confirmed, and the warning to give if the server presents another.
+   */
+  private record KnownServerKey(WebDavServerKeyPin pin, String changeWarning) {}
 
   // Suppress "StaticFieldLeak" because CrumblesLogsEncryptor only holds the application context
   // or a null context, so retaining it in a static field does not cause an Activity leak.
@@ -168,18 +216,49 @@ public class CrumblesMain extends FragmentActivity {
   @Override
   public void onStop() {
     super.onStop();
+    // The logs decrypted from files that are still being read would only be wiped.
+    decryptionInputGeneration++;
     if (selectedLogsCallback != null) {
       selectedLogsCallback.wipe();
       selectedLogsCallback = null;
     }
-    dismissDialog(webDavDialog);
+    abandonOpenDestinationDialogs();
     Log.d(TAG, "stopped");
+  }
+
+  /**
+   * Closes the destination dialogs that a confirmed device credential opened, so that whoever
+   * unlocks the phone next cannot finish the change, and records that it was abandoned.
+   */
+  private void abandonOpenDestinationDialogs() {
+    if ((isShowing(storageTypeDialog) || isShowing(webDavDialog))
+        && !isShowing(handoverProgressDialog)
+        && !isShowing(handoverFailedDialog)) {
+      CrumblesAppAuditLogger.getInstance(this)
+          .logEvent(
+              "UPLOAD_DESTINATION_ABANDONED",
+              "Upload destination unchanged because the app left the screen before a new one"
+                  + " was chosen.");
+    }
+    dismissDialog(storageTypeDialog);
+    dismissDialog(webDavDialog);
+    // Leaving the screen, for example when it locks, keeps the current upload destination.
+    abandonDestinationHandover();
+    dismissDialog(handoverFailedDialog);
+  }
+
+  private static boolean isShowing(@Nullable AlertDialog dialog) {
+    return dialog != null && dialog.isShowing();
   }
 
   @Override
   protected void onDestroy() {
+    folderNameExecutor.shutdown();
     webDavProbeExecutor.shutdownNow();
     keyProbeExecutor.shutdown();
+    // A handover in progress still finishes, so that the activity log records its outcome.
+    destinationHandoverExecutor.shutdown();
+    decryptionInputExecutor.shutdownNow();
     dismissDialog(webDavDialog);
     super.onDestroy();
   }
@@ -195,6 +274,7 @@ public class CrumblesMain extends FragmentActivity {
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
+    CrumblesLauncherEntry.applyToTask(this);
     if (!CrumblesSetupActivity.isAcknowledged(this)) {
       // Nothing on the main screen runs until the user has read what Crumbles collects.
       startActivity(new Intent(this, CrumblesSetupActivity.class));
@@ -272,6 +352,7 @@ public class CrumblesMain extends FragmentActivity {
     updateUploadIssueUi();
     updateWipeAnywayButton();
     updateScreenLockWarning();
+    updateAlertsBlockedWarning();
     updateDeviceAdminOffer();
   }
 
@@ -284,6 +365,13 @@ public class CrumblesMain extends FragmentActivity {
         dpm != null && dpm.getPasswordComplexity() == DevicePolicyManager.PASSWORD_COMPLEXITY_NONE;
     findViewById(R.id.screen_lock_warning)
         .setVisibility(hasNoScreenLock ? View.VISIBLE : View.GONE);
+  }
+
+  /** Shows a warning while the user has turned off the alerts that collection stopped. */
+  private void updateAlertsBlockedWarning() {
+    findViewById(R.id.alerts_blocked_warning)
+        .setVisibility(
+            CrumblesLoggingWatchdogWorker.areAlertsBlocked(this) ? View.VISIBLE : View.GONE);
   }
 
   /**
@@ -304,7 +392,10 @@ public class CrumblesMain extends FragmentActivity {
     findViewById(R.id.device_admin_offer).setVisibility(offer ? View.VISIBLE : View.GONE);
   }
 
-  /** Opens the system screen that asks the user to activate Crumbles as a device admin. */
+  /**
+   * Opens the system screen that asks the user to activate Crumbles as a device admin, never the
+   * screen of another app that claims the action.
+   */
   private void requestDeviceAdminActivation() {
     Intent intent =
         new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
@@ -313,7 +404,9 @@ public class CrumblesMain extends FragmentActivity {
                 DevicePolicyManager.EXTRA_ADD_EXPLANATION,
                 getString(R.string.device_admin_explanation));
     try {
-      startActivity(intent);
+      startActivity(
+          CrumblesSystemActivity.resolve(getPackageManager(), intent)
+              .orElseThrow(ActivityNotFoundException::new));
     } catch (ActivityNotFoundException e) {
       // Modified ROMs can ship without a system activity for ACTION_ADD_DEVICE_ADMIN.
       Log.e(TAG, "Failed to open the device admin activation screen", e);
@@ -494,6 +587,7 @@ public class CrumblesMain extends FragmentActivity {
                     CrumblesConstants.PREF_LAST_OBSERVED_LOGGING_ENABLED, true);
               }
               observedLogging.apply();
+              CrumblesLoggingWatchdogWorker.recordLoggingTurnedOn(this);
               CrumblesDeviceAdminReceiver.bumpLoggingEnableEpoch(this);
               CrumblesDeviceAdminReceiver.syncDisallowAddUserRestriction(this, /* enabled= */ true);
               showToast("Logging enabled");
@@ -682,6 +776,7 @@ public class CrumblesMain extends FragmentActivity {
       CrumblesLauncherEntry.showDefault(this);
       showToast(getString(R.string.toast_neutral_launcher_off));
     }
+    CrumblesLauncherEntry.applyToTask(this);
   }
 
   private void setDecryptLogsButton() {
@@ -700,8 +795,8 @@ public class CrumblesMain extends FragmentActivity {
   }
 
   /**
-   * Wires "Upload now and wipe", and "Wipe anyway", which shows while the last upload and wipe has
-   * left batches on this device.
+   * Wires "Upload now and wipe", and "Wipe anyway", which shows while an upload and wipe is queued
+   * or running, or has left batches on this device.
    */
   private void setUpUploadAndWipe() {
     findViewById(R.id.btn_upload_and_wipe)
@@ -720,14 +815,20 @@ public class CrumblesMain extends FragmentActivity {
                           : R.string.toast_upload_and_wipe_started_folder));
             });
     findViewById(R.id.btn_wipe_anyway).setOnClickListener(v -> onWipeAnywayClicked());
-    WorkManager.getInstance(this)
-        .getWorkInfosForUniqueWorkLiveData(CrumblesUploadAndWipeWorker.UNIQUE_WORK_NAME)
-        .observe(this, workInfos -> updateWipeAnywayButton());
+    uploadAndWipeWork =
+        WorkManager.getInstance(this)
+            .getWorkInfosForUniqueWorkLiveData(CrumblesUploadAndWipeWorker.UNIQUE_WORK_NAME);
+    uploadAndWipeWork.observe(this, workInfos -> updateWipeAnywayButton());
   }
 
   private void updateWipeAnywayButton() {
     Button wipeAnywayButton = findViewById(R.id.btn_wipe_anyway);
     int notUploadedCount = CrumblesUploadAndWipeWorker.getBatchesLeft(this);
+    if (isUploadAndWipeUnfinished()) {
+      // The upload can take minutes, while the user may have to clear the phone at once.
+      notUploadedCount =
+          Math.max(notUploadedCount, CrumblesUploadAndWipeWorker.countPendingBatches(this));
+    }
     int keptSentCount = CrumblesUploadAndWipeWorker.countKeptSafBatches(this);
 
     if (notUploadedCount > 0) {
@@ -761,6 +862,13 @@ public class CrumblesMain extends FragmentActivity {
     } else {
       textKeptCopies.setVisibility(View.GONE);
     }
+  }
+
+  /** Returns whether an upload and wipe is queued or running, as WorkManager last reported. */
+  private boolean isUploadAndWipeUnfinished() {
+    List<WorkInfo> workInfos = uploadAndWipeWork.getValue();
+    return workInfos != null
+        && workInfos.stream().anyMatch(workInfo -> !workInfo.getState().isFinished());
   }
 
   private void onWipeAnywayClicked() {
@@ -827,6 +935,39 @@ public class CrumblesMain extends FragmentActivity {
         data.getFlags()
             & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
     getContentResolver().takePersistableUriPermission(uri, takeFlags);
+  }
+
+  /**
+   * Releases the persisted grant of every folder but {@code keptTreeUri}. Uploads no longer use
+   * them, and a documents provider could otherwise have an upload write to one of them. While a
+   * destination hand-over runs, which may still write its notice to the outgoing folder under that
+   * folder's grant, this waits until none runs, and then keeps the upload folder saved by then.
+   */
+  private void releaseFolderGrantsOtherThan(@Nullable Uri keptTreeUri) {
+    if (handoversInFlight > 0) {
+      // The executor runs one task at a time, in order, so this comes after the hand-overs.
+      destinationHandoverExecutor.execute(
+          () -> runOnUiThread(() -> releaseFolderGrantsOtherThan(readUploadFolder())));
+      return;
+    }
+    ContentResolver resolver = getContentResolver();
+    for (UriPermission grant : ImmutableList.copyOf(resolver.getPersistedUriPermissions())) {
+      if (!grant.getUri().equals(keptTreeUri)) {
+        resolver.releasePersistableUriPermission(
+            grant.getUri(),
+            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+      }
+    }
+  }
+
+  /** Returns the upload folder saved now, or {@code null} if the destination is not a folder. */
+  @Nullable
+  private Uri readUploadFolder() {
+    UploadDestination destination = CrumblesSendAndMarkProcessingWorker.readUploadDestination(this);
+    return destination.config().getStorageType().equals(StorageType.STORAGE_TYPE_WEBDAV)
+            || destination.folderUri() == null
+        ? null
+        : Uri.parse(destination.folderUri());
   }
 
   /* onActivityResult triggers the biometric prompt instead of directly processing files. */
@@ -963,6 +1104,11 @@ public class CrumblesMain extends FragmentActivity {
         showToast(getString(R.string.toast_upload_dest_invalid_uri));
         return;
       }
+      if (!readyToChangeDestination(
+          "a folder of storage provider " + treeUri.getAuthority(),
+          () -> handleFileTreeResult(resultCode, data))) {
+        return;
+      }
 
       try {
         // Replacing the whole config also deletes any sealed WebDAV credentials.
@@ -979,7 +1125,9 @@ public class CrumblesMain extends FragmentActivity {
       getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
           .edit()
           .putString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, treeUri.toString())
+          .remove(CrumblesConstants.PREF_UPLOAD_FOLDER_NAME)
           .apply();
+      releaseFolderGrantsOtherThan(treeUri);
 
       CrumblesAppAuditLogger.getInstance(this)
           .logEvent(
@@ -994,6 +1142,193 @@ public class CrumblesMain extends FragmentActivity {
     } else {
       showToast(getString(R.string.toast_upload_dest_set_cancelled));
     }
+  }
+
+  /**
+   * Returns whether the upload destination may change now: no external key is active, no
+   * destination is set, or the change was just handed over. Otherwise hands the change over first:
+   * uploads a notice of it, sealed to the active external key, to the current destination, so that
+   * the holder of the key learns where later batches go. That runs off the main thread, behind a
+   * progress dialog, and this returns false. Then {@code retry}, which repeats the change, runs on
+   * the main thread, unless the screen was left meanwhile or, if nothing confirms that the notice
+   * reached the current destination, the user does not confirm the change.
+   */
+  private boolean readyToChangeDestination(String newDestination, Runnable retry) {
+    if (destinationHandedOver
+        || !CrumblesExternalPublicKeyManager.getInstance(this).isExternalKeySelected()) {
+      return true;
+    }
+    // Read once, so that the notices go to this destination even after the change saves another.
+    UploadDestination outgoing = CrumblesSendAndMarkProcessingWorker.readUploadDestination(this);
+    if (!outgoing.isConfigured()) {
+      return true;
+    }
+    String changeDescription = "Changing the upload destination to " + newDestination;
+    handOverInBackground(
+        changeDescription,
+        outgoing,
+        android.R.string.cancel,
+        outcome -> {
+          switch (outcome) {
+            // Only a WebDAV server confirms a notice: a storage app can serve one it never syncs.
+            case UPLOADED_UNCONFIRMED, UPLOADED_OFFLINE, UPLOAD_FAILED, NOT_SEALED ->
+                confirmChangeWithoutHandover(changeDescription, outgoing, outcome, retry);
+            case NOT_NEEDED, UPLOADED, KEPT_ON_DEVICE -> commitDestinationChange(retry);
+          }
+        });
+    return false;
+  }
+
+  /**
+   * Hands the change that {@code changeDescription} describes over to {@code outgoing} off the main
+   * thread, behind a progress dialog, then passes the outcome to {@code onOutcome} on the main
+   * thread. The dialog's {@code stopWaitingLabel} button passes {@link
+   * CrumblesKeyHandover.Outcome#UPLOAD_FAILED} at once instead, so that a storage provider that
+   * never answers cannot hold up the change. The hand-over still seals its notice and records its
+   * outcome then, but uploads the notice only if its upload had started already. Leaving or closing
+   * the screen meanwhile keeps the current destination.
+   */
+  private void handOverInBackground(
+      String changeDescription,
+      UploadDestination outgoing,
+      @StringRes int stopWaitingLabel,
+      Consumer<CrumblesKeyHandover.Outcome> onOutcome) {
+    AlertDialog progressDialog =
+        new AlertDialog.Builder(this)
+            .setMessage(R.string.dialog_message_handing_over_destination)
+            .setNegativeButton(stopWaitingLabel, null)
+            .setCancelable(false)
+            .create();
+    handoverProgressDialog = progressDialog;
+    int generation = destinationChangeGeneration;
+    // Set on the main thread once the user stopped waiting, or the outcome arrived.
+    AtomicBoolean settled = new AtomicBoolean();
+    showSecureDialog(progressDialog);
+    progressDialog
+        .getButton(AlertDialog.BUTTON_NEGATIVE)
+        .setOnClickListener(v -> {
+          if (!settled.getAndSet(true)) {
+            progressDialog.dismiss();
+            onOutcome.accept(CrumblesKeyHandover.Outcome.UPLOAD_FAILED);
+          }
+        });
+    handoversInFlight++;
+    destinationHandoverExecutor.execute(() -> {
+      CrumblesKeyHandover.Outcome outcome =
+          CrumblesKeyHandover.handOverDestination(
+              this, changeDescription, outgoing, /* shouldUpload= */ () -> !settled.get());
+      runOnUiThread(() -> {
+        handoversInFlight--;
+        // The user stopped waiting, or left the screen, which recorded the abandoned change.
+        if (settled.getAndSet(true) || generation != destinationChangeGeneration) {
+          return;
+        }
+        // A destroyed screen no longer shows the dialog.
+        if (!isDestroyed()) {
+          progressDialog.dismiss();
+        }
+        // A screen that closed meanwhile does not change the destination after the fact.
+        if (isDestroyed() || isFinishing()) {
+          abandonDestinationChange(outcome);
+          return;
+        }
+        onOutcome.accept(outcome);
+      });
+    });
+  }
+
+  /**
+   * Stops waiting for the destination hand-over in progress, if any, so that its outcome neither
+   * asks about nor makes the change, and records that the destination stays.
+   */
+  private void abandonDestinationHandover() {
+    if (handoverProgressDialog == null || !handoverProgressDialog.isShowing()) {
+      return;
+    }
+    destinationChangeGeneration++;
+    handoverProgressDialog.dismiss();
+    CrumblesAppAuditLogger.getInstance(this)
+        .logEvent(
+            "UPLOAD_DESTINATION_ABANDONED",
+            "Upload destination unchanged because the app left the screen while the change was"
+                + " handed over.");
+  }
+
+  /**
+   * Asks whether to change the upload destination although nothing confirms that {@code outgoing}
+   * got the notice of the change that {@code changeDescription} describes, as {@code outcome} says.
+   * Changing anyway records that choice and hands the change over again: the next notice sealed
+   * carries the record to {@code outgoing}, which later batches no longer reach. Then it runs {@code
+   * retry}. Closing the dialog in any other way, also by leaving the screen, keeps the current
+   * destination.
+   */
+  private void confirmChangeWithoutHandover(
+      String changeDescription,
+      UploadDestination outgoing,
+      CrumblesKeyHandover.Outcome outcome,
+      Runnable retry) {
+    AlertDialog dialog =
+        new AlertDialog.Builder(this)
+            .setMessage(describeMissedHandover(outcome))
+            .setPositiveButton(R.string.dialog_destination_not_handed_over_confirm, null)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setOnDismissListener(d -> abandonDestinationChange(outcome))
+            .create();
+    handoverFailedDialog = dialog;
+    showSecureDialog(dialog);
+    dialog
+        .getButton(AlertDialog.BUTTON_POSITIVE)
+        .setOnClickListener(v -> {
+          dialog.setOnDismissListener(null);
+          dialog.dismiss();
+          CrumblesAppAuditLogger.getInstance(this)
+              .logEvent(
+                  "DESTINATION_CHANGED_WITHOUT_HANDOVER",
+                  "The user chose to change the upload destination although the outgoing"
+                      + " destination did not confirm the handover notice ("
+                      + outcome
+                      + ").");
+          // Sealed after that record, the second notice carries it, unless the first one is sealed
+          // only now.
+          handOverInBackground(
+              changeDescription
+                  + " anyway, although the outgoing destination did not confirm the first notice ("
+                  + outcome
+                  + ")",
+              outgoing,
+              R.string.dialog_destination_change_now,
+              unused -> commitDestinationChange(retry));
+        });
+  }
+
+  /** Returns the message that asks whether to change the destination after {@code outcome}. */
+  @StringRes
+  private static int describeMissedHandover(CrumblesKeyHandover.Outcome outcome) {
+    return switch (outcome) {
+      case UPLOADED_UNCONFIRMED -> R.string.dialog_destination_handover_unconfirmed_message;
+      case UPLOADED_OFFLINE -> R.string.dialog_destination_handover_offline_message;
+      default -> R.string.dialog_destination_not_handed_over_message;
+    };
+  }
+
+  /** Runs {@code retry}, which repeats a destination change, without handing it over again. */
+  private void commitDestinationChange(Runnable retry) {
+    destinationHandedOver = true;
+    try {
+      retry.run();
+    } finally {
+      destinationHandedOver = false;
+    }
+  }
+
+  /** Records that the upload destination stays unchanged although its change was handed over. */
+  private void abandonDestinationChange(CrumblesKeyHandover.Outcome outcome) {
+    CrumblesAppAuditLogger.getInstance(this)
+        .logEvent(
+            "UPLOAD_DESTINATION_ABANDONED",
+            "Upload destination unchanged: the change was abandoned after its handover ("
+                + outcome
+                + ").");
   }
 
   /**
@@ -1022,7 +1357,7 @@ public class CrumblesMain extends FragmentActivity {
         new CharSequence[] {
           getString(R.string.storage_type_folder), getString(R.string.storage_type_webdav),
         };
-    showSecureDialog(
+    storageTypeDialog =
         new AlertDialog.Builder(this)
             .setTitle(R.string.storage_type_dialog_title)
             .setItems(
@@ -1035,7 +1370,8 @@ public class CrumblesMain extends FragmentActivity {
                   }
                 })
             .setNegativeButton(android.R.string.cancel, null)
-            .create());
+            .create();
+    showSecureDialog(storageTypeDialog);
   }
 
   /** Shows the WebDAV settings dialog, which starts empty because saved values are sealed. */
@@ -1152,7 +1488,7 @@ public class CrumblesMain extends FragmentActivity {
       commitWebDavConfig(dialog, config, /* serverKeyPin= */ null);
       return;
     }
-    if (lastConfirmedPin != null && lastConfirmedPin.serverUrl.equals(serverUrl)) {
+    if (lastConfirmedPin != null && lastConfirmedPin.isFor(serverUrl)) {
       commitWebDavConfig(dialog, config, lastConfirmedPin.pin);
       return;
     }
@@ -1166,7 +1502,7 @@ public class CrumblesMain extends FragmentActivity {
    */
   private void confirmServerKeyPin(
       String serverUrl, Runnable onDismiss, Consumer<WebDavServerKeyPin> onConfirmed) {
-    WebDavServerKeyPin knownKey = knownServerKey(serverUrl);
+    KnownServerKey knownKey = knownServerKey(serverUrl);
     lastConfirmedPin = null;
     dismissDialog(serverKeyPinDialog);
     serverKeyPinDialog =
@@ -1188,13 +1524,14 @@ public class CrumblesMain extends FragmentActivity {
   }
 
   /**
-   * Returns the key already confirmed for {@code serverUrl} in this dialog or in stored settings,
-   * or {@code null} if none matches {@code serverUrl}.
+   * Returns the key already confirmed for the server of {@code serverUrl}, at the same scheme, host
+   * and port, in this dialog or in stored settings, or {@code null} if none was.
    */
   @Nullable
-  private WebDavServerKeyPin knownServerKey(String serverUrl) {
-    if (lastConfirmedPin != null && lastConfirmedPin.serverUrl.equals(serverUrl)) {
-      return lastConfirmedPin.pin;
+  private KnownServerKey knownServerKey(String serverUrl) {
+    if (lastConfirmedPin != null && lastConfirmedPin.isFor(serverUrl)) {
+      return new KnownServerKey(
+          lastConfirmedPin.pin, getString(R.string.webdav_server_key_changed));
     }
     RemoteStorageConfig config = readRemoteStorageConfig();
     if (config.getWebdavServerKeySha256().getCiphertext().isEmpty()) {
@@ -1207,12 +1544,18 @@ public class CrumblesMain extends FragmentActivity {
               encryptor.decryptDataStoreEntry(
                   config.getWebdavServerUrl(), CrumblesConstants.WEBDAV_SERVER_URL_ENTRY_ID),
               UTF_8);
-      return storedUrl.equals(serverUrl)
-          ? WebDavServerKeyPin.ofSha256(
+      if (!WebDavStorageUploader.serverOrigin(storedUrl)
+          .equals(WebDavStorageUploader.serverOrigin(serverUrl))) {
+        return null;
+      }
+      WebDavServerKeyPin storedPin =
+          WebDavServerKeyPin.ofSha256(
               encryptor.decryptDataStoreEntry(
                   config.getWebdavServerKeySha256(),
-                  CrumblesConstants.WEBDAV_SERVER_KEY_SHA256_ENTRY_ID))
-          : null;
+                  CrumblesConstants.WEBDAV_SERVER_KEY_SHA256_ENTRY_ID));
+      return new KnownServerKey(
+          storedPin,
+          getString(R.string.webdav_server_key_differs_from_saved, storedPin.fingerprint()));
     } catch (CrumblesKeysException | IllegalArgumentException e) {
       Log.w(TAG, "Failed to read the pinned WebDAV server key", e);
       return null;
@@ -1235,7 +1578,7 @@ public class CrumblesMain extends FragmentActivity {
   private void offerServerKeyPin(
       AlertDialog dialog,
       String serverUrl,
-      @Nullable WebDavServerKeyPin knownKey,
+      @Nullable KnownServerKey knownKey,
       Optional<WebDavServerKeyPin> serverKeyPin,
       Consumer<WebDavServerKeyPin> onConfirmed) {
     if (!dialog.isShowing()) {
@@ -1246,7 +1589,7 @@ public class CrumblesMain extends FragmentActivity {
       return;
     }
     if (knownKey != null) {
-      if (knownKey.equals(serverKeyPin.get())) {
+      if (knownKey.pin().equals(serverKeyPin.get())) {
         dialog.setOnDismissListener(null);
         dialog.dismiss();
         lastConfirmedPin = new ConfirmedServerKey(serverUrl, serverKeyPin.get());
@@ -1254,10 +1597,9 @@ public class CrumblesMain extends FragmentActivity {
         return;
       }
       dialog.setMessage(
-          getString(R.string.webdav_server_key_changed)
+          knownKey.changeWarning()
               + getString(
-                  R.string.webdav_server_key_dialog_message,
-                  serverKeyPin.get().fingerprint()));
+                  R.string.webdav_server_key_dialog_message, serverKeyPin.get().fingerprint()));
     } else {
       dialog.setMessage(
           getString(
@@ -1277,10 +1619,15 @@ public class CrumblesMain extends FragmentActivity {
 
   /**
    * Seals {@code serverKeyPin} (if any) into {@code config}, saves the upload destination, and
-   * closes {@code dialog}.
+   * closes {@code dialog}, once the change is handed over to the current destination.
    */
   private void commitWebDavConfig(
       AlertDialog dialog, RemoteStorageConfig config, @Nullable WebDavServerKeyPin serverKeyPin) {
+    RemoteStorageConfig unpinnedConfig = config;
+    if (!readyToChangeDestination(
+        "a WebDAV server", () -> commitWebDavConfig(dialog, unpinnedConfig, serverKeyPin))) {
+      return;
+    }
     try {
       if (serverKeyPin != null) {
         config =
@@ -1298,6 +1645,7 @@ public class CrumblesMain extends FragmentActivity {
       showToast(getString(R.string.toast_upload_dest_save_failed));
       return;
     }
+    releaseFolderGrantsOtherThan(/* keptTreeUri= */ null);
     dialog.dismiss();
     // The server URL stays out of the audit trail because it can name the account.
     CrumblesAppAuditLogger.getInstance(this)
@@ -1506,12 +1854,17 @@ public class CrumblesMain extends FragmentActivity {
   }
 
   /**
-   * Returns the status text for a configured upload folder. It names the folder when its storage
-   * provider reports a display name, and the app that holds the folder when that app is installed,
-   * so the user can see which app receives the logs.
+   * Returns the status text for a configured upload folder. It names the folder once its storage
+   * provider has reported a display name, and the app that holds the folder when that app is
+   * installed, so the user can see which app receives the logs.
    */
   private String describeConfiguredUploadDestination(Uri treeUri) {
-    String folderName = readUploadFolderName(treeUri);
+    String folderName =
+        getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(CrumblesConstants.PREF_UPLOAD_FOLDER_NAME, /* defValue= */ null);
+    if (folderName == null && !isReadingFolderName) {
+      readUploadFolderNameInBackground(treeUri);
+    }
     PackageManager packageManager = getPackageManager();
     ProviderInfo storageProvider =
         packageManager.resolveContentProvider(treeUri.getAuthority(), /* flags= */ 0);
@@ -1535,8 +1888,35 @@ public class CrumblesMain extends FragmentActivity {
   }
 
   /**
+   * Reads the display name of the upload folder in the background and stores it, so that the main
+   * screen shows it from then on without asking the storage provider again.
+   */
+  private void readUploadFolderNameInBackground(Uri treeUri) {
+    isReadingFolderName = true;
+    folderNameExecutor.execute(
+        () -> {
+          String folderName = Strings.nullToEmpty(readUploadFolderName(treeUri));
+          runOnUiThread(() -> storeUploadFolderName(treeUri, folderName));
+        });
+  }
+
+  /** Stores and shows {@code folderName} unless the user chose another folder in the meantime. */
+  private void storeUploadFolderName(Uri treeUri, String folderName) {
+    isReadingFolderName = false;
+    SharedPreferences preferences =
+        getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE);
+    if (treeUri
+        .toString()
+        .equals(preferences.getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, null))) {
+      preferences.edit().putString(CrumblesConstants.PREF_UPLOAD_FOLDER_NAME, folderName).apply();
+      updateUploadDestinationStatusUi();
+    }
+  }
+
+  /**
    * Returns the display name that the storage provider reports for the upload folder, if any,
-   * {@link CrumblesDeviceAdminReceiver#escapeLabel escaped and capped} since the provider chooses it.
+   * {@link CrumblesDeviceAdminReceiver#escapeLabel escaped and capped} since the provider chooses
+   * it. The provider may never answer, so this must not run on the UI thread.
    */
   @Nullable
   private String readUploadFolderName(Uri treeUri) {
@@ -1623,13 +2003,9 @@ public class CrumblesMain extends FragmentActivity {
 
       } else if (Objects.equals(scheme, ContentResolver.SCHEME_CONTENT)) {
         rejectIfDeclaredSizeExceedsLimit(uri);
-        // For content:// URIs, use SafeContentResolver as intended for external content.
-        Log.d(TAG, "Opening content URI via SafeContentResolver: " + uri);
-        inputStream = SafeContentResolver.openInputStream(this, uri, SourcePolicy.EXTERNAL_ONLY);
-        if (inputStream == null) {
-          throw new FileNotFoundException(
-              "SafeContentResolver.openInputStream returned null for content URI: " + uri);
-        }
+        // For content:// URIs, enforce external-only provider checks before opening the stream.
+        Log.d(TAG, "Opening content URI via CrumblesExternalContentResolver: " + uri);
+        inputStream = CrumblesExternalContentResolver.openInputStream(this, uri);
       } else {
         Log.w(TAG, "Unsupported URI scheme for reading: " + scheme + " for URI: " + uri);
         throw new IOException("Unsupported URI scheme: " + scheme);
@@ -1691,8 +2067,8 @@ public class CrumblesMain extends FragmentActivity {
   }
 
   /**
-   * Reads the selected log files, then decrypts them together after the prompts that their keys
-   * need, and shows the decrypted logs.
+   * Reads the selected log files off the UI thread, then decrypts them together after the prompts
+   * that their keys need, and shows the decrypted logs.
    */
   protected void processSelectedFilesForDecryption(List<Uri> uris) {
     if (!getLogsEncryptorInstance().doesPrivateKeyExist()) {
@@ -1700,10 +2076,26 @@ public class CrumblesMain extends FragmentActivity {
       Log.w(TAG, "Attempted decryption without a private key.");
       return;
     }
+    if (uris.size() > CrumblesConstants.MAX_DECRYPTION_FILES_PER_SESSION) {
+      showToast(getString(R.string.toast_decryption_too_many_files));
+      return;
+    }
 
+    List<Uri> selection = new ArrayList<>(uris);
+    int generation = ++decryptionInputGeneration;
+    // A provider can be slow, or stream the files from the network.
+    decryptionInputExecutor.execute(() -> readSelectionThenDecrypt(selection, generation));
+  }
+
+  /**
+   * Reads the selected log files, up to {@link CrumblesConstants#MAX_DECRYPTION_SESSION_BYTES} in
+   * total, then decrypts them on the UI thread unless a newer selection or a stop superseded them.
+   */
+  private void readSelectionThenDecrypt(List<Uri> uris, int generation) {
     List<LogBatch> logBatches = new ArrayList<>();
     IdentityHashMap<LogBatch, String> fileNames = new IdentityHashMap<>();
     boolean allRead = true;
+    long bytesRead = 0;
     for (Uri uri : uris) {
       String fileName = getFileNameFromUri(uri);
       byte[] fileBytes = null;
@@ -1714,27 +2106,42 @@ public class CrumblesMain extends FragmentActivity {
         Log.e(TAG, "Unexpected error processing file: " + fileName, e);
         // A content provider can throw an exception with any message it chooses, so the toast
         // names only the file.
-        showToast("Could not read " + fileName + ".");
+        runOnUiThread(() -> showToast("Could not read " + fileName + "."));
         allRead = false;
         continue;
+      }
+      bytesRead += fileBytes.length;
+      if (bytesRead > CrumblesConstants.MAX_DECRYPTION_SESSION_BYTES) {
+        Log.w(TAG, "The selection is too large to decrypt from " + fileName + " on.");
+        runOnUiThread(
+            () -> showToast(getString(R.string.toast_decryption_selection_too_large, fileName)));
+        allRead = false;
+        break;
       }
 
       LogBatch logBatch;
       try {
-        logBatch = LogBatch.parseFrom(fileBytes, ExtensionRegistryLite.getGeneratedRegistry());
+        logBatch = LogBatch.parseFrom(fileBytes, ExtensionRegistryLite.getEmptyRegistry());
         Log.d(TAG, "Successfully deserialized LogBatch from " + fileName);
       } catch (InvalidProtocolBufferException e) {
         Log.e(TAG, "Failed to parse LogBatch from file: " + fileName, e);
-        showToast("Error: " + fileName + " is not a valid LogBatch format.");
+        runOnUiThread(() -> showToast("Error: " + fileName + " is not a valid LogBatch format."));
         allRead = false;
         continue;
       }
       logBatches.add(logBatch);
       fileNames.put(logBatch, fileName);
     }
-    selectedLogsCallback =
-        new SelectedLogsCallback(uris.isEmpty(), allRead, logBatches, fileNames);
-    selectedLogsCallback.decryptor.decrypt(logBatches, selectedLogsCallback);
+    boolean allSelectedRead = allRead;
+    runOnUiThread(
+        () -> {
+          if (generation != decryptionInputGeneration) {
+            return;
+          }
+          selectedLogsCallback =
+              new SelectedLogsCallback(uris.isEmpty(), allSelectedRead, logBatches, fileNames);
+          selectedLogsCallback.decryptor.decrypt(logBatches, selectedLogsCallback);
+        });
   }
 
   /** Collects the logs decrypted from a selection, and shows them once the decryptor is done. */
@@ -1762,12 +2169,14 @@ public class CrumblesMain extends FragmentActivity {
     @Override
     public void onDecrypted(LogBatch logBatch, DecryptedLogBatch decryptedBatch) {
       String fileName = fileNames.get(logBatch);
+      LogMetadata metadata = decryptedBatch.metadata();
       decryptedEntries.put(
           logBatch,
           new CrumblesDecryptedLogEntry(
               fileName,
               decryptedBatch.logs(),
-              decryptedBatch.metadata().getDevice().getDeviceId(),
+              metadata.getDevice().getDeviceId(),
+              metadata.hasTimestamp() ? metadata.getTimestamp() : null,
               logBatch));
       Log.i(TAG, "Successfully decrypted: " + fileName);
       CrumblesAppAuditLogger.getInstance(CrumblesMain.this)

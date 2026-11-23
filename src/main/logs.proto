@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-edition = "2023";
+syntax = "proto3";
 
 package wireless_android_security_exploits_secure_logging_src_main;
 
 import "google/protobuf/timestamp.proto";
-import "storage/datapol/annotations/proto/semantic_annotations.proto";
 
+option java_package =
+    "com.google.protos.wireless_android_security_exploits_secure_logging_src_main";
 option java_multiple_files = true;
 
 enum LogEncryptionType {
@@ -44,13 +45,12 @@ message SealedLogs {
   // The fields of the batch metadata that its cleartext metadata leaves out:
   // the timestamp and the device identifier.
   LogMetadata metadata = 1;
-  bytes logs = 2;
+  optional bytes logs = 2;
   // DER-encoded X.509 certificates of the installation's batch-signing key
   // from Android key attestation, leaf first, sealed inside the ciphertext so
   // that the device identifier in the attestation challenge and the OS
   // verified-boot key and patch level are not exposed in cleartext.
-  repeated bytes attestation_chain = 3
-      [(datapol.semantic_type) = ST_IDENTIFYING_ID];
+  repeated bytes attestation_chain = 3;
 }
 // LINT.ThenChange(../../tools/analyst/crumbles_analyst.py)
 
@@ -60,59 +60,51 @@ enum KeyEncryptionType {
   KEY_ENCRYPTION_TYPE_ASYMMETRIC = 1;
   KEY_ENCRYPTION_TYPE_CERT_SHA256_WITH_RSA = 2;
   reserved 3;
-  reserved KEY_ENCRYPTION_TYPE_CIPHER_MODE_RSA_ECB_PKCS1;
+  reserved "KEY_ENCRYPTION_TYPE_CIPHER_MODE_RSA_ECB_PKCS1";
   KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256 = 4;
 }
 // LINT.ThenChange(../../tools/analyst/crumbles_analyst.py)
 
-enum UploadLogResult {
-  UPLOAD_LOG_RESULT_UNSPECIFIED = 0;
-  UPLOAD_LOG_RESULT_SUCCESS = 1;
-  UPLOAD_LOG_RESULT_FAILURE = 2;
-}
-
 // LINT.IfChange
 message DeviceId {
   // A hardware ID - precisely which TBD
-  string device_id = 1 [(datapol.semantic_type) = ST_IDENTIFYING_ID];
+  optional string device_id = 1;
 }
 
 message LogData {
-  bytes log_blob = 1;
+  optional bytes log_blob = 1;
 }
 
 message LogMetadata {
-  uint32 blob_size = 1;
+  optional uint32 blob_size = 1;
   google.protobuf.Timestamp timestamp = 2;
   DeviceId device = 3;
-  LogEncryptionType encryption_type = 4;
+  optional LogEncryptionType encryption_type = 4;
 }
 
 message LogKey {
-  KeyEncryptionType key_encryption_type = 1;
-  bytes encrypted_symmetric_key = 2 [(datapol.semantic_type) = ST_SECURITY_KEY];
-  bytes iv = 3;
+  optional KeyEncryptionType key_encryption_type = 1;
+  optional bytes encrypted_symmetric_key = 2;
+  optional bytes iv = 3;
   // The symmetric key again, encrypted on the device that wrote the batch with
   // its AES batch-wrap Keystore key: the 16-byte IV, then the AES/CBC/NoPadding
   // ciphertext. One authentication can unwrap the keys of many batches. Absent
   // from batches encrypted to an external key. encrypted_symmetric_key stays
   // the reference.
-  bytes batch_wrapped_symmetric_key = 4
-      [(datapol.semantic_type) = ST_SECURITY_KEY];
+  optional bytes batch_wrapped_symmetric_key = 4;
   // Identifies the batch-wrap key that produced batch_wrapped_symmetric_key:
   // the first 8 bytes of its encryption of an all-zero block.
-  bytes batch_wrap_key_id = 5 [(datapol.semantic_type) = ST_SECURITY_MATERIAL];
+  optional bytes batch_wrap_key_id = 5;
 }
 
 message LogBatch {
   LogData data = 1;
-  // Even when used in a DownloadLogsResponse, there should only be one log
-  // batch for each response, each including only one key+iv.
+  // Each batch has a single key: one symmetric key and its IV.
   LogKey key = 2;
   LogMetadata metadata = 3;
   // Position of this batch among the batches that the installation which wrote
   // it has signed, starting at 1. A gap means that a signed batch is missing.
-  int64 sequence_number = 4;
+  optional int64 sequence_number = 4;
   // Covers the serialized batch without this field: remove field 5 from the
   // batch file and verify the remaining bytes. Absent from batches written
   // before batches were signed and from batches that could not be signed.
@@ -123,7 +115,7 @@ message LogBatch {
 // Android Keystore key that never leaves the device.
 message BatchSignature {
   // DER-encoded ECDSA signature with SHA-256 (SHA256withECDSA).
-  bytes signature = 1;
+  optional bytes signature = 1;
   // DER-encoded X.509 certificates of the signing key from Android key
   // attestation, leaf first. The leaf holds the public key that verifies
   // `signature`, and its attestation challenge is the device_id of the
@@ -132,65 +124,6 @@ message BatchSignature {
   // in SealedLogs.attestation_chain instead, so that their signature can only
   // be checked after decryption. The signature does not cover this field, so
   // recipients reject a format version 2 batch that carries a chain here.
-  repeated bytes attestation_chain = 2
-      [(datapol.semantic_type) = ST_IDENTIFYING_ID];
+  repeated bytes attestation_chain = 2;
 }
 // LINT.ThenChange(../../tools/analyst/crumbles_analyst.py)
-
-message UploadLogRequest {
-  LogBatch log_batch = 1;
-  // Gaia ID will be provided by the request authentication
-}
-
-message UploadLogResponse {
-  UploadLogResult result = 1;
-}
-
-message QueryLogsRequest {
-  google.protobuf.Timestamp query_from = 1;
-  google.protobuf.Timestamp query_to = 2;
-  LogMetadata log_metadata = 3;
-}
-
-message QueryLogsResponse {
-  repeated LogBatch log_batch = 1;
-}
-
-message DownloadLogsRequest {
-  repeated LogMetadata logs = 1;
-}
-
-message DownloadLogsResponse {
-  repeated LogBatch log_batch = 1;
-}
-
-/**
- * Service for uploading and downloading logs.
- */
-service CrumblesService {
-  /**
-   * Upload a log to the server.
-   */
-  rpc UploadLog(UploadLogRequest) returns (UploadLogResponse) {
-    // The server will ignore blob_size, blob_sha256, and timestamp in LogData,
-    // filling these values in itself.
-    option deadline = 60;  // in seconds
-  }
-
-  /**
-   * Query logs from the server.
-   */
-  rpc QueryLogs(QueryLogsRequest) returns (QueryLogsResponse) {
-    option deadline = 60;  // in seconds
-  }
-
-  /**
-   * Download logs from the server.
-   */
-  rpc DownloadLogs(DownloadLogsRequest) returns (DownloadLogsResponse) {
-    // Use the QueryLogs request to get information about a set of logs, and
-    // then provide information about the logs to this RPC to actually get the
-    // data and encrypted keys.
-    option deadline = 60;  // in seconds
-  }
-}

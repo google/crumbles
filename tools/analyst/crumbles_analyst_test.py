@@ -101,6 +101,10 @@ _CREATION_DATETIME = b"\xbf\x85\x3d"  # [701] EXPLICIT
 _ORIGIN = b"\xbf\x85\x3e"  # [702] EXPLICIT
 _ROOT_OF_TRUST = b"\xbf\x85\x40"  # [704] EXPLICIT
 _APPLICATION_ID = b"\xbf\x85\x45"  # [709] EXPLICIT
+_OS_VERSION = b"\xbf\x85\x41"  # [705] EXPLICIT
+_OS_PATCH_LEVEL = b"\xbf\x85\x42"  # [706] EXPLICIT
+_VENDOR_PATCH_LEVEL = b"\xbf\x85\x4e"  # [718] EXPLICIT
+_BOOT_PATCH_LEVEL = b"\xbf\x85\x4f"  # [719] EXPLICIT
 
 _PrivateKey = (
     ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey | ed25519.Ed25519PrivateKey)
@@ -248,6 +252,7 @@ def _key_description(
     hardware_creation_time: bool = False,
     origin: bytes | None = b"\x00",
     extra_software_tags: Sequence[bytes] = (),
+    extra_hardware_tags: Sequence[bytes] = (),
 ) -> bytes:
   """Returns a KeyDescription as Android key attestation writes it."""
   package_info = _der(_SEQUENCE, _der(_OCTET_STRING, package),
@@ -262,7 +267,7 @@ def _key_description(
       _der(_APPLICATION_ID, _der(_OCTET_STRING, application_id)),
       *extra_software_tags,
   ]
-  hardware_enforced = []
+  hardware_enforced = [*extra_hardware_tags]
   if origin is not None:
     hardware_enforced.append(_der(_ORIGIN, _der(_INTEGER, origin)))
   if creation_millis is not None:
@@ -386,9 +391,12 @@ def _with_chain(
   return batch
 
 
-def _sealed(number: int, recipient: rsa.RSAPrivateKey) -> message.Message:
+def _sealed(
+    number: int,
+    recipient: rsa.RSAPrivateKey,
+    logs: bytes = _trailer(_TAG_A, _TAG_A, []),
+) -> message.Message:
   """Returns the format version 2 batch number, encrypted to recipient."""
-  logs = _trailer(_TAG_A, _TAG_A, [])
   return _sign(
       _encrypt(
           logs,
@@ -658,6 +666,10 @@ class CrumblesAnalystTest(parameterized.TestCase):
           status_data=b'{"entries": {"1": {}}}',
       ),
       dict(
+          testcase_name="entry_with_an_empty_status",
+          status_data=b'{"entries": {"1": {"status": ""}}}',
+      ),
+      dict(
           testcase_name="entry_not_a_map",
           status_data=b'{"entries": {"1": "REVOKED"}}',
       ),
@@ -852,24 +864,6 @@ class CrumblesAnalystTest(parameterized.TestCase):
                        _SEQUENCE, b"\x06\x03\x55\x1d\x13",
                        _der(_OCTET_STRING, _der(_SEQUENCE))) * 2)]),
            error=r"malformed attestation certificate \(DuplicateExtension\)"),
-      dict(testcase_name="leaf_not_yet_valid",
-           batch=_with_chain(
-               _sign(_encrypt(b"logs"), 1),
-               [_certificate(_LEAF_KEY, _INTERMEDIATE_KEY, _key_description(),
-                             not_valid_before=datetime.datetime(2025, 1, 2)),
-                *_CHAIN_TAIL]),
-           batch_time=datetime.datetime(2025, 1, 1,
-                                        tzinfo=datetime.timezone.utc),
-           error="attestation certificate 0 was not valid at the batch time"),
-      dict(testcase_name="leaf_expired_at_batch_time",
-           batch=_with_chain(
-               _sign(_encrypt(b"logs"), 1),
-               [_certificate(_LEAF_KEY, _INTERMEDIATE_KEY, _key_description(),
-                             not_valid_after=datetime.datetime(2025, 1, 2)),
-                *_CHAIN_TAIL]),
-           batch_time=datetime.datetime(2025, 1, 3,
-                                        tzinfo=datetime.timezone.utc),
-           error="attestation certificate 0 was not valid at the batch time"),
       dict(testcase_name="intermediate_not_a_ca",
            batch=_sign(_encrypt(b"logs"), 1, chain_tail=[
                _certificate(_INTERMEDIATE_KEY, _KEY, ca=False), _ROOT]),
@@ -1023,12 +1017,11 @@ class CrumblesAnalystTest(parameterized.TestCase):
       batch: message.Message,
       error: str,
       root_keys: Collection[str] = _ROOT_KEYS,
-      batch_time: datetime.datetime | None = None,
   ) -> None:
     with self.assertRaisesRegex(crumbles_analyst.BatchError, error):
       crumbles_analyst.check_signature(
-          batch.SerializeToString(), batch, b"device-1", root_keys,
-          batch_time=batch_time)
+          batch.SerializeToString(), batch, b"device-1", root_keys
+      )
 
   def test_rejects_signature_of_a_revoked_attestation_key(self) -> None:
     batch = _sign(_encrypt(b"logs"), 1)
@@ -1412,6 +1405,30 @@ class CrumblesAnalystTest(parameterized.TestCase):
         },
     )
 
+  def test_checks_the_chain_across_batches_without_a_trailer(self) -> None:
+    before_unlock = b"Crumbles: security logs collected before the first unlock"
+    batches = {
+        "b1.bin": _sealed(1, _KEY),
+        "b2.bin": _sealed(2, _KEY, before_unlock),
+        "b3.bin": _sealed(3, _KEY),
+        "b4.bin": _sealed(4, _OTHER_KEY, _trailer(_TAG_A, _TAG_B)),
+        "b5.bin": _sealed(5, _KEY, _trailer(_TAG_B, _TAG_B, [])),
+        "unsigned.bin": _encrypt(before_unlock),
+    }
+    _write_batches(self.batch_dir, batches)
+
+    results = crumbles_analyst.check_batches(
+        sorted(self.batch_dir.iterdir()), _KEY, _ROOT_KEYS
+    )
+
+    problems = [result.problems for result in results]
+    self.assertEqual(problems[:5], [(), (), (), (_CANNOT_UNWRAP,), ()])
+    self.assertEqual(problems[5], ("no activity log trailer", "unsigned batch"))
+    self.assertIn(
+        "collected before the first unlock: no activity log records",
+        results[1].notices,
+    )
+
   def test_main_decrypts_each_batch_with_the_key_it_was_encrypted_to(
       self,
   ) -> None:
@@ -1459,6 +1476,147 @@ class CrumblesAnalystTest(parameterized.TestCase):
         ("attestation certificate 1 is expired at analysis time",),
     )
 
+  def test_rejects_more_than_10_attestation_certificates(self) -> None:
+    batch = _with_chain(_sign(_encrypt(b"logs"), 1), [_ROOT] * 11)
+
+    with self.assertRaisesWithLiteralMatch(
+        crumbles_analyst.BatchError, "more than 10 attestation certificates"
+    ):
+      crumbles_analyst.check_signature(
+          batch.SerializeToString(), batch, b"device-1", _ROOT_KEYS
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="clock_set_past_the_default_validity",
+          not_valid_after=datetime.datetime(2048, 1, 1),
+          batch_time=datetime.datetime(2050, 1, 1),
+      ),
+      dict(
+          testcase_name="rkp_leaf_that_ends_with_its_issuer",
+          not_valid_after=datetime.datetime(2026, 1, 10),
+          batch_time=datetime.datetime(2026, 1, 31),
+      ),
+      dict(
+          testcase_name="key_made_after_the_leaf_expired",
+          not_valid_after=datetime.datetime(2026, 1, 2),
+          batch_time=datetime.datetime(2026, 1, 6),
+      ),
+  )
+  def test_keeps_the_signer_of_a_batch_written_outside_the_leaf_validity(
+      self, not_valid_after: datetime.datetime, batch_time: datetime.datetime
+  ) -> None:
+    rkp_issuer = _certificate(
+        _INTERMEDIATE_KEY,
+        _KEY,
+        not_valid_before=datetime.datetime(2026, 1, 1),
+        not_valid_after=datetime.datetime(2026, 1, 10),
+        path_length=0,
+        rkp=True,
+    )
+    # Made on 2026-01-05, when the issuer was valid.
+    key_description = _key_description(creation_millis=1767571200000)
+    leaf = _certificate(
+        _LEAF_KEY,
+        _INTERMEDIATE_KEY,
+        key_description,
+        not_valid_after=not_valid_after,
+    )
+    seconds = int(batch_time.replace(tzinfo=datetime.timezone.utc).timestamp())
+    batch = _sign(_encrypt(_trailer("none", _TAG_A), seconds=seconds), 1)
+    chain = [leaf, rkp_issuer, _ROOT]
+    _write_batches(self.batch_dir, {"b1.bin": _with_chain(batch, chain)})
+
+    [result] = crumbles_analyst.check_batches(
+        [self.batch_dir / "b1.bin"], _KEY, _ROOT_KEYS
+    )
+
+    self.assertEqual((result.signer_trusted, result.problems), (True, ()))
+    [notice] = result.notices
+    self.assertEqual(
+        notice,
+        "the batch time is outside the validity of attestation certificate 0:"
+        " the device clock may have been changed",
+    )
+    self.assertEqual(result.batch.data.log_blob, b"")
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="patch_levels_too_old_or_missing",
+          args=("--min-patch-level", "201802"),
+          problems=[
+              "the key's OS patch level is below --min-patch-level",
+              "the key's boot patch level is below --min-patch-level",
+              "the key has no attested OS patch level",
+              "the key has no attested vendor patch level",
+              "the key has no attested boot patch level",
+          ],
+      ),
+      dict(
+          testcase_name="other_signing_key",
+          args=(
+              "--signer",
+              hashlib.sha256(_public_key_der(_LEAF_KEY)).hexdigest(),
+          ),
+          problems=[
+              "signed with another key than b1.bin",
+              "signed with none of the keys of --signer",
+          ],
+      ),
+  )
+  def test_main_checks_the_patch_levels_and_the_signing_key(
+      self, args: Sequence[str], problems: Sequence[str]
+  ) -> None:
+    levels = {
+        _OS_VERSION: 150000,
+        _OS_PATCH_LEVEL: 201801,
+        _VENDOR_PATCH_LEVEL: 20180205,
+        _BOOT_PATCH_LEVEL: 20180105,
+    }
+    tags = [_der(tag, _der_int(level)) for tag, level in levels.items()]
+    key_description = _key_description(extra_hardware_tags=tags)
+    other_leaf_key = ec.generate_private_key(ec.SECP256R1())
+    logs = _trailer(_TAG_A, _TAG_A, [])
+    batches = {
+        "b1.bin": _sign(_encrypt(logs), 1, key_description=key_description),
+        "b2.bin": _sign(
+            _encrypt(logs, seconds=2),
+            2,
+            leaf_key=other_leaf_key,
+            key_description=_key_description(),  # Without patch levels.
+        ),
+    }
+    _write_batches(self.batch_dir, batches)
+
+    status, report = _run_main("--key", self.key_file, *args, self.batch_dir)
+
+    self.assertEqual(status, 1)
+    lines = report.splitlines()
+    self.assertEqual(
+        [
+            line.removeprefix("  PROBLEM: ")
+            for line in lines
+            if "PROBLEM" in line
+        ],
+        problems,
+    )
+    self.assertIn(
+        "  attested OS version 150000, OS patch level 201801, vendor patch "
+        "level 20180205, boot patch level 20180105",
+        lines,
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="year", level="2025"),
+      dict(testcase_name="year_month_day", level="20250105"),
+      dict(testcase_name="month_13", level="202513"),
+  )
+  def test_main_rejects_min_patch_level_not_yyyymm(self, level: str) -> None:
+    args = ("--key", self.key_file, "--min-patch-level", level, self.batch_dir)
+    with self.assertRaises(SystemExit):
+      with contextlib.redirect_stderr(io.StringIO()):
+        _run_main(*args)
+
   @parameterized.named_parameters(
       dict(testcase_name="version_1", log_type=_LOG_ENCRYPTION_TYPE_AES_GCM),
       dict(testcase_name="padded", log_type=_PADDED),
@@ -1482,23 +1640,26 @@ class CrumblesAnalystTest(parameterized.TestCase):
         "--app-cert", app_certificate, self.batch_dir)
     self.assertEqual(status, 0)
     signing_key = hashlib.sha256(_public_key_der(_LEAF_KEY)).hexdigest()
-    self.assertEqual(report.splitlines(), [
+    expected = [
         str(self.batch_dir / "b1.bin"),
         "  written 2025-10-09 08:53:20+00:00 by device 'device-1', key wrap "
         + "RSA-OAEP-SHA256",
         f"  decrypted {len(logs)} bytes of logs",
         "  activity log: since record none, 1 new records, chain head "
         + _TAG_A,
-        f"  batch 1, signed by TEE key {signing_key[:16]}",
+        f"  batch 1, signed by TEE key {signing_key}",
         f"  app signing certificate (SHA-256): {app_certificate}",
         "  bootloader locked, verified boot state Verified, verified boot key "
         + _BOOT_KEY.hex(),
+        "  attested OS version unknown, OS patch level unknown, vendor patch "
+        + "level unknown, boot patch level unknown",
         f"  written to {self.out_dir / 'b1.bin.txt'}",
         "Device 'device-1': sequences 1 to 1, times "
         + "2025-10-09T08:53:20+00:00 to "
         + "2025-10-09T08:53:20+00:00",
         "1 batches, 0 with problems.",
-    ])
+    ]
+    self.assertEqual(report.splitlines(), expected)
     self.assertEqual((self.out_dir / "b1.bin.txt").read_bytes(), logs)
     self.assertEqual(
         (self.out_dir / "b1.bin.txt").stat().st_mode & 0o777, 0o600)
@@ -1683,6 +1844,37 @@ class CrumblesAnalystTest(parameterized.TestCase):
           testcase_name="not_sealed",
           event="DESTINATION_HANDOVER_NOT_SEALED",
           problems=("tamper-evidence event: DESTINATION_HANDOVER_NOT_SEALED",),
+      ),
+      dict(
+          testcase_name="changed_without_handover",
+          event="DESTINATION_CHANGED_WITHOUT_HANDOVER",
+          problems=(
+              "tamper-evidence event: DESTINATION_CHANGED_WITHOUT_HANDOVER",
+          ),
+      ),
+      dict(
+          testcase_name="handover_upload_failed",
+          event="DESTINATION_HANDOVER_UPLOAD_FAILED",
+          problems=(
+              "tamper-evidence event: DESTINATION_HANDOVER_UPLOAD_FAILED",
+          ),
+      ),
+      dict(
+          testcase_name="handover_uploaded_unconfirmed",
+          event="DESTINATION_HANDOVER_UPLOADED_UNCONFIRMED",
+          problems=(
+              (
+                  "tamper-evidence event:"
+                  " DESTINATION_HANDOVER_UPLOADED_UNCONFIRMED"
+              ),
+          ),
+      ),
+      dict(
+          testcase_name="handover_uploaded_offline",
+          event="DESTINATION_HANDOVER_UPLOADED_OFFLINE",
+          problems=(
+              "tamper-evidence event: DESTINATION_HANDOVER_UPLOADED_OFFLINE",
+          ),
       ),
   )
   def test_classifies_the_activity_log_events_of_newer_versions(

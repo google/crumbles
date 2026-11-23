@@ -41,7 +41,6 @@ import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Streams;
 import com.google.common.truth.Expect;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.ExtensionRegistryLite;
@@ -78,6 +77,7 @@ import java.security.spec.RSAKeyGenParameterSpec;
 import java.security.spec.RSAPublicKeySpec;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import javax.crypto.AEADBadTagException;
@@ -102,7 +102,7 @@ import org.robolectric.annotation.Config;
 
 /** Tests for {@link CrumblesLogsEncryptor} using a fake AndroidKeyStore provider. */
 @RunWith(RobolectricTestParameterInjector.class)
-@Config(sdk = {Build.VERSION_CODES.TIRAMISU})
+@Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
 public final class CrumblesLogsEncryptorTest {
 
   @Rule public final Expect expect = Expect.create();
@@ -1085,11 +1085,16 @@ public final class CrumblesLogsEncryptorTest {
   @Test
   @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
   public void encryptLogs_sealsTheAttestationChainOfTheBatchSigningKey() throws Exception {
+    Context context = getContext();
     KeyPair externalKeyPair = generateTestExternalRsaKeyPair();
 
     LogBatch logBatch =
-        new CrumblesLogsEncryptor(getContext())
-            .encryptLogs("logs".getBytes(UTF_8), externalKeyPair.getPublic());
+        new CrumblesLogsEncryptor(context)
+            .encryptLogs(
+                context,
+                "logs".getBytes(UTF_8),
+                externalKeyPair.getPublic(),
+                new CrumblesBatchSigner(context).attestationChainToSeal());
 
     ImmutableList<ByteString> batchSigningKeyChain = batchSigningKeyChain();
     assertThat(batchSigningKeyChain).isNotEmpty();
@@ -1149,10 +1154,16 @@ public final class CrumblesLogsEncryptorTest {
       @TestParameter AttestationChainFailure failure) throws Exception {
     KeyPair externalKeyPair = generateTestExternalRsaKeyPair();
     byte[] plainLogs = "logs written without an attestation chain".getBytes(UTF_8);
+    Context context = getContext();
     failure.simulate();
 
     LogBatch logBatch =
-        new CrumblesLogsEncryptor(getContext()).encryptLogs(plainLogs, externalKeyPair.getPublic());
+        new CrumblesLogsEncryptor(context)
+            .encryptLogs(
+                context,
+                plainLogs,
+                externalKeyPair.getPublic(),
+                new CrumblesBatchSigner(context).attestationChainToSeal());
 
     SealedLogs sealedLogs =
         sealedLogsDecryptedWith(
@@ -1161,19 +1172,30 @@ public final class CrumblesLogsEncryptorTest {
     expect.that(sealedLogs.getAttestationChainList()).isEmpty();
   }
 
+  /** The metadata of a decrypted batch, written long before its logs are re-encrypted. */
+  private static final LogMetadata ORIGINAL =
+      recordedBy("original-device").toBuilder()
+          .setTimestamp(Timestamp.newBuilder().setSeconds(1_600_000_000L))
+          .build();
+
+  /** Returns the metadata of a decrypted batch that records {@code deviceId} and no time. */
+  private static LogMetadata recordedBy(String deviceId) {
+    return LogMetadata.newBuilder().setDevice(DeviceId.newBuilder().setDeviceId(deviceId)).build();
+  }
+
   /** Re-encryptions of the logs of another batch, which stay unsigned. */
   private enum UnsignedReEncryption {
     RE_ENCRYPT_LOG_BATCH {
       @Override
       LogBatch reEncrypt(CrumblesLogsEncryptor encryptor, byte[] plainLogs, PublicKey recipient)
           throws CrumblesKeysException {
-        return encryptor.reEncryptLogBatch(plainLogs, recipient, "original-device");
+        return encryptor.reEncryptLogBatch(plainLogs, recipient, ORIGINAL);
       }
     },
     ENCRYPT_LOGS_ATTRIBUTED_TO {
       @Override
       LogBatch reEncrypt(CrumblesLogsEncryptor encryptor, byte[] plainLogs, PublicKey recipient) {
-        return encryptor.encryptLogsAttributedTo("original-device", plainLogs, recipient);
+        return encryptor.encryptLogsAttributedTo(ORIGINAL, plainLogs, recipient);
       }
     };
 
@@ -1204,26 +1226,88 @@ public final class CrumblesLogsEncryptorTest {
 
   @Test
   @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
-  public void reEncryptLogBatchForSigning_withoutCachedContext_sealsTheChainAndThisDevicesId()
-      throws Exception {
-    Context context = getContext();
+  public void reEncryptingForAnotherDevice_keepsTheTimeTheOriginalRecorded(
+      @TestParameter UnsignedReEncryption reEncryption) throws Exception {
     KeyPair externalKeyPair = generateTestExternalRsaKeyPair();
 
     LogBatch logBatch =
-        encryptor.reEncryptLogBatchForSigning(
-            context, "logs of this installation".getBytes(UTF_8), externalKeyPair.getPublic());
+        reEncryption.reEncrypt(
+            new CrumblesLogsEncryptor(getContext()),
+            "logs of another batch".getBytes(UTF_8),
+            externalKeyPair.getPublic());
+
+    assertThat(
+            sealedLogsDecryptedWith(
+                    externalKeyPair.getPrivate(), externalKeyPair.getPublic(), logBatch)
+                .getMetadata()
+                .getTimestamp())
+        .isEqualTo(ORIGINAL.getTimestamp());
+  }
+
+  /** Re-encryptions of the logs of a batch that this installation signed, to sign them again. */
+  private enum SignedReEncryption {
+    RE_ENCRYPT_LOG_BATCH_FOR_SIGNING {
+      @Override
+      LogBatch reEncrypt(
+          CrumblesLogsEncryptor encryptor,
+          Context context,
+          byte[] plainLogs,
+          PublicKey recipient,
+          List<ByteString> attestationChain)
+          throws CrumblesKeysException {
+        return encryptor.reEncryptLogBatchForSigning(
+            context, plainLogs, recipient, ORIGINAL, attestationChain);
+      }
+    },
+    ENCRYPT_LOGS_FOR_SIGNING_AGAIN {
+      @Override
+      LogBatch reEncrypt(
+          CrumblesLogsEncryptor encryptor,
+          Context context,
+          byte[] plainLogs,
+          PublicKey recipient,
+          List<ByteString> attestationChain) {
+        return encryptor.encryptLogsForSigningAgain(
+            context, ORIGINAL, plainLogs, recipient, attestationChain);
+      }
+    };
+
+    abstract LogBatch reEncrypt(
+        CrumblesLogsEncryptor encryptor,
+        Context context,
+        byte[] plainLogs,
+        PublicKey recipient,
+        List<ByteString> attestationChain)
+        throws CrumblesKeysException;
+  }
+
+  @Test
+  @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
+  public void reEncryptingToSignAgain_keepsTheOriginalTimeAndSealsGivenChainAndThisDevicesId(
+      @TestParameter SignedReEncryption reEncryption) throws Exception {
+    Context context = getContext();
+    KeyPair externalKeyPair = generateTestExternalRsaKeyPair();
+    ImmutableList<ByteString> attestationChain =
+        ImmutableList.of(ByteString.copyFromUtf8("leaf"), ByteString.copyFromUtf8("root"));
+
+    LogBatch logBatch =
+        reEncryption.reEncrypt(
+            encryptor,
+            context,
+            "logs of this installation".getBytes(UTF_8),
+            externalKeyPair.getPublic(),
+            attestationChain);
 
     SealedLogs sealedLogs =
         sealedLogsDecryptedWith(
             externalKeyPair.getPrivate(), externalKeyPair.getPublic(), logBatch);
-    ImmutableList<ByteString> batchSigningKeyChain = batchSigningKeyChain();
-    assertThat(batchSigningKeyChain).isNotEmpty();
+    expect.that(sealedLogs.getMetadata().getTimestamp()).isEqualTo(ORIGINAL.getTimestamp());
     expect
         .that(sealedLogs.getMetadata().getDevice().getDeviceId())
         .isEqualTo(CrumblesDeviceIdManager.getDeviceId(context));
     expect
         .that(sealedLogs.getAttestationChainList())
-        .containsExactlyElementsIn(batchSigningKeyChain)
+        .containsExactlyElementsIn(attestationChain)
         .inOrder();
   }
 
@@ -1284,17 +1368,19 @@ public final class CrumblesLogsEncryptorTest {
   }
 
   @Test
-  public void isPrivateKeyPermanentlyInvalidated_withValidLegacyPkcs1Key_returnsFalse() throws Exception {
+  public void isPrivateKeyPermanentlyInvalidated_withValidLegacyPkcs1Key_returnsFalse()
+      throws Exception {
     generateLegacyPkcs1OnlyDeviceKey();
-    
+
     assertThat(encryptor.isPrivateKeyPermanentlyInvalidated()).isFalse();
   }
 
   @Test
-  public void isPrivateKeyPermanentlyInvalidated_withInvalidatedLegacyPkcs1Key_detectsInvalidation() throws Exception {
+  public void isPrivateKeyPermanentlyInvalidated_withInvalidatedLegacyPkcs1Key_detectsInvalidation()
+      throws Exception {
     generateLegacyPkcs1OnlyDeviceKey();
     FakeAndroidKeyStoreSpi.invalidateKey(CrumblesLogsEncryptor.KEY_ALIAS);
-    
+
     assertThat(encryptor.isPrivateKeyPermanentlyInvalidated()).isTrue();
   }
 
@@ -1354,11 +1440,20 @@ public final class CrumblesLogsEncryptorTest {
     byte[] plainLogs = "logs after restart for OAEP key".getBytes(UTF_8);
 
     LogBatch logBatch =
-        new CrumblesLogsEncryptor().encryptLogs(context, plainLogs, /* publicKey= */ null);
+        new CrumblesLogsEncryptor()
+            .encryptLogs(
+                context,
+                plainLogs,
+                /* publicKey= */ null,
+                /* attestationChain= */ ImmutableList.of());
     CrumblesLogsEncryptor.clearKeyPaddingCacheForTest();
     LogBatch nullContextBatch =
         new CrumblesLogsEncryptor()
-            .encryptLogs(/* context= */ null, plainLogs, /* publicKey= */ null);
+            .encryptLogs(
+                /* context= */ null,
+                plainLogs,
+                /* publicKey= */ null,
+                /* attestationChain= */ ImmutableList.of());
 
     expect
         .that(logBatch.getKey().getKeyEncryptionType())
@@ -1476,8 +1571,9 @@ public final class CrumblesLogsEncryptorTest {
 
   @Test
   @Config(sdk = {Build.VERSION_CODES.UPSIDE_DOWN_CAKE})
-  public void encryptLogs_whenReplacedDeviceKeyHasDifferentFingerprint_doesNotReuseOldCachedPadding()
-      throws Exception {
+  public void
+      encryptLogs_whenReplacedDeviceKeyHasDifferentFingerprint_doesNotReuseOldCachedPadding()
+          throws Exception {
     Context context = ApplicationProvider.getApplicationContext();
     setDeviceSecure(true);
     new CrumblesLogsEncryptor(context).generateKeyPair();
@@ -1530,7 +1626,7 @@ public final class CrumblesLogsEncryptorTest {
     PublicKey devicePublicKey = encryptor.generateKeyPair().getPublic();
     byte[] plainLogs = "re-encrypted logs".getBytes(UTF_8);
 
-    LogBatch logBatch = encryptor.reEncryptLogBatch(plainLogs, devicePublicKey, "device-123");
+    LogBatch logBatch = encryptor.reEncryptLogBatch(plainLogs, devicePublicKey, ORIGINAL);
 
     assertThat(decryptWithBatchWrappedKey(logBatch)).isEqualTo(plainLogs);
   }
@@ -1587,11 +1683,6 @@ public final class CrumblesLogsEncryptorTest {
     expect.that(auditEventTypes(context)).contains("BATCH_WRAP_FAILED");
   }
 
-
-
-
-
-
   @Test
   public void encryptLogs_whenBatchWrapFailsWithoutContext_stillEncrypts() throws Exception {
     CrumblesLogsEncryptor.setApplicationContext(null);
@@ -1601,6 +1692,66 @@ public final class CrumblesLogsEncryptorTest {
     LogBatch logBatch = encryptor.encryptLogs("logs".getBytes(UTF_8), /* publicKey= */ null);
 
     assertThat(logBatch.getKey().hasBatchWrappedSymmetricKey()).isFalse();
+  }
+
+  @Test
+  public void encryptLogsBeforeFirstUnlock_toDeviceKey_marksEmptyBatchWrapKeyId()
+      throws Exception {
+    PublicKey devicePublicKey = encryptor.generateKeyPair().getPublic();
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+    byte[] plainLogs = "logs collected before the first unlock".getBytes(UTF_8);
+
+    LogBatch logBatch =
+        encryptor.encryptLogsBeforeFirstUnlock(
+            plainLogs, devicePublicKey, "device-123", ImmutableList.of());
+
+    expect.that(logBatch.getKey().hasBatchWrapKeyId()).isTrue();
+    expect.that(logBatch.getKey().getBatchWrapKeyId()).isEmpty();
+    expect.that(logBatch.getKey().hasBatchWrappedSymmetricKey()).isFalse();
+    expect
+        .that(encryptor.partitionForBulkDecrypt(ImmutableList.of(logBatch)).rsaOnly())
+        .containsExactly(logBatch);
+    expect.that(decrypt(encryptor, logBatch)).isEqualTo(plainLogs);
+  }
+
+  @Test
+  public void encryptLogsBeforeFirstUnlock_toExternalKey_carriesNoBatchWrapKeyId()
+      throws Exception {
+    encryptor.generateKeyPair();
+    KeyPair externalKeyPair = generateTestExternalRsaKeyPair();
+    byte[] plainLogs = "logs collected before the first unlock".getBytes(UTF_8);
+
+    LogBatch logBatch =
+        encryptor.encryptLogsBeforeFirstUnlock(
+            plainLogs, externalKeyPair.getPublic(), "device-123", ImmutableList.of());
+
+    expect.that(logBatch.getKey().hasBatchWrapKeyId()).isFalse();
+    expect.that(logBatch.getKey().hasBatchWrappedSymmetricKey()).isFalse();
+    expect.that(decryptWithOaepKeyPair(externalKeyPair, logBatch)).isEqualTo(plainLogs);
+  }
+
+  @Test
+  public void
+      encryptLogsBeforeFirstUnlock_whenKeystoreCertificateLookupFails_returnsDecryptableBatch()
+          throws Exception {
+    PublicKey devicePublicKey = encryptor.generateKeyPair().getPublic();
+    FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
+    byte[] plainLogs = "logs collected during Keystore fault".getBytes(UTF_8);
+
+    LogBatch logBatch;
+    FakeAndroidKeyStoreSpi.certificateLookupFailure =
+        new ProviderException("Keystore certificate lookup failed");
+    try {
+      logBatch =
+          encryptor.encryptLogsBeforeFirstUnlock(
+              plainLogs, devicePublicKey, "device-123", ImmutableList.of());
+    } finally {
+      FakeAndroidKeyStoreSpi.certificateLookupFailure = null;
+    }
+
+    expect.that(logBatch.getKey().hasBatchWrapKeyId()).isFalse();
+    expect.that(logBatch.getKey().hasBatchWrappedSymmetricKey()).isFalse();
+    expect.that(decrypt(encryptor, logBatch)).isEqualTo(plainLogs);
   }
 
   @Test
@@ -1618,15 +1769,16 @@ public final class CrumblesLogsEncryptorTest {
 
     ImmutableList<SecretKey> symmetricKeys =
         encryptor.unwrapBatchKeys(batchUnwrapCipher, batchUnwrappable);
-    ImmutableList<String> decryptedLogs =
-        Streams.zip(
-                batchUnwrappable.stream(),
-                symmetricKeys.stream(),
-                (logBatch, symmetricKey) ->
-                    new String(
-                        encryptor.decryptLogsWithSymmetricKey(logBatch, symmetricKey).logs(),
-                        UTF_8))
-            .collect(toImmutableList());
+    ImmutableList.Builder<String> decryptedLogsBuilder = ImmutableList.builder();
+    for (int i = 0; i < batchUnwrappable.size(); i++) {
+      decryptedLogsBuilder.add(
+          new String(
+              encryptor
+                  .decryptLogsWithSymmetricKey(batchUnwrappable.get(i), symmetricKeys.get(i))
+                  .logs(),
+              UTF_8));
+    }
+    ImmutableList<String> decryptedLogs = decryptedLogsBuilder.build();
 
     assertThat(decryptedLogs).containsExactly("first logs", "second logs", "third logs").inOrder();
   }
@@ -1683,6 +1835,26 @@ public final class CrumblesLogsEncryptorTest {
     assertThat(partition.rsaOnly()).containsExactly(logBatch);
   }
 
+  @Test
+  public void encryptLogs_toDeviceKeyWithoutABatchWrappedKey_marksItAsForTheDeviceKey(
+      @TestParameter UnknownBatchWrapKeyIdCause cause) throws Exception {
+    encryptor.generateKeyPair();
+    cause.apply();
+
+    LogBatch logBatch = encryptor.encryptLogs("logs".getBytes(UTF_8), /* publicKey= */ null);
+
+    expect.that(logBatch.getKey().hasBatchWrapKeyId()).isTrue();
+    expect.that(logBatch.getKey().getBatchWrapKeyId()).isEqualTo(ByteString.EMPTY);
+    expect.that(logBatch.getKey().hasBatchWrappedSymmetricKey()).isFalse();
+    expect
+        .that(
+            encryptor
+                .partitionForKeyChange(
+                    ImmutableList.of(logBatch), /* mayBeForAnExternalKey= */ batch -> true)
+                .rsaOnly())
+        .containsExactly(logBatch);
+  }
+
   private enum UnusableBatchWrappedKey {
     TRUNCATED {
       @Override
@@ -1714,6 +1886,55 @@ public final class CrumblesLogsEncryptorTest {
         encryptor.partitionForBulkDecrypt(ImmutableList.of(modifiedBatch));
 
     assertThat(partition.rsaOnly()).containsExactly(modifiedBatch);
+  }
+
+  @Test
+  public void partitionForKeyChange_whenBatchMayBeForExternalKey_findsItUndecryptable()
+      throws Exception {
+    encryptor.generateKeyPair();
+    LogBatch keystoreKeyBatch =
+        encryptor.encryptLogs("keystore logs".getBytes(UTF_8), /* publicKey= */ null);
+    LogBatch externalKeyBatch =
+        encryptor.encryptLogs(
+            "external logs".getBytes(UTF_8), generateTestExternalRsaKeyPair().getPublic());
+    LogBatch unmarkedBuiltInBatch =
+        keystoreKeyBatch.toBuilder()
+            .setKey(
+                keystoreKeyBatch.getKey().toBuilder()
+                    .clearBatchWrapKeyId()
+                    .clearBatchWrappedSymmetricKey())
+            .build();
+
+    BulkDecryptPartition partition =
+        encryptor.partitionForKeyChange(
+            ImmutableList.of(keystoreKeyBatch, externalKeyBatch, unmarkedBuiltInBatch),
+            /* mayBeForAnExternalKey= */ logBatch -> logBatch.equals(externalKeyBatch));
+
+    expect.that(partition.batchUnwrappable()).containsExactly(keystoreKeyBatch);
+    expect.that(partition.rsaOnly()).containsExactly(unmarkedBuiltInBatch);
+    expect.that(partition.undecryptable()).containsExactly(externalKeyBatch);
+  }
+
+  @Test
+  public void partitionForKeyChange_findsABatchForAKeyOfAnotherSizeUndecryptable()
+      throws Exception {
+    encryptor.generateKeyPair();
+    KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
+    keyPairGenerator.initialize(new RSAKeyGenParameterSpec(3072, RSAKeyGenParameterSpec.F4));
+    LogBatch largerKeyBatch =
+        encryptor.encryptLogs(
+            "larger key logs".getBytes(UTF_8), keyPairGenerator.generateKeyPair().getPublic());
+    LogBatch sameSizeKeyBatch =
+        encryptor.encryptLogs(
+            "same size key logs".getBytes(UTF_8), generateTestExternalRsaKeyPair().getPublic());
+
+    BulkDecryptPartition partition =
+        encryptor.partitionForKeyChange(
+            ImmutableList.of(largerKeyBatch, sameSizeKeyBatch),
+            /* mayBeForAnExternalKey= */ logBatch -> false);
+
+    expect.that(partition.rsaOnly()).containsExactly(sameSizeKeyBatch);
+    expect.that(partition.undecryptable()).containsExactly(largerKeyBatch);
   }
 
   @Test
@@ -1852,7 +2073,7 @@ public final class CrumblesLogsEncryptorTest {
     LogBatch logBatch =
         new CrumblesLogsEncryptor(context)
             .reEncryptLogBatch(
-                plainLogs, externalKeyPair.getPublic(), /* originalDeviceId= */ null);
+                plainLogs, externalKeyPair.getPublic(), LogMetadata.getDefaultInstance());
 
     assertThat(logBatch.getKey().getKeyEncryptionType())
         .isEqualTo(KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256);
@@ -2358,7 +2579,7 @@ public final class CrumblesLogsEncryptorTest {
   @Test
   public void serializeBytes_whenTargetExists_replacesItAndLeavesNoTempFile() throws Exception {
     Path baseDir = Files.createTempDirectory("crumbles_test_");
-    Path existingFile = Files.writeString(baseDir.resolve("batch.bin"), "stale batch");
+    Path existingFile = Files.write(baseDir.resolve("batch.bin"), "stale batch".getBytes(UTF_8));
     LogBatch logBatch =
         CrumblesLogsEncryptor.assembleCipherText(
             new byte[] {1, 2, 3}, new byte[] {4, 5, 6}, new byte[12], "device-123");
@@ -2374,7 +2595,8 @@ public final class CrumblesLogsEncryptorTest {
   public void serializeBytes_whenMoveFails_throwsAndDeletesTempFile() throws Exception {
     Path baseDir = Files.createTempDirectory("crumbles_test_");
     Path blockingDirectory = Files.createDirectory(baseDir.resolve("batch.bin"));
-    Files.writeString(blockingDirectory.resolve("child"), "keeps the directory non-empty");
+    Files.write(
+        blockingDirectory.resolve("child"), "keeps the directory non-empty".getBytes(UTF_8));
     LogBatch logBatch =
         CrumblesLogsEncryptor.assembleCipherText(
             new byte[] {1, 2, 3}, new byte[] {4, 5, 6}, new byte[12], "device-123");
@@ -2477,7 +2699,7 @@ public final class CrumblesLogsEncryptorTest {
 
     // When: The plain logs are re-encrypted for the recipient public key.
     LogBatch reEncryptedBatch =
-        encryptor.reEncryptLogBatch(plainLogs, encryptor.getPublicKey(), "original-device");
+        encryptor.reEncryptLogBatch(plainLogs, encryptor.getPublicKey(), ORIGINAL);
 
     // Then: The re-encrypted batch can be successfully decrypted and content matches.
     byte[] decryptedLogs = decrypt(encryptor, reEncryptedBatch);
@@ -2503,7 +2725,8 @@ public final class CrumblesLogsEncryptorTest {
     byte[] plainLogs = "logs collected on the original device".getBytes(UTF_8);
 
     LogBatch reEncryptedBatch =
-        encryptor.reEncryptLogBatch(plainLogs, encryptor.getPublicKey(), "original-device-42");
+        encryptor.reEncryptLogBatch(
+            plainLogs, encryptor.getPublicKey(), recordedBy("original-device-42"));
     LogBatch fallbackDeviceBatch =
         reEncryptedBatch.toBuilder()
             .setMetadata(
@@ -2527,7 +2750,7 @@ public final class CrumblesLogsEncryptorTest {
 
     LogBatch reEncryptedBatch =
         encryptor.reEncryptLogBatch(
-            new byte[] {1, 2, 3}, encryptor.getPublicKey(), /* originalDeviceId= */ null);
+            new byte[] {1, 2, 3}, encryptor.getPublicKey(), LogMetadata.getDefaultInstance());
 
     assertThat(decryptLogBatch(encryptor, reEncryptedBatch).metadata().getDevice().getDeviceId())
         .isEqualTo(CrumblesDeviceIdManager.FALLBACK_DEVICE_ID);
@@ -2541,7 +2764,7 @@ public final class CrumblesLogsEncryptorTest {
 
     LogBatch batch =
         encryptor.encryptLogsAttributedTo(
-            "original-device-42", plainLogs, encryptor.getPublicKey());
+            recordedBy("original-device-42"), plainLogs, encryptor.getPublicKey());
 
     DecryptedLogBatch decryptedBatch = decryptLogBatch(encryptor, batch);
     expect.that(batch.getMetadata().getDevice().getDeviceId()).isEmpty();
@@ -2645,7 +2868,9 @@ public final class CrumblesLogsEncryptorTest {
     localEncryptor.generateKeyPair();
     FakeAndroidKeyStoreSpi.setUserAuthenticated(true);
     PublicKey keyBeforeFailure = localEncryptor.getPublicKey();
-    LogBatch validBatch = localEncryptor.encryptLogs(context, "secret".getBytes(UTF_8), null);
+    LogBatch validBatch =
+        localEncryptor.encryptLogs(
+            context, "secret".getBytes(UTF_8), null, /* attestationChain= */ ImmutableList.of());
     LogBatch corrupted =
         CrumblesLogsEncryptor.assembleCipherText(
             new byte[] {1, 2, 3}, new byte[] {9, 9, 9}, new byte[12], "device-123");

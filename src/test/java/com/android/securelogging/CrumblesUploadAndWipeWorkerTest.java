@@ -26,6 +26,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.robolectric.Shadows.shadowOf;
+import static org.robolectric.util.ReflectionHelpers.callInstanceMethod;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -54,8 +55,8 @@ import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.audit.CrumblesAuditEvent;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.google.common.collect.ImmutableList;
-import com.google.common.time.Sleeper;
 import com.google.common.truth.Expect;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
@@ -65,6 +66,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
+import java.security.KeyPairGenerator;
 import java.security.PublicKey;
 import java.security.Security;
 import java.time.Duration;
@@ -76,6 +78,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
@@ -85,6 +88,8 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.Robolectric;
 import org.robolectric.shadows.ShadowNetworkCapabilities;
+import org.robolectric.shadows.ShadowSystemClock;
+import org.robolectric.util.ReflectionHelpers.ClassParameter;
 
 /** Unit tests for {@link CrumblesUploadAndWipeWorker}. */
 @RunWith(AndroidJUnit4.class)
@@ -174,6 +179,11 @@ public final class CrumblesUploadAndWipeWorkerTest {
         res.putParcelable("uri", Uri.parse("content://" + SAF_AUTHORITY + "/document/" + name));
         return res;
       }
+      if (Objects.equals(method, "android:isChildDocument")) {
+        Bundle res = new Bundle();
+        res.putBoolean("result", true);
+        return res;
+      }
       return null;
     }
 
@@ -219,7 +229,8 @@ public final class CrumblesUploadAndWipeWorkerTest {
     encryptor = mock(CrumblesLogsEncryptor.class);
     when(encryptor.doesPrivateKeyExist()).thenReturn(true);
     when(encryptor.getPublicKey()).thenReturn(mock(PublicKey.class));
-    when(encryptor.encryptLogs(any(), any(), any())).thenReturn(LogBatch.getDefaultInstance());
+    when(encryptor.encryptLogs(any(), any(), any(), any(), any()))
+        .thenReturn(LogBatch.getDefaultInstance());
     when(encryptor.serializeBytes(any(), any(), any()))
         .thenAnswer(
             inv -> {
@@ -555,7 +566,8 @@ public final class CrumblesUploadAndWipeWorkerTest {
     Thread wipe =
         new Thread(
             () -> {
-              var _ = CrumblesUploadAndWipeWorker.wipeAllBatches(context);
+              @SuppressWarnings("unused")
+              var unusedWiped = CrumblesUploadAndWipeWorker.wipeAllBatches(context);
             });
     try {
       Future<Integer> drain =
@@ -579,7 +591,7 @@ public final class CrumblesUploadAndWipeWorkerTest {
       wipe.start();
       long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
       while (wipe.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
-        Sleeper.defaultSleeper().sleep(Duration.ofMillis(10));
+        Uninterruptibles.sleepUninterruptibly(10, MILLISECONDS);
       }
       release.countDown();
       expect.that(drain.get(10, SECONDS)).isEqualTo(2);
@@ -589,6 +601,68 @@ public final class CrumblesUploadAndWipeWorkerTest {
     }
     expect.that(logsDirectory.list()).isEmpty();
     expect.that(staging.isEmpty()).isTrue();
+  }
+
+  @Test
+  public void doWork_whenTheServerPacesTheUploads_leavesTheBatchesPastItsBudget() throws Exception {
+    File first = createBatch("crumbles_logs_encrypted_1.bin");
+    File second = createBatch("crumbles_logs_encrypted_2.bin");
+    File third = createBatch("crumbles_logs_encrypted_3.bin");
+    Semaphore arrived = new Semaphore(0);
+    Semaphore answered = new Semaphore(0);
+    duringUpload =
+        () -> {
+          arrived.release();
+          try {
+            @SuppressWarnings("unused")
+            var unusedAcquired = answered.tryAcquire(/* timeout= */ 20, SECONDS);
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+          }
+        };
+    ExecutorService workerThread = Executors.newSingleThreadExecutor();
+    try {
+      Future<Result> run = workerThread.submit(this::runWorker);
+      // Each upload takes 50 s by the clock, so the third ends past the two minutes of the budget,
+      // and the server holds it.
+      for (int upload = 1; upload <= 3; upload++) {
+        assertThat(arrived.tryAcquire(/* timeout= */ 10, SECONDS)).isTrue();
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(50));
+        if (upload < 3) {
+          answered.release();
+        }
+      }
+
+      Result result = run.get(/* timeout= */ 10, SECONDS);
+
+      expect.that(result).isEqualTo(Result.success());
+      expect.that(first.exists()).isFalse();
+      expect.that(second.exists()).isFalse();
+      expect.that(third.exists()).isTrue();
+      expect.that(CrumblesUploadAndWipeWorker.getBatchesLeft(context)).isEqualTo(1);
+    } finally {
+      answered.release(/* permits= */ 10);
+      workerThread.shutdownNow();
+    }
+  }
+
+  @Test
+  public void doWork_whenStoppedMidUpload_wipesUploadedBatchWithoutStartingTheNext()
+      throws Exception {
+    File first = createBatch("crumbles_logs_encrypted_1.bin");
+    File second = createBatch("crumbles_logs_encrypted_2.bin");
+    CrumblesUploadAndWipeWorker worker =
+        TestListenableWorkerBuilder.from(context, CrumblesUploadAndWipeWorker.class).build();
+    duringUpload =
+        () -> callInstanceMethod(worker, "stop", ClassParameter.from(int.class, /* value= */ 1));
+
+    Result result = worker.doWork();
+
+    expect.that(result).isEqualTo(Result.success());
+    expect.that(uploadedNames).containsExactly(first.getName());
+    expect.that(first.exists()).isFalse();
+    expect.that(second.exists()).isTrue();
+    expect.that(CrumblesUploadAndWipeWorker.getBatchesLeft(context)).isEqualTo(1);
   }
 
   @Test
@@ -612,8 +686,28 @@ public final class CrumblesUploadAndWipeWorkerTest {
         .containsExactly("Upload and wipe of every pending batch requested.");
   }
 
+  @Test
+  public void countPendingBatches_countsPendingStagedAndDirectBootBatches() throws Exception {
+    createBatch("pending.bin");
+    createBatch("uploaded" + CrumblesConstants.SENT_SUFFIX);
+    createStagedBatch("0000000000000000001-S.sealed");
+    when(encryptor.encryptLogsBeforeFirstUnlock(any(), any(), any(), any()))
+        .thenReturn(LogBatch.getDefaultInstance());
+    CrumblesDirectBootStore directBootStore = new CrumblesDirectBootStore(context);
+    directBootStore.rememberRecipient(
+        CrumblesDirectBootStore.forgottenRecipients(),
+        KeyPairGenerator.getInstance("RSA").generateKeyPair().getPublic(),
+        "device-id",
+        ImmutableList.of());
+    assertThat(directBootStore.saveBatch(new byte[0])).isTrue();
+
+    assertThat(CrumblesUploadAndWipeWorker.countPendingBatches(context)).isEqualTo(3);
+  }
+
   private void configureSafDestination() throws Exception {
-    var _ = Robolectric.setupContentProvider(FakeSafContentProvider.class, SAF_AUTHORITY);
+    @SuppressWarnings("unused")
+    var unusedProvider =
+        Robolectric.setupContentProvider(FakeSafContentProvider.class, SAF_AUTHORITY);
     context.grantUriPermission(
         context.getPackageName(),
         SAF_TREE_URI,
@@ -662,7 +756,7 @@ public final class CrumblesUploadAndWipeWorkerTest {
   @CanIgnoreReturnValue
   private File createBatch(String name) throws IOException {
     File batch = new File(logsDirectory, name);
-    Files.writeString(batch.toPath(), "encrypted batch");
+    Files.write(batch.toPath(), "encrypted batch".getBytes(UTF_8));
     return batch;
   }
 

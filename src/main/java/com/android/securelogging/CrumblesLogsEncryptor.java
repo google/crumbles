@@ -40,7 +40,6 @@ import com.android.securelogging.exceptions.CrumblesLogsDecryptionException;
 import com.android.securelogging.exceptions.CrumblesLogsEncryptionException;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
-import com.google.common.time.TimeSource;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedOutputStream;
@@ -87,14 +86,17 @@ import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.RSAKeyGenParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -266,9 +268,10 @@ public class CrumblesLogsEncryptor {
    * @param rsaOnly batches without a usable batch-wrapped key, which only the Keystore RSA key may
    *     decrypt, one operation each: batches written before the batch-unwrap keys existed, or
    *     encrypted to an external key
-   * @param undecryptable batches whose batch-unwrap keys were replaced after they were written.
-   *     Those keys are only replaced together with the Keystore RSA key, so no key on this device
-   *     can decrypt these batches.
+   * @param undecryptable batches that no key on this device can decrypt: batches whose batch-unwrap
+   *     keys were replaced after they were written, as those keys are only replaced together with
+   *     the Keystore RSA key, and for a key change the batches that {@link #partitionForKeyChange}
+   *     takes to be for another key
    */
   record BulkDecryptPartition(
       ImmutableList<LogBatch> batchUnwrappable,
@@ -652,7 +655,7 @@ public class CrumblesLogsEncryptor {
   }
 
   public static LogMetadata assembleMetadata(int blobSize, String deviceId) {
-    return sealedMetadata(deviceId).toBuilder()
+    return sealedMetadata(deviceId, /* timestamp= */ null).toBuilder()
         .setBlobSize(blobSize)
         .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM)
         .build();
@@ -663,19 +666,33 @@ public class CrumblesLogsEncryptor {
   }
 
   /**
-   * Returns the metadata that a format version 2 batch seals: the current time and {@code
-   * deviceId}, or the fallback device identifier if {@code deviceId} is empty.
+   * Returns the metadata that a format version 2 batch seals: {@code timestamp}, or the current
+   * time if it is null, and {@code deviceId}, or the fallback device identifier if it is empty.
    */
-  private static LogMetadata sealedMetadata(@Nullable String deviceId) {
+  private static LogMetadata sealedMetadata(
+      @Nullable String deviceId, @Nullable Timestamp timestamp) {
     DeviceId deviceProto =
         DeviceId.newBuilder()
             .setDeviceId(
                 isNullOrEmpty(deviceId) ? CrumblesDeviceIdManager.FALLBACK_DEVICE_ID : deviceId)
             .build();
     return LogMetadata.newBuilder()
-        .setTimestamp(timestampFromMillis(TimeSource.system().instant().toEpochMilli()))
+        .setTimestamp(
+            timestamp != null
+                ? timestamp
+                : timestampFromMillis(Instant.now().toEpochMilli()))
         .setDevice(deviceProto)
         .build();
+  }
+
+  /**
+   * Returns the time that {@code original}, the metadata of a decrypted batch, records, or null if
+   * it records none. A copy of the batch seals that time rather than the time of copying, as its
+   * recipient judges how recent the logs are from the newest batch.
+   */
+  @Nullable
+  private static Timestamp recordedTime(LogMetadata original) {
+    return original.hasTimestamp() ? original.getTimestamp() : null;
   }
 
   /**
@@ -845,28 +862,55 @@ public class CrumblesLogsEncryptor {
 
   /**
    * Encrypts plain logs of this installation using the provided public key and context for device
-   * attribution. The batch seals the attestation chain of this installation's batch-signing key,
-   * creating that key if there is none, for {@link CrumblesBatchSigner} to sign the batch.
+   * attribution. The batch seals {@code attestationChain}, for {@link CrumblesBatchSigner} to sign
+   * the batch with the key that the chain attests.
    *
-   * @param context the Android context to resolve the device ID and the batch-signing key from, or
-   *     {@code null} to seal no attestation chain
+   * @param context the Android context to resolve the device ID from, if any
    * @param plainLogsBytes the plain log data
    * @param publicKey the specific public key to use for encryption
+   * @param attestationChain the chain from {@link CrumblesBatchSigner#attestationChainToSeal}, or
+   *     an empty list for a batch that stays unsigned
    * @return a {@link LogBatch} containing encrypted logs, or {@code null} if no key is available
    */
   @CanIgnoreReturnValue
   @Nullable
   public LogBatch encryptLogs(
-      @Nullable Context context, byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
+      @Nullable Context context,
+      byte[] plainLogsBytes,
+      @Nullable PublicKey publicKey,
+      List<ByteString> attestationChain) {
     if (context != null) {
       setApplicationContext(context);
     }
     return encryptLogsInternal(
-        plainLogsBytes, publicKey, CrumblesDeviceIdManager.getDeviceId(context), context);
+        plainLogsBytes,
+        publicKey,
+        sealedMetadata(CrumblesDeviceIdManager.getDeviceId(context), /* timestamp= */ null),
+        attestationChain);
   }
 
   /**
-   * Encrypts log data and packages it into a {@link LogBatch} protobuf message bound with AAD.
+   * As {@link #encryptLogs(Context, byte[], PublicKey, List)}, but seals {@code deviceId} and
+   * {@code attestationChain}, which the caller read once, so that it knows what the batch sealed.
+   */
+  @Nullable
+  LogBatch encryptLogs(
+      Context context,
+      byte[] plainLogsBytes,
+      PublicKey publicKey,
+      String deviceId,
+      List<ByteString> attestationChain) {
+    setApplicationContext(context);
+    return encryptLogsInternal(
+        plainLogsBytes,
+        publicKey,
+        sealedMetadata(deviceId, /* timestamp= */ null),
+        attestationChain);
+  }
+
+  /**
+   * Encrypts log data and packages it into a {@link LogBatch} protobuf message bound with AAD. The
+   * batch seals no attestation chain, so it stays unsigned.
    *
    * @param plainLogsBytes the plain log data to encrypt
    * @param publicKey the public key to use for encryption, or {@code null} to use Keystore
@@ -875,35 +919,63 @@ public class CrumblesLogsEncryptor {
   @CanIgnoreReturnValue
   @Nullable
   public LogBatch encryptLogs(byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
-    return encryptLogs(cacheAndResolveContext(this.context), plainLogsBytes, publicKey);
+    return encryptLogs(
+        cacheAndResolveContext(this.context),
+        plainLogsBytes,
+        publicKey,
+        /* attestationChain= */ ImmutableList.of());
   }
 
   /**
-   * As {@link #encryptLogs(byte[], PublicKey)}, but seals {@code deviceId} in the batch instead of
-   * this device's ID, such as the ID of the device that wrote the batch the logs were decrypted
-   * from. The batch stays unsigned, so it seals no attestation chain and creates no batch-signing
-   * key.
+   * As {@link #encryptLogs(byte[], PublicKey)}, for the logs of a batch decrypted with {@code
+   * original} as its metadata: the new batch seals the device ID and the time that {@code original}
+   * records instead of this device's ID and the current time. The batch stays unsigned, so it seals
+   * no attestation chain and creates no batch-signing key.
    */
   @Nullable
   LogBatch encryptLogsAttributedTo(
-      String deviceId, byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
-    return encryptLogsInternal(plainLogsBytes, publicKey, deviceId, /* signingContext= */ null);
+      LogMetadata original, byte[] plainLogsBytes, @Nullable PublicKey publicKey) {
+    return encryptLogsInternal(
+        plainLogsBytes,
+        publicKey,
+        sealedMetadata(original.getDevice().getDeviceId(), recordedTime(original)),
+        /* attestationChain= */ ImmutableList.of());
+  }
+
+  /**
+   * As {@link #encryptLogs(Context, byte[], PublicKey, List)}, but for the logs of a batch that
+   * this installation signed, decrypted with {@code original} as its metadata, for {@link
+   * CrumblesBatchSigner#signAgain(LogBatch, LogBatch, List)} to sign the new batch: it keeps the
+   * time that {@code original} records instead of the current time and seals {@code
+   * attestationChain}.
+   */
+  @Nullable
+  LogBatch encryptLogsForSigningAgain(
+      Context context,
+      LogMetadata original,
+      byte[] plainLogsBytes,
+      @Nullable PublicKey publicKey,
+      List<ByteString> attestationChain) {
+    return encryptLogsInternal(
+        plainLogsBytes,
+        publicKey,
+        sealedMetadata(CrumblesDeviceIdManager.getDeviceId(context), recordedTime(original)),
+        attestationChain);
   }
 
   /**
    * Encrypts {@code plainLogsBytes} for {@code publicKey}, or the Keystore key when it is null.
    *
-   * @param signingContext the context of the installation that will sign the batch, whose
-   *     batch-signing key's attestation chain the batch seals, or {@code null} for a batch that
-   *     stays unsigned
+   * @param attestationChain the attestation chain of the batch-signing key that will sign the
+   *     batch, or an empty list for a batch that stays unsigned
    * @return the batch, or {@code null} if there is no key to encrypt to
    */
   @Nullable
   private LogBatch encryptLogsInternal(
       byte[] plainLogsBytes,
       @Nullable PublicKey publicKey,
-      String deviceId,
-      @Nullable Context signingContext) {
+      LogMetadata sealedMetadata,
+      List<ByteString> attestationChain) {
     try {
       PublicKey recipient =
           publicKey != null ? publicKey : loadKeystorePublicKey(KEY_ALIAS).orElse(null);
@@ -922,11 +994,7 @@ public class CrumblesLogsEncryptor {
               ? KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC
               : KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256;
       return encryptLogBatch(
-          plainLogsBytes,
-          recipient,
-          deviceId,
-          keyEncryptionType,
-          batchSigningKeyAttestationChain(signingContext));
+          plainLogsBytes, recipient, sealedMetadata, keyEncryptionType, attestationChain);
     } catch (CrumblesKeysException | RuntimeException e) {
       Log.e(TAG, "Unexpected runtime error during encryption process.", e);
       throw new CrumblesLogsEncryptionException(
@@ -936,10 +1004,9 @@ public class CrumblesLogsEncryptor {
 
   /**
    * Encrypts {@code plainLogsBytes} into a format version 2 {@link LogBatch} for {@code recipient}:
-   * a {@link SealedLogs} that holds the logs, the current time, {@code deviceId} and {@code
-   * attestationChain}, padded to its size bucket and bound to {@code recipient} by its associated
-   * data. A batch for the device Keystore key also carries its symmetric key wrapped with the
-   * batch-wrap key.
+   * a {@link SealedLogs} that holds the logs, {@code sealedMetadata} and {@code attestationChain},
+   * padded to its size bucket and bound to {@code recipient} by its associated data. A batch for
+   * the device Keystore key also carries its symmetric key wrapped with the batch-wrap key.
    *
    * @param attestationChain the attestation chain of this installation's batch-signing key for a
    *     batch that it will sign, or an empty list for a batch that stays unsigned
@@ -947,13 +1014,69 @@ public class CrumblesLogsEncryptor {
   private LogBatch encryptLogBatch(
       byte[] plainLogsBytes,
       PublicKey recipient,
-      @Nullable String deviceId,
+      LogMetadata sealedMetadata,
       KeyEncryptionType keyEncryptionType,
+      List<ByteString> attestationChain)
+      throws CrumblesKeysException {
+    SecretKey symKey = generateSecretKey();
+    LogBatch logBatch =
+        sealAndEncrypt(
+            symKey, plainLogsBytes, recipient, sealedMetadata, keyEncryptionType, attestationChain);
+    return isDeviceKey(recipient) ? addBatchWrappedKey(logBatch, symKey) : logBatch;
+  }
+
+  /**
+   * Encrypts {@code plainLogsBytes} for {@code recipient} as before the first unlock after a
+   * restart, when credential-encrypted storage and user-authenticated Keystore keys are unusable:
+   * as {@link #encryptLogs(Context, byte[], PublicKey, String, List)} does, but sealing {@code
+   * deviceId} and {@code attestationChain}, saved from an earlier batch, wrapping the key with
+   * RSA-OAEP, and without a batch-wrapped key. When the Keystore certificate of the device key can
+   * be read and matches {@code recipient}, the batch gets an empty batch-wrap key id to mark it as
+   * encrypted for the device key.
+   */
+  LogBatch encryptLogsBeforeFirstUnlock(
+      byte[] plainLogsBytes,
+      PublicKey recipient,
+      String deviceId,
       ImmutableList<ByteString> attestationChain)
+      throws CrumblesKeysException {
+    LogBatch logBatch =
+        sealAndEncrypt(
+            generateSecretKey(),
+            plainLogsBytes,
+            recipient,
+            sealedMetadata(deviceId, /* timestamp= */ null),
+            KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256,
+            attestationChain);
+    return isDeviceKeyIfReadable(recipient) ? withEmptyBatchWrapKeyId(logBatch) : logBatch;
+  }
+
+  private static boolean isDeviceKeyIfReadable(PublicKey recipient) {
+    try {
+      return isDeviceKey(recipient);
+    } catch (CrumblesKeysException e) {
+      // Marking the device key must never lose logs collected before the first unlock when the
+      // Keystore cannot read its certificate.
+      Log.w(TAG, "Failed to check whether pre-unlock recipient is the device key.", e);
+      return false;
+    }
+  }
+
+  /**
+   * Encrypts {@code plainLogsBytes} with {@code symKey} as {@link #encryptLogBatch} does, without a
+   * batch-wrapped key.
+   */
+  private LogBatch sealAndEncrypt(
+      SecretKey symKey,
+      byte[] plainLogsBytes,
+      PublicKey recipient,
+      LogMetadata sealedMetadata,
+      KeyEncryptionType keyEncryptionType,
+      List<ByteString> attestationChain)
       throws CrumblesKeysException {
     SealedLogs sealedLogs =
         SealedLogs.newBuilder()
-            .setMetadata(sealedMetadata(deviceId))
+            .setMetadata(sealedMetadata)
             .setLogs(ByteString.copyFrom(plainLogsBytes))
             .addAllAttestationChain(attestationChain)
             .build();
@@ -963,7 +1086,6 @@ public class CrumblesLogsEncryptor {
             .setBlobSize(paddedLogs.length + GCM_TAG_LEN_BYTES)
             .setEncryptionType(LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA)
             .build();
-    SecretKey symKey = generateSecretKey();
     EncryptedData encryptedData =
         encryptData(
             symKey,
@@ -971,51 +1093,24 @@ public class CrumblesLogsEncryptor {
             computeAssociatedData(logMetadata, keyEncryptionType, recipient),
             recipient,
             keyEncryptionType == KeyEncryptionType.KEY_ENCRYPTION_TYPE_ASYMMETRIC);
-    LogBatch logBatch =
-        assembleCipherText(
-            encryptedData.ciphertext,
-            encryptedData.encryptedSymmetricKey,
-            encryptedData.initializationVector,
-            logMetadata,
-            keyEncryptionType);
-    return isDeviceKey(recipient) ? addBatchWrappedKey(logBatch, symKey) : logBatch;
-  }
-
-  /**
-   * Returns the attestation chain of the batch-signing key of the installation that {@code
-   * signingContext} belongs to, for a format version 2 batch that it will sign to seal, as {@link
-   * CrumblesBatchSigner} leaves the chain out of the cleartext signature. Reading the chain creates
-   * the key if the installation has none.
-   *
-   * <p>Returns an empty list without a context, so that a batch that stays unsigned neither seals a
-   * chain nor creates a key, and if the chain cannot be read, as on devices without key
-   * attestation: the batch is then still written, without the chain that its recipient needs to
-   * check a signature.
-   */
-  private static ImmutableList<ByteString> batchSigningKeyAttestationChain(
-      @Nullable Context signingContext) {
-    if (signingContext == null) {
-      return ImmutableList.of();
-    }
-    try {
-      return new CrumblesBatchSigningKey(signingContext).attestationChain();
-    } catch (CrumblesKeysException | RuntimeException e) {
-      // Sealing the chain must never keep the logs from being written, and Keystore on some OEM
-      // builds throws unchecked exceptions other than the ProviderException that
-      // attestationChain() reports as CrumblesKeysException.
-      Log.w(TAG, "Failed to read the attestation chain of the batch-signing key.", e);
-      return ImmutableList.of();
-    }
+    return assembleCipherText(
+        encryptedData.ciphertext,
+        encryptedData.encryptedSymmetricKey,
+        encryptedData.initializationVector,
+        logMetadata,
+        keyEncryptionType);
   }
 
   /**
    * Adds {@code symKey}, wrapped with the batch-wrap key, to {@code logBatch}, so that one
    * authentication can unwrap it together with the keys of other batches. Without batch-unwrap
-   * keys, or if wrapping fails, the batch keeps only its RSA-wrapped key.
+   * keys, or if wrapping fails, the batch keeps only its RSA-wrapped key, with an empty batch-wrap
+   * key id: batches for an external key have none, so the id still tells that the batch is for the
+   * device key.
    */
   private LogBatch addBatchWrappedKey(LogBatch logBatch, SecretKey symKey) {
     if (!CrumblesBatchKeyStore.hasKeys()) {
-      return logBatch;
+      return withEmptyBatchWrapKeyId(logBatch);
     }
     CrumblesBatchKeyStore.WrappedKey wrappedKey;
     try {
@@ -1025,13 +1120,19 @@ public class CrumblesLogsEncryptor {
       logBatchWrapFailure(
           "A log batch was written without its batch-wrapped key; reading it needs its own"
               + " authentication.");
-      return logBatch;
+      return withEmptyBatchWrapKeyId(logBatch);
     }
     return logBatch.toBuilder()
         .setKey(
             logBatch.getKey().toBuilder()
                 .setBatchWrappedSymmetricKey(wrappedKey.wrappedKey())
                 .setBatchWrapKeyId(wrappedKey.keyId()))
+        .build();
+  }
+
+  private static LogBatch withEmptyBatchWrapKeyId(LogBatch logBatch) {
+    return logBatch.toBuilder()
+        .setKey(logBatch.getKey().toBuilder().setBatchWrapKeyId(ByteString.EMPTY))
         .build();
   }
 
@@ -1184,13 +1285,46 @@ public class CrumblesLogsEncryptor {
    * {@code logBatches}.
    */
   BulkDecryptPartition partitionForBulkDecrypt(List<LogBatch> logBatches) {
+    return groupForBulkDecrypt(logBatches, /* isForAnotherKey= */ logBatch -> false);
+  }
+
+  /**
+   * Groups {@code logBatches} as {@link #partitionForBulkDecrypt} does, for a key change, which
+   * must not ask for the device credential for each batch that the Keystore key cannot decrypt. A
+   * batch without a batch-wrap key id is taken to be for another key, and so undecryptable, if its
+   * RSA-wrapped key does not have the size of the Keystore key's modulus, or if {@code
+   * mayBeForAnExternalKey} accepts it: batches for an external key never have one, while batches
+   * for the Keystore key only lack one if an earlier version wrote them without a batch-wrapped
+   * key.
+   */
+  BulkDecryptPartition partitionForKeyChange(
+      List<LogBatch> logBatches, Predicate<LogBatch> mayBeForAnExternalKey) {
+    OptionalInt keystoreModulusBytes = keystoreModulusBytes();
+    return groupForBulkDecrypt(
+        logBatches,
+        logBatch ->
+            !logBatch.getKey().hasBatchWrapKeyId()
+                && (mayBeForAnExternalKey.test(logBatch)
+                    || (keystoreModulusBytes.isPresent()
+                        && logBatch.getKey().getEncryptedSymmetricKey().size()
+                            != keystoreModulusBytes.getAsInt())));
+  }
+
+  /**
+   * Groups {@code logBatches} as {@link #partitionForBulkDecrypt} does, except that each batch that
+   * {@code isForAnotherKey} accepts is undecryptable.
+   */
+  private static BulkDecryptPartition groupForBulkDecrypt(
+      List<LogBatch> logBatches, Predicate<LogBatch> isForAnotherKey) {
     Optional<ByteString> batchWrapKeyId = currentBatchWrapKeyId();
     ImmutableList.Builder<LogBatch> batchUnwrappable = ImmutableList.builder();
     ImmutableList.Builder<LogBatch> rsaOnly = ImmutableList.builder();
     ImmutableList.Builder<LogBatch> undecryptable = ImmutableList.builder();
     for (LogBatch logBatch : logBatches) {
       LogKey key = logBatch.getKey();
-      if (!carriesBatchWrappedKey(key) || batchWrapKeyId.isEmpty()) {
+      if (isForAnotherKey.test(logBatch)) {
+        undecryptable.add(logBatch);
+      } else if (!carriesBatchWrappedKey(key) || batchWrapKeyId.isEmpty()) {
         rsaOnly.add(logBatch);
       } else if (key.getBatchWrapKeyId().equals(batchWrapKeyId.get())) {
         batchUnwrappable.add(logBatch);
@@ -1200,6 +1334,13 @@ public class CrumblesLogsEncryptor {
     }
     return new BulkDecryptPartition(
         batchUnwrappable.build(), rsaOnly.build(), undecryptable.build());
+  }
+
+  /** Returns the size in bytes of the Keystore key's modulus, or empty if there is no such key. */
+  private OptionalInt keystoreModulusBytes() {
+    return getPublicKey() instanceof RSAPublicKey rsaKey
+        ? OptionalInt.of((rsaKey.getModulus().bitLength() + Byte.SIZE - 1) / Byte.SIZE)
+        : OptionalInt.empty();
   }
 
   /**
@@ -1446,7 +1587,7 @@ public class CrumblesLogsEncryptor {
   public LogBatch deserializeFile(Path filePath) {
     try {
       byte[] serializedBytes = Files.readAllBytes(filePath);
-      return LogBatch.parseFrom(serializedBytes, ExtensionRegistryLite.getGeneratedRegistry());
+      return LogBatch.parseFrom(serializedBytes, ExtensionRegistryLite.getEmptyRegistry());
     } catch (IOException e) {
       throw new CrumblesLogsEncryptionException("Failed to deserialize bytes from file.", e);
     }
@@ -1691,9 +1832,7 @@ public class CrumblesLogsEncryptor {
     try {
       return decryptDataStoreEntryWithAad(payload, entryIdAsAssociatedData(entryId));
     } catch (CrumblesKeysException e) {
-      Log.w(
-          TAG,
-          "Entry is not bound to its identifier; assuming it predates entry binding.");
+      Log.w(TAG, "Entry is not bound to its identifier; assuming it predates entry binding.");
       return decryptDataStoreEntryWithAad(payload, /* aad= */ null);
     }
   }
@@ -1865,50 +2004,50 @@ public class CrumblesLogsEncryptor {
    * Re-encrypts plain log bytes under a new public key and packages the result into a {@link
    * LogBatch}.
    *
-   * <p>The new batch is attributed to {@code originalDeviceId}, the device that produced the batch
-   * the logs were decrypted from, in the metadata that it seals. It stays unsigned, so it seals no
-   * attestation chain and creates no batch-signing key; see {@link #reEncryptLogBatchForSigning}
-   * for a batch that this installation signed.
+   * <p>The new batch is attributed to the batch the logs were decrypted from, whose metadata is
+   * {@code original}: it seals the device ID and the time that {@code original} records. It stays
+   * unsigned, so it seals no attestation chain and creates no batch-signing key; see {@link
+   * #reEncryptLogBatchForSigning} for a batch that this installation signed.
    *
    * @param plainLogsBytes the plain log bytes to re-encrypt
    * @param reEncryptionKey the public key to wrap the per-batch symmetric key with
-   * @param originalDeviceId the device id from the original batch's {@link LogMetadata}, or {@code
-   *     null} if unknown
+   * @param original the metadata of the decrypted batch, with what it sealed
    * @return a newly assembled {@link LogBatch} bound with AAD
    * @throws CrumblesKeysException if key wrapping fails
    */
   public LogBatch reEncryptLogBatch(
-      byte[] plainLogsBytes, PublicKey reEncryptionKey, @Nullable String originalDeviceId)
+      byte[] plainLogsBytes, PublicKey reEncryptionKey, LogMetadata original)
       throws CrumblesKeysException {
     return encryptLogBatch(
         plainLogsBytes,
         reEncryptionKey,
-        originalDeviceId,
+        sealedMetadata(original.getDevice().getDeviceId(), recordedTime(original)),
         KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256,
         /* attestationChain= */ ImmutableList.of());
   }
 
   /**
    * As {@link #reEncryptLogBatch}, but for the logs of a batch that this installation signed, for
-   * {@link CrumblesBatchSigner#signAgain} to sign the new batch: it is attributed to this device
-   * and seals the attestation chain of this installation's batch-signing key, read with {@code
-   * context}.
-   *
-   * <p>Reading the chain creates the batch-signing key if the installation has none, so only call
-   * this once {@link CrumblesBatchSigner#isSignedByThisInstallation} confirmed that the original
-   * batch is this installation's.
+   * {@link CrumblesBatchSigner#signAgain(LogBatch, LogBatch, List)} to sign the new batch: it keeps
+   * the time that {@code original} records, but is attributed to this device, read with {@code
+   * context}, and seals {@code attestationChain}, from {@link
+   * CrumblesBatchSigner#attestationChainToSeal}.
    *
    * @throws CrumblesKeysException if key wrapping fails
    */
   LogBatch reEncryptLogBatchForSigning(
-      Context context, byte[] plainLogsBytes, PublicKey reEncryptionKey)
+      Context context,
+      byte[] plainLogsBytes,
+      PublicKey reEncryptionKey,
+      LogMetadata original,
+      List<ByteString> attestationChain)
       throws CrumblesKeysException {
     return encryptLogBatch(
         plainLogsBytes,
         reEncryptionKey,
-        CrumblesDeviceIdManager.getDeviceId(context),
+        sealedMetadata(CrumblesDeviceIdManager.getDeviceId(context), recordedTime(original)),
         KeyEncryptionType.KEY_ENCRYPTION_TYPE_RSA_OAEP_SHA256,
-        batchSigningKeyAttestationChain(context));
+        attestationChain);
   }
 
   /**

@@ -25,7 +25,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
-import java.security.ProviderException;
 import java.security.SecureRandom;
 import java.util.Optional;
 import javax.crypto.AEADBadTagException;
@@ -74,9 +73,17 @@ final class CrumblesLogStagingSealer {
     byte[] dataKey = new byte[KEY_SIZE_BYTES];
     random.nextBytes(dataKey);
     Cipher wrapCipher = Cipher.getInstance(TRANSFORMATION);
-    // The Keystore picks the IV, as it requires for encryption.
-    wrapCipher.init(Cipher.ENCRYPT_MODE, loadOrCreateWrappingKey());
-    byte[] wrappedKey = wrapCipher.doFinal(dataKey);
+    byte[] wrappedKey;
+    try {
+      // The Keystore picks the IV, as it requires for encryption.
+      wrapCipher.init(Cipher.ENCRYPT_MODE, loadOrCreateWrappingKey());
+      wrappedKey = wrapCipher.doFinal(dataKey);
+    } catch (RuntimeException e) {
+      // Keystore reports some failures, such as losing its connection to the Keystore service, as
+      // ProviderException, and on some OEM builds throws other unchecked exceptions. Callers handle
+      // them as any other Keystore failure.
+      throw new GeneralSecurityException("Keystore failed to wrap the data key.", e);
+    }
     byte[] dataIv = new byte[IV_SIZE_BYTES];
     random.nextBytes(dataIv);
     Cipher dataCipher = Cipher.getInstance(TRANSFORMATION);
@@ -107,17 +114,25 @@ final class CrumblesLogStagingSealer {
     if (sealed.length < OVERHEAD_BYTES || sealed[0] != VERSION) {
       throw new AEADBadTagException("Staged batch is truncated or in an unknown format.");
     }
-    Optional<SecretKey> wrappingKey = loadWrappingKey();
-    if (wrappingKey.isEmpty()) {
-      throw new AEADBadTagException("The key that wrapped the staged batch is gone.");
+    byte[] dataKey;
+    try {
+      Optional<SecretKey> wrappingKey = loadWrappingKey();
+      if (wrappingKey.isEmpty()) {
+        throw new AEADBadTagException("The key that wrapped the staged batch is gone.");
+      }
+      Cipher unwrapCipher = Cipher.getInstance(TRANSFORMATION);
+      unwrapCipher.init(
+          Cipher.DECRYPT_MODE,
+          wrappingKey.get(),
+          new GCMParameterSpec(TAG_SIZE_BYTES * 8, sealed, 1, IV_SIZE_BYTES));
+      dataKey =
+          unwrapCipher.doFinal(sealed, WRAPPED_KEY_OFFSET, DATA_IV_OFFSET - WRAPPED_KEY_OFFSET);
+    } catch (RuntimeException e) {
+      // As in seal. Not an AEADBadTagException, which would get the batch deleted as unreadable.
+      // The AEADBadTagException of a batch that can never be unsealed is checked, so it still
+      // propagates.
+      throw new GeneralSecurityException("Keystore failed to unwrap the data key.", e);
     }
-    Cipher unwrapCipher = Cipher.getInstance(TRANSFORMATION);
-    unwrapCipher.init(
-        Cipher.DECRYPT_MODE,
-        wrappingKey.get(),
-        new GCMParameterSpec(TAG_SIZE_BYTES * 8, sealed, 1, IV_SIZE_BYTES));
-    byte[] dataKey =
-        unwrapCipher.doFinal(sealed, WRAPPED_KEY_OFFSET, DATA_IV_OFFSET - WRAPPED_KEY_OFFSET);
     Cipher dataCipher = Cipher.getInstance(TRANSFORMATION);
     dataCipher.init(
         Cipher.DECRYPT_MODE,
@@ -149,7 +164,9 @@ final class CrumblesLogStagingSealer {
     }
     try {
       return generateWrappingKey(/* strongBoxBacked= */ true);
-    } catch (GeneralSecurityException | ProviderException e) {
+    } catch (GeneralSecurityException | RuntimeException e) {
+      // StrongBox can be missing, or fail with ProviderException or, on some OEM builds, with other
+      // unchecked exceptions, while the TEE works.
       return generateWrappingKey(/* strongBoxBacked= */ false);
     }
   }

@@ -19,6 +19,7 @@ package com.android.securelogging;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
@@ -29,8 +30,9 @@ import static org.mockito.Mockito.when;
 
 import android.os.Build;
 import android.security.keystore.UserNotAuthenticatedException;
-import android.support.v4.app.FragmentActivity;
+import androidx.biometric.BiometricManager.Authenticators;
 import androidx.biometric.BiometricPrompt;
+import androidx.fragment.app.FragmentActivity;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.android.securelogging.CrumblesLogsEncryptor.BulkDecryptPartition;
 import com.android.securelogging.CrumblesLogsEncryptor.DecryptedLogBatch;
@@ -45,6 +47,7 @@ import com.google.protos.wireless_android_security_exploits_secure_logging_src_m
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogMetadata;
 import java.security.Security;
 import java.util.Arrays;
+import java.util.function.Predicate;
 import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
@@ -106,6 +109,16 @@ public final class CrumblesAuthorizedLogDecryptorTest {
       ImmutableList<LogBatch> undecryptable) {
     when(mockLogsEncryptor.partitionForBulkDecrypt(BOTH_BATCHES))
         .thenReturn(new BulkDecryptPartition(batchUnwrappable, rsaOnly, undecryptable));
+    when(mockLogsEncryptor.partitionForKeyChange(eq(BOTH_BATCHES), any()))
+        .thenReturn(new BulkDecryptPartition(batchUnwrappable, rsaOnly, undecryptable));
+  }
+
+  /** Returns a decryptor for the pending logs of a key change away from the Keystore key. */
+  private CrumblesAuthorizedLogDecryptor keyChangeDecryptor() {
+    return CrumblesAuthorizedLogDecryptor.forKeyChange(
+        activityController.get(),
+        mockLogsEncryptor,
+        /* mayBeForAnExternalKey= */ logBatch -> false);
   }
 
   @Test
@@ -129,6 +142,17 @@ public final class CrumblesAuthorizedLogDecryptorTest {
     verify(mockCallback).onDecrypted(SECOND_BATCH, secondLogs);
     verify(mockCallback).onFinished();
     assertThat(ShadowBiometricPrompt.getCurrentPrompt()).isNull();
+  }
+
+  @Test
+  public void decrypt_asksForTheDeviceCredentialOnly() throws Exception {
+    partition(BOTH_BATCHES, NO_BATCHES, NO_BATCHES);
+    when(mockLogsEncryptor.createBatchUnwrapCipher()).thenReturn(unwrapCipher);
+
+    decryptor.decrypt(BOTH_BATCHES, mockCallback);
+
+    assertThat(ShadowBiometricPrompt.getCurrentPrompt().getAllowedAuthenticators())
+        .isEqualTo(Authenticators.DEVICE_CREDENTIAL);
   }
 
   @Test
@@ -174,7 +198,7 @@ public final class CrumblesAuthorizedLogDecryptorTest {
   }
 
   @Test
-  public void decrypt_withoutBatchUnwrapCipher_decryptsWithTheRsaKeyWithoutPrompt()
+  public void decrypt_withoutBatchUnwrapCipher_decryptsWithTheRsaKeyAfterOnePrompt()
       throws Exception {
     partition(ImmutableList.of(FIRST_BATCH), ImmutableList.of(SECOND_BATCH), NO_BATCHES);
     when(mockLogsEncryptor.createBatchUnwrapCipher())
@@ -184,6 +208,8 @@ public final class CrumblesAuthorizedLogDecryptorTest {
 
     decryptor.decrypt(BOTH_BATCHES, mockCallback);
     ShadowLooper.idleMainLooper();
+    ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
+    ShadowLooper.idleMainLooper();
 
     verify(mockCallback).onDecrypted(FIRST_BATCH, firstLogs);
     verify(mockCallback).onDecrypted(SECOND_BATCH, secondLogs);
@@ -192,13 +218,25 @@ public final class CrumblesAuthorizedLogDecryptorTest {
   }
 
   @Test
-  public void decrypt_whileTheRsaKeyWindowIsOpen_decryptsEveryBatchWithoutPrompt()
+  public void decrypt_whileTheRsaKeyWindowIsOpen_asksForTheDeviceCredentialFirst()
       throws Exception {
+    partition(NO_BATCHES, BOTH_BATCHES, NO_BATCHES);
+
+    decryptor.decrypt(BOTH_BATCHES, mockCallback);
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor, never()).decryptLogBatch(any(LogBatch.class));
+    assertThat(ShadowBiometricPrompt.getCurrentPrompt().getAllowedAuthenticators())
+        .isEqualTo(Authenticators.DEVICE_CREDENTIAL);
+  }
+
+  @Test
+  public void forKeyChange_decryptsWithinTheOpenWindowWithoutAnotherPrompt() throws Exception {
     partition(NO_BATCHES, BOTH_BATCHES, NO_BATCHES);
     when(mockLogsEncryptor.decryptLogBatch(FIRST_BATCH)).thenReturn(firstLogs);
     when(mockLogsEncryptor.decryptLogBatch(SECOND_BATCH)).thenReturn(secondLogs);
 
-    decryptor.decrypt(BOTH_BATCHES, mockCallback);
+    keyChangeDecryptor().decrypt(BOTH_BATCHES, mockCallback);
     ShadowLooper.idleMainLooper();
 
     verify(mockCallback).onDecrypted(FIRST_BATCH, firstLogs);
@@ -210,11 +248,9 @@ public final class CrumblesAuthorizedLogDecryptorTest {
   @Test
   public void decrypt_whenTheRsaKeyWindowCloses_promptsForTheBatchesLeft() throws Exception {
     partition(NO_BATCHES, BOTH_BATCHES, NO_BATCHES);
-    UserNotAuthenticatedException windowClosed = new UserNotAuthenticatedException();
-    when(mockLogsEncryptor.decryptLogBatch(FIRST_BATCH))
-        .thenThrow(windowClosed)
-        .thenReturn(firstLogs);
-    when(mockLogsEncryptor.decryptLogBatch(SECOND_BATCH)).thenThrow(windowClosed);
+    when(mockLogsEncryptor.decryptLogBatch(FIRST_BATCH)).thenReturn(firstLogs);
+    when(mockLogsEncryptor.decryptLogBatch(SECOND_BATCH))
+        .thenThrow(new UserNotAuthenticatedException());
 
     decryptor.decrypt(BOTH_BATCHES, mockCallback);
     ShadowLooper.idleMainLooper();
@@ -257,6 +293,8 @@ public final class CrumblesAuthorizedLogDecryptorTest {
 
     decryptor.decrypt(BOTH_BATCHES, mockCallback);
     ShadowLooper.idleMainLooper();
+    ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
+    ShadowLooper.idleMainLooper();
 
     verify(mockCallback).onDecryptionFailed(FIRST_BATCH, wrongKey);
     verify(mockCallback).onDecrypted(SECOND_BATCH, secondLogs);
@@ -279,10 +317,8 @@ public final class CrumblesAuthorizedLogDecryptorTest {
   }
 
   @Test
-  public void decrypt_whenTheUserCancels_reportsItAndDecryptsNothingMore() throws Exception {
+  public void decrypt_whenTheUserCancels_reportsItAndDecryptsNothing() throws Exception {
     partition(NO_BATCHES, BOTH_BATCHES, NO_BATCHES);
-    when(mockLogsEncryptor.decryptLogBatch(any(LogBatch.class)))
-        .thenThrow(new UserNotAuthenticatedException());
 
     decryptor.decrypt(BOTH_BATCHES, mockCallback);
     ShadowLooper.idleMainLooper();
@@ -292,7 +328,7 @@ public final class CrumblesAuthorizedLogDecryptorTest {
 
     verify(mockCallback)
         .onNotAuthorized(BiometricPrompt.ERROR_USER_CANCELED, "Authentication canceled");
-    verify(mockLogsEncryptor).decryptLogBatch(any(LogBatch.class));
+    verify(mockLogsEncryptor, never()).decryptLogBatch(any(LogBatch.class));
     verify(mockCallback, never()).onFinished();
   }
 
@@ -353,6 +389,8 @@ public final class CrumblesAuthorizedLogDecryptorTest {
         .thenReturn(secondLogs);
 
     decryptor.decrypt(BOTH_BATCHES, mockCallback);
+    ShadowLooper.idleMainLooper();
+    ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
     ShadowLooper.idleMainLooper();
     decryptor.cancel();
     ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
@@ -433,6 +471,63 @@ public final class CrumblesAuthorizedLogDecryptorTest {
         .onNotAuthorized(BiometricPrompt.ERROR_USER_CANCELED, "Authentication canceled");
     verify(mockCallback, never()).onFinished();
     verify(mockLogsEncryptor, never()).createUnwrapCipher(SECOND_BATCH);
+  }
+
+  @Test
+  public void forKeyChange_whenAPromptOfItsOwnIsCancelled_skipsTheBatchesLeft() throws Exception {
+    partition(NO_BATCHES, BOTH_BATCHES, NO_BATCHES);
+    when(mockLogsEncryptor.isKeystoreKeyBoundToEachOperation()).thenReturn(true);
+    when(mockLogsEncryptor.createUnwrapCipher(FIRST_BATCH)).thenReturn(unwrapCipher);
+
+    keyChangeDecryptor().decrypt(BOTH_BATCHES, mockCallback);
+    ShadowLooper.idleMainLooper();
+    ShadowBiometricPrompt.authenticateCurrentSessionWithError(
+        BiometricPrompt.ERROR_USER_CANCELED, "Authentication canceled");
+    ShadowLooper.idleMainLooper();
+
+    verify(mockCallback)
+        .onDecryptionFailed(same(FIRST_BATCH), any(CrumblesLogsDecryptionException.class));
+    verify(mockCallback)
+        .onDecryptionFailed(same(SECOND_BATCH), any(CrumblesLogsDecryptionException.class));
+    verify(mockCallback).onFinished();
+    verify(mockCallback, never()).onNotAuthorized(anyInt(), any());
+    verify(mockLogsEncryptor, never()).createUnwrapCipher(SECOND_BATCH);
+  }
+
+  @Test
+  public void forKeyChange_forwardsExternalKeyPredicateToPartitioner() {
+    Predicate<LogBatch> externalPredicate = logBatch -> true;
+    partition(NO_BATCHES, NO_BATCHES, BOTH_BATCHES);
+
+    CrumblesAuthorizedLogDecryptor.forKeyChange(
+            activityController.get(), mockLogsEncryptor, externalPredicate)
+        .decrypt(BOTH_BATCHES, mockCallback);
+    ShadowLooper.idleMainLooper();
+
+    verify(mockLogsEncryptor).partitionForKeyChange(BOTH_BATCHES, externalPredicate);
+    verify(mockCallback)
+        .onDecryptionFailed(same(FIRST_BATCH), any(CrumblesLogsDecryptionException.class));
+    verify(mockCallback)
+        .onDecryptionFailed(same(SECOND_BATCH), any(CrumblesLogsDecryptionException.class));
+    verify(mockCallback).onFinished();
+    assertThat(ShadowBiometricPrompt.getCurrentPrompt()).isNull();
+  }
+
+  @Test
+  public void forKeyChange_whenAPromptOfItsOwnFailsOtherwise_reportsItAndDecryptsNothingMore()
+      throws Exception {
+    partition(NO_BATCHES, BOTH_BATCHES, NO_BATCHES);
+    when(mockLogsEncryptor.isKeystoreKeyBoundToEachOperation()).thenReturn(true);
+    when(mockLogsEncryptor.createUnwrapCipher(FIRST_BATCH)).thenReturn(unwrapCipher);
+
+    keyChangeDecryptor().decrypt(BOTH_BATCHES, mockCallback);
+    ShadowLooper.idleMainLooper();
+    ShadowBiometricPrompt.authenticateCurrentSessionWithError(
+        BiometricPrompt.ERROR_LOCKOUT, "Too many attempts");
+    ShadowLooper.idleMainLooper();
+
+    verify(mockCallback).onNotAuthorized(BiometricPrompt.ERROR_LOCKOUT, "Too many attempts");
+    verify(mockCallback, never()).onFinished();
   }
 
   @Test

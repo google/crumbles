@@ -108,11 +108,28 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
   @SuppressWarnings("NonFinalStaticField")
   public static boolean isStrongBoxThrowingGeneralSecurityException = false;
 
+  /**
+   * Unchecked exception that StrongBox key generation throws instead of creating the key, if not
+   * null, as on OEM builds whose Keystore throws exceptions other than {@link ProviderException}.
+   */
+  @Nullable
+  @SuppressWarnings("NonFinalStaticField")
+  public static RuntimeException strongBoxFailure = null;
+
   @SuppressWarnings("NonFinalStaticField")
   public static boolean isCertificateChainNull = false;
 
+  /** Makes this many next certificate chain lookups return null, as a Keystore that recovers. */
+  @SuppressWarnings("NonFinalStaticField")
+  public static int certificateChainFailuresLeft = 0;
+
   @SuppressWarnings("NonFinalStaticField")
   public static boolean isDeleteFailing = false;
+
+  /** Unchecked exception that {@link #engineDeleteEntry} throws, if not null. */
+  @Nullable
+  @SuppressWarnings("NonFinalStaticField")
+  public static RuntimeException deleteFailure = null;
 
   /** Makes every secret key import fail, as on a Keystore that refuses the import. */
   @SuppressWarnings("NonFinalStaticField")
@@ -175,6 +192,9 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
         if (isStrongBoxThrowingGeneralSecurityException) {
           throw new InvalidAlgorithmParameterException("StrongBox rejected parameters");
         }
+        if (strongBoxFailure != null) {
+          throw strongBoxFailure;
+        }
       }
       this.spec = keySpec;
       setLatestKeyGenParameterSpec(keySpec);
@@ -226,6 +246,30 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
     }
   }
 
+  /**
+   * Handle of a secret key that the user must authenticate to use. Like an AndroidKeyStore key, it
+   * holds no key material that another provider could use, such as the Conscrypt provider that
+   * Robolectric installs ahead of the fake one, so only {@link FakeCipherSpi} accepts it.
+   */
+  private record AuthBoundSecretKey(SecretKey raw) implements SecretKey {
+    @Override
+    public String getAlgorithm() {
+      return raw.getAlgorithm();
+    }
+
+    @Override
+    @Nullable
+    public String getFormat() {
+      return null;
+    }
+
+    @Override
+    @Nullable
+    public byte[] getEncoded() {
+      return null;
+    }
+  }
+
   /** An entry representing a private key, its certificate chain, and its generation specs. */
   public static class PrivateKeyEntry implements Entry {
     private final PrivateKey privateKey;
@@ -272,7 +316,7 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
   public record SecretKeyEntry(SecretKey secretKey, KeyProtection protection) implements Entry {
     @Override
     public Key getKey() {
-      return secretKey;
+      return isUserAuthenticationRequired() ? new AuthBoundSecretKey(secretKey) : secretKey;
     }
 
     @Override
@@ -494,6 +538,7 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
       return false;
     }
     return key instanceof AuthBoundKey
+        || key instanceof AuthBoundSecretKey
         || keystoreEntries.values().stream()
             .anyMatch(
                 entry ->
@@ -508,6 +553,19 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
         alias,
         new PrivateKeyEntry(
             new InvalidatedPrivateKey(), entry.getCertificateChain(), entry.getSpec()));
+  }
+
+  /** Makes loading the key of {@code alias} throw {@code failure}, as an ailing Keystore does. */
+  public static void failKeyLookup(String alias, RuntimeException failure) {
+    keystoreEntries.put(
+        alias,
+        new PrivateKeyEntry(
+            /* privateKey= */ null, /* certificateChain= */ null, /* spec= */ null) {
+          @Override
+          public Key getKey() {
+            throw failure;
+          }
+        });
   }
 
   // --- Overridden KeyStoreSpi Methods ---
@@ -531,6 +589,10 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
 
   @Override
   public Certificate[] engineGetCertificateChain(String alias) {
+    if (certificateChainFailuresLeft > 0) {
+      certificateChainFailuresLeft--;
+      return null;
+    }
     if (isCertificateChainNull) {
       return null;
     }
@@ -591,6 +653,9 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
   public void engineDeleteEntry(String alias) throws KeyStoreException {
     if (isDeleteFailing) {
       throw new ProviderException("Delete failed.");
+    }
+    if (deleteFailure != null) {
+      throw deleteFailure;
     }
     keystoreEntries.remove(alias);
   }
@@ -698,7 +763,12 @@ public class FakeAndroidKeyStoreSpi extends KeyStoreSpi {
     }
 
     private Key beforeInit(int opmode, Key key) throws UserNotAuthenticatedException {
-      Key rawKey = key instanceof AuthBoundKey bound ? bound.raw : key;
+      Key rawKey = key;
+      if (key instanceof AuthBoundKey bound) {
+        rawKey = bound.raw();
+      } else if (key instanceof AuthBoundSecretKey bound) {
+        rawKey = bound.raw();
+      }
       authorizedForNextOperation = false;
       authAlias = null;
       if (opmode == Cipher.DECRYPT_MODE || opmode == Cipher.UNWRAP_MODE) {

@@ -16,6 +16,7 @@
 
 package com.android.securelogging;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.mockito.ArgumentMatchers.any;
@@ -61,6 +62,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.truth.Expect;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.ExtensionRegistryLite;
+import com.google.protobuf.Timestamp;
+import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogBatch;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogData;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.LogEncryptionType;
@@ -70,6 +73,7 @@ import java.io.File;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.security.Key;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -78,6 +82,7 @@ import java.security.Security;
 import java.security.spec.MGF1ParameterSpec;
 import java.util.ArrayList;
 import java.util.Map;
+import java.util.stream.Stream;
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.OAEPParameterSpec;
@@ -108,6 +113,10 @@ public class CrumblesDecryptedLogsActivityTest {
 
   private static final String TEST_FILE_NAME_1 = "log1.txt";
   private static final String TEST_DEVICE_ID = "original-device";
+  private static final LogMetadata TEST_RECORDED_METADATA =
+      LogMetadata.newBuilder().setDevice(DeviceId.newBuilder().setDeviceId(TEST_DEVICE_ID)).build();
+  private static final Timestamp TEST_RECORDED_TIME =
+      Timestamp.newBuilder().setSeconds(1_600_000_000L).build();
   private static final byte[] testRawBytes1 = "decrypted log content".getBytes(UTF_8);
   private static final ComponentName SHARE_TARGET =
       new ComponentName("com.example.mail", "com.example.mail.ComposeActivity");
@@ -240,7 +249,8 @@ public class CrumblesDecryptedLogsActivityTest {
                 Files.write(
                     new File(invocation.<File>getArgument(1), invocation.<String>getArgument(2))
                         .toPath(),
-                    "re-encrypted".getBytes(UTF_8)));
+                    "re-encrypted".getBytes(UTF_8),
+                    StandardOpenOption.WRITE));
   }
 
   /** Installs an app whose activity {@code component}, named {@code label}, accepts the log. */
@@ -372,7 +382,7 @@ public class CrumblesDecryptedLogsActivityTest {
           // And: The encryptor is called with the correct external key and original device id.
           try {
             verify(mockLogsEncryptor)
-                .reEncryptLogBatch(testRawBytes1, mockExternalKey, TEST_DEVICE_ID);
+                .reEncryptLogBatch(testRawBytes1, mockExternalKey, TEST_RECORDED_METADATA);
           } catch (CrumblesKeysException e) {
             throw new AssertionError("Test setup failed.", e);
           }
@@ -415,7 +425,7 @@ public class CrumblesDecryptedLogsActivityTest {
     scenario.onActivity(activity -> activity.handleReEncryption(fingerprint, false));
     shadowOf(Looper.getMainLooper()).idle();
 
-    verify(mockLogsEncryptor).reEncryptLogBatch(testRawBytes1, selectedKey, TEST_DEVICE_ID);
+    verify(mockLogsEncryptor).reEncryptLogBatch(testRawBytes1, selectedKey, TEST_RECORDED_METADATA);
   }
 
   @Test
@@ -956,6 +966,40 @@ public class CrumblesDecryptedLogsActivityTest {
   }
 
   @Test
+  public void share_logsWithTheSameName_sendsADistinctFileForEach() throws Exception {
+    // Re-encrypted within a few milliseconds of each other, under the fallback display name.
+    long sessionId =
+        CrumblesDecryptedLogsSession.startSession(
+            Stream.generate(
+                    () ->
+                        new CrumblesDecryptedLogEntry(
+                            "Unknown_File",
+                            testRawBytes1.clone(),
+                            TEST_DEVICE_ID,
+                            /* originalBatch= */ null))
+                .limit(10)
+                .collect(toImmutableList()));
+    Activity viewer = launchViewer(sessionId).get();
+    addShareTarget(SHARE_TARGET, SHARE_TARGET_LABEL);
+    IntentFilter sendMultiple = new IntentFilter(Intent.ACTION_SEND_MULTIPLE, "*/*");
+    sendMultiple.addCategory(Intent.CATEGORY_DEFAULT);
+    shadowOf(viewer.getPackageManager()).addIntentFilterForActivity(SHARE_TARGET, sendMultiple);
+
+    pickKey(viewer);
+    shadowOf(ShadowAlertDialog.getLatestAlertDialog()).clickOnItem(0);
+    clickDialogButton(DialogInterface.BUTTON_POSITIVE);
+
+    ArrayList<Uri> streamUris =
+        IntentCompat.getParcelableArrayListExtra(
+            shadowOf(viewer).getNextStartedActivityForResult().intent,
+            Intent.EXTRA_STREAM,
+            Uri.class);
+    expect.that(streamUris).hasSize(10);
+    expect.that(streamUris).containsNoDuplicates();
+    expect.that(CrumblesReEncryptedCache.getDirectory(viewer).list()).hasLength(10);
+  }
+
+  @Test
   public void share_whenAppListIsCancelled_deletesStagedLog() throws Exception {
     addShareTarget(SHARE_TARGET, SHARE_TARGET_LABEL);
     Activity viewer = launchViewer(startSession(testRawBytes1.clone())).get();
@@ -1042,7 +1086,7 @@ public class CrumblesDecryptedLogsActivityTest {
         LogBatch.newBuilder()
             .setData(LogData.newBuilder().setLogBlob(ByteString.copyFromUtf8("new ciphertext")))
             .build();
-    when(mockLogsEncryptor.reEncryptLogBatchForSigning(any(), any(), any()))
+    when(mockLogsEncryptor.reEncryptLogBatchForSigning(any(), any(), any(), any(), any()))
         .thenReturn(reEncryptedBatch);
     File stagedFile = tempFolder.newFile("signed_share.bin");
     when(mockLogsEncryptor.serializeBytes(any(), any(), any())).thenReturn(stagedFile.toPath());
@@ -1055,7 +1099,9 @@ public class CrumblesDecryptedLogsActivityTest {
 
     viewer.reEncryptAndOfferToShareLogs(recipientKey);
 
-    verify(mockLogsEncryptor).reEncryptLogBatchForSigning(viewer, testRawBytes1, recipientKey);
+    verify(mockLogsEncryptor)
+        .reEncryptLogBatchForSigning(
+            eq(viewer), eq(testRawBytes1), eq(recipientKey), eq(TEST_RECORDED_METADATA), any());
     verify(mockLogsEncryptor, never()).reEncryptLogBatch(any(), any(), any());
     ArgumentCaptor<LogBatch> batchCaptor = ArgumentCaptor.forClass(LogBatch.class);
     verify(mockLogsEncryptor).serializeBytes(batchCaptor.capture(), any(), any());
@@ -1073,26 +1119,26 @@ public class CrumblesDecryptedLogsActivityTest {
   }
 
   @Test
-  public void
-      reEncryptAndOfferToShareLogs_whenV2OriginalBatchHasEmptyOuterDeviceId_sealsLocalIdAndChain()
-          throws Exception {
+  public void reEncryptAndOfferToShareLogs_ofSignedV2Batch_sealsLocalIdChainAndRecordedTime()
+      throws Exception {
     addShareTarget(SHARE_TARGET, SHARE_TARGET_LABEL);
     Context context = ApplicationProvider.getApplicationContext();
     // Like CrumblesMain's encryptor, which has no context of its own, before any caches one.
     CrumblesLogsEncryptor.setApplicationContext(null);
     CrumblesLogsEncryptor spyEncryptor = spy(new CrumblesLogsEncryptor());
     CrumblesMain.setLogsEncryptorInstanceForTest(spyEncryptor);
+    CrumblesBatchSigner signer = new CrumblesBatchSigner(context);
     LogBatch signedV2Original =
-        new CrumblesBatchSigner(context)
-            .sign(
-                LogBatch.newBuilder()
-                    .setMetadata(
-                        LogMetadata.newBuilder()
-                            .setBlobSize(4112)
-                            .setEncryptionType(
-                                LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA))
-                    .setData(LogData.newBuilder().setLogBlob(ByteString.copyFromUtf8("v2-cipher")))
-                    .build());
+        signer.sign(
+            LogBatch.newBuilder()
+                .setMetadata(
+                    LogMetadata.newBuilder()
+                        .setBlobSize(4112)
+                        .setEncryptionType(
+                            LogEncryptionType.LOG_ENCRYPTION_TYPE_AES_GCM_SEALED_METADATA))
+                .setData(LogData.newBuilder().setLogBlob(ByteString.copyFromUtf8("v2-cipher")))
+                .build(),
+            signer.attestationChainToSeal());
     assertThat(signedV2Original.getMetadata().getDevice().getDeviceId()).isEmpty();
     KeyPair recipientKeyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
     long sessionId =
@@ -1102,18 +1148,20 @@ public class CrumblesDecryptedLogsActivityTest {
                     TEST_FILE_NAME_1,
                     testRawBytes1.clone(),
                     signedV2Original.getMetadata().getDevice().getDeviceId(),
+                    TEST_RECORDED_TIME,
                     signedV2Original)));
     CrumblesDecryptedLogsActivity viewer = launchViewer(sessionId).get();
 
     viewer.reEncryptAndOfferToShareLogs(recipientKeyPair.getPublic());
 
     verify(spyEncryptor)
-        .reEncryptLogBatchForSigning(viewer, testRawBytes1, recipientKeyPair.getPublic());
+        .reEncryptLogBatchForSigning(
+            eq(viewer), eq(testRawBytes1), eq(recipientKeyPair.getPublic()), any(), any());
     verify(spyEncryptor, never()).reEncryptLogBatch(any(), any(), any());
     LogBatch writtenBatch =
         LogBatch.parseFrom(
             Files.readAllBytes(onlyStagedFile(viewer).toPath()),
-            ExtensionRegistryLite.getGeneratedRegistry());
+            ExtensionRegistryLite.getEmptyRegistry());
     SealedLogs sealedLogs = sealedLogsOf(writtenBatch, recipientKeyPair);
     ImmutableList<ByteString> batchSigningKeyChain =
         new CrumblesBatchSigningKey(viewer).attestationChain();
@@ -1130,6 +1178,7 @@ public class CrumblesDecryptedLogsActivityTest {
     expect
         .that(sealedLogs.getMetadata().getDevice().getDeviceId())
         .isEqualTo(CrumblesDeviceIdManager.getDeviceId(context));
+    expect.that(sealedLogs.getMetadata().getTimestamp()).isEqualTo(TEST_RECORDED_TIME);
     expect
         .that(sealedLogs.getAttestationChainList())
         .containsExactlyElementsIn(batchSigningKeyChain)
@@ -1149,7 +1198,10 @@ public class CrumblesDecryptedLogsActivityTest {
         LogBatch.newBuilder()
             .setData(LogData.newBuilder().setLogBlob(ByteString.copyFromUtf8("new ciphertext")))
             .build();
-    when(mockLogsEncryptor.reEncryptLogBatch(testRawBytes1, recipientKey, TEST_DEVICE_ID))
+    when(mockLogsEncryptor.reEncryptLogBatch(
+            testRawBytes1,
+            recipientKey,
+            TEST_RECORDED_METADATA.toBuilder().setTimestamp(TEST_RECORDED_TIME).build()))
         .thenReturn(reEncryptedBatch);
     File stagedFile = tempFolder.newFile("unsigned_share.bin");
     when(mockLogsEncryptor.serializeBytes(any(), any(), any())).thenReturn(stagedFile.toPath());
@@ -1157,12 +1209,17 @@ public class CrumblesDecryptedLogsActivityTest {
         CrumblesDecryptedLogsSession.startSession(
             ImmutableList.of(
                 new CrumblesDecryptedLogEntry(
-                    TEST_FILE_NAME_1, testRawBytes1.clone(), TEST_DEVICE_ID, unsignedOriginal)));
+                    TEST_FILE_NAME_1,
+                    testRawBytes1.clone(),
+                    TEST_DEVICE_ID,
+                    TEST_RECORDED_TIME,
+                    unsignedOriginal)));
     CrumblesDecryptedLogsActivity viewer = launchViewer(sessionId).get();
 
     viewer.reEncryptAndOfferToShareLogs(recipientKey);
 
-    verify(mockLogsEncryptor, never()).reEncryptLogBatchForSigning(any(), any(), any());
+    verify(mockLogsEncryptor, never())
+        .reEncryptLogBatchForSigning(any(), any(), any(), any(), any());
     ArgumentCaptor<LogBatch> batchCaptor = ArgumentCaptor.forClass(LogBatch.class);
     verify(mockLogsEncryptor).serializeBytes(batchCaptor.capture(), any(), any());
     expect.that(batchCaptor.getValue()).isEqualTo(reEncryptedBatch);
@@ -1191,7 +1248,7 @@ public class CrumblesDecryptedLogsActivityTest {
         LogBatch.newBuilder()
             .setData(LogData.newBuilder().setLogBlob(ByteString.copyFromUtf8("fallback unsigned")))
             .build();
-    when(mockLogsEncryptor.reEncryptLogBatch(testRawBytes1, recipientKey, TEST_DEVICE_ID))
+    when(mockLogsEncryptor.reEncryptLogBatch(testRawBytes1, recipientKey, TEST_RECORDED_METADATA))
         .thenReturn(fallbackBatch);
     File stagedFile = tempFolder.newFile("foreign_share.bin");
     when(mockLogsEncryptor.serializeBytes(any(), any(), any())).thenReturn(stagedFile.toPath());
@@ -1204,7 +1261,8 @@ public class CrumblesDecryptedLogsActivityTest {
 
     viewer.reEncryptAndOfferToShareLogs(recipientKey);
 
-    verify(mockLogsEncryptor, never()).reEncryptLogBatchForSigning(any(), any(), any());
+    verify(mockLogsEncryptor, never())
+        .reEncryptLogBatchForSigning(any(), any(), any(), any(), any());
     ArgumentCaptor<LogBatch> batchCaptor = ArgumentCaptor.forClass(LogBatch.class);
     verify(mockLogsEncryptor).serializeBytes(batchCaptor.capture(), any(), any());
     expect.that(batchCaptor.getValue()).isEqualTo(fallbackBatch);
@@ -1240,9 +1298,9 @@ public class CrumblesDecryptedLogsActivityTest {
         LogBatch.newBuilder()
             .setData(LogData.newBuilder().setLogBlob(ByteString.copyFromUtf8("fallback unsigned")))
             .build();
-    when(mockLogsEncryptor.reEncryptLogBatchForSigning(any(), any(), any()))
+    when(mockLogsEncryptor.reEncryptLogBatchForSigning(any(), any(), any(), any(), any()))
         .thenReturn(localCandidateBatch);
-    when(mockLogsEncryptor.reEncryptLogBatch(testRawBytes1, recipientKey, TEST_DEVICE_ID))
+    when(mockLogsEncryptor.reEncryptLogBatch(testRawBytes1, recipientKey, TEST_RECORDED_METADATA))
         .thenReturn(fallbackBatch);
     File stagedFile = tempFolder.newFile("fallback_share.bin");
     when(mockLogsEncryptor.serializeBytes(any(), any(), any())).thenReturn(stagedFile.toPath());

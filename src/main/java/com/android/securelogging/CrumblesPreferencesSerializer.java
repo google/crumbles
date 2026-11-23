@@ -99,7 +99,7 @@ class CrumblesPreferencesSerializer implements Serializer<UserKeyPreferences> {
     UserKeyPreferences preferences;
     try {
       preferences =
-          UserKeyPreferences.parseFrom(input, ExtensionRegistryLite.getGeneratedRegistry());
+          UserKeyPreferences.parseFrom(input, ExtensionRegistryLite.getEmptyRegistry());
     } catch (InvalidProtocolBufferException e) {
       throw sneakyThrow(new CorruptionException("Cannot read the key preferences.", e));
     } catch (IOException e) {

@@ -18,9 +18,12 @@ package com.android.securelogging;
 
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.TruthJUnit.assume;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 import android.content.ContentProvider;
+import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
@@ -32,17 +35,20 @@ import android.provider.DocumentsContract;
 import androidx.annotation.Nullable;
 import androidx.documentfile.provider.DocumentFile;
 import androidx.test.core.app.ApplicationProvider;
-import com.google.common.time.Sleeper;
 import com.google.common.truth.Expect;
+import com.google.common.util.concurrent.Uninterruptibles;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.channels.ClosedChannelException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -60,6 +66,7 @@ import org.robolectric.shadows.ShadowSystemClock;
 public final class GoogleDriveStorageUploaderTest {
 
   private static final String AUTHORITY = "com.android.securelogging.test.drive";
+  private static final String OTHER_AUTHORITY = "com.android.securelogging.test.other";
   private static final Uri TREE_URI =
       DocumentsContract.buildTreeDocumentUri(AUTHORITY, "root_folder");
 
@@ -77,6 +84,7 @@ public final class GoogleDriveStorageUploaderTest {
   public static class TestDriveContentProvider extends ContentProvider {
     File tempDriveDir;
     int queryFault;
+    @Nullable Uri createdDocumentUri;
     private boolean shouldFailStreaming;
     private boolean shouldFailCreate;
     private boolean shouldAlterReadBack;
@@ -85,7 +93,20 @@ public final class GoogleDriveStorageUploaderTest {
     private boolean shouldCrash;
     private boolean shouldReadBackEndlessly;
     @Nullable File stalledReadBack;
+
+    /** A file that writes to the copy go to instead of the document, such as a pipe. */
+    @Nullable File stalledCopy;
+
     private final List<String> deletedDocuments = new ArrayList<>();
+    private final List<String> documentsOpenedForWriting = new ArrayList<>();
+
+    /** The call that the provider holds until {@link #release} opens: a method, or "openFile". */
+    @Nullable String heldCall;
+
+    final CountDownLatch release = new CountDownLatch(1);
+    final CountDownLatch heldCallEntered = new CountDownLatch(1);
+    final CountDownLatch copyOpened = new CountDownLatch(1);
+    final CountDownLatch readBackOpened = new CountDownLatch(1);
 
     public void setShouldFailStreaming(boolean fail) {
       this.shouldFailStreaming = fail;
@@ -167,6 +188,7 @@ public final class GoogleDriveStorageUploaderTest {
 
     @Override
     public Bundle call(String method, @Nullable String arg, @Nullable Bundle extras) {
+      holdIf(method);
       if (Objects.equals(method, "android:createDocument")) {
         if (shouldFailCreate) {
           return null;
@@ -183,8 +205,20 @@ public final class GoogleDriveStorageUploaderTest {
           return null;
         }
         Bundle bundle = new Bundle();
-        bundle.putParcelable("uri", Uri.parse("content://" + AUTHORITY + "/document/" + name));
+        bundle.putParcelable(
+            "uri",
+            createdDocumentUri != null
+                ? createdDocumentUri
+                : DocumentsContract.buildDocumentUriUsingTree(TREE_URI, name));
         return bundle;
+      }
+      if (Objects.equals(method, "android:isChildDocument") && extras != null) {
+        // Only documents directly in the fake folder are its children. Like a hostile provider, it
+        // judges by the last path segment alone, so it claims file URIs too.
+        Uri document = extras.getParcelable("android.content.extra.TARGET_URI", Uri.class);
+        Bundle result = new Bundle();
+        result.putBoolean("result", !document.getLastPathSegment().contains("/"));
+        return result;
       }
       if (Objects.equals(method, "android:deleteDocument") && extras != null) {
         String name = extras.getParcelable("uri", Uri.class).getLastPathSegment();
@@ -196,6 +230,7 @@ public final class GoogleDriveStorageUploaderTest {
 
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
+      holdIf("openFile");
       if (shouldFailStreaming) {
         throw new FileNotFoundException("Simulated stream failure");
       }
@@ -203,13 +238,23 @@ public final class GoogleDriveStorageUploaderTest {
         throw new IllegalStateException("Simulated provider crash");
       }
       File document = new File(tempDriveDir, uri.getLastPathSegment());
+      if (!mode.equals("r")) {
+        documentsOpenedForWriting.add(uri.getLastPathSegment());
+      }
       if (!mode.equals("r") && shouldWithholdWriteStream) {
         return null;
+      }
+      if (!mode.equals("r")) {
+        copyOpened.countDown();
+      }
+      if (!mode.equals("r") && stalledCopy != null) {
+        return ParcelFileDescriptor.open(stalledCopy, ParcelFileDescriptor.MODE_READ_WRITE);
       }
       if (mode.equals("r") && shouldWithholdReadBack) {
         return null;
       }
       if (mode.equals("r") && stalledReadBack != null) {
+        readBackOpened.countDown();
         return ParcelFileDescriptor.open(stalledReadBack, ParcelFileDescriptor.MODE_READ_ONLY);
       }
       if (mode.equals("r") && shouldReadBackEndlessly) {
@@ -218,7 +263,7 @@ public final class GoogleDriveStorageUploaderTest {
       if (mode.equals("r") && shouldAlterReadBack) {
         document = new File(tempDriveDir, "altered_copy.bin");
         try {
-          Files.writeString(document.toPath(), "encrypted test conten");
+          Files.write(document.toPath(), "encrypted test conten".getBytes(UTF_8));
         } catch (IOException e) {
           throw new FileNotFoundException(e.getMessage());
         }
@@ -229,6 +274,17 @@ public final class GoogleDriveStorageUploaderTest {
     @Override
     public String getType(Uri uri) {
       return "application/octet-stream";
+    }
+
+    void holdIf(String call) {
+      if (Objects.equals(call, heldCall)) {
+        heldCallEntered.countDown();
+        try {
+          release.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
     }
 
     @Override
@@ -254,11 +310,13 @@ public final class GoogleDriveStorageUploaderTest {
         Robolectric.buildContentProvider(TestDriveContentProvider.class).create(AUTHORITY).get();
     uploader = new GoogleDriveStorageUploader(DocumentFile.fromTreeUri(context, TREE_URI));
     testFile = new File(context.getFilesDir(), "local_test.bin");
-    Files.writeString(testFile.toPath(), "encrypted test content");
+    Files.write(testFile.toPath(), "encrypted test content".getBytes(UTF_8));
   }
 
   @After
-  public void tearDown() {
+  public void tearDown() throws Exception {
+    provider.release.countDown();
+    awaitProviderAnswers(TREE_URI);
     if (testFile != null && testFile.exists()) {
       testFile.delete();
     }
@@ -268,7 +326,8 @@ public final class GoogleDriveStorageUploaderTest {
   public void uploadFile_whenSuccessful_streamsDataAndReturnsTrue() throws Exception {
     assertThat(uploader.uploadFile(context, testFile, "destination_log.bin")).isTrue();
     File uploadedFile = new File(context.getFilesDir(), "fake_drive_dir/destination_log.bin");
-    assertThat(Files.readString(uploadedFile.toPath())).isEqualTo("encrypted test content");
+    assertThat(new String(Files.readAllBytes(uploadedFile.toPath()), UTF_8))
+        .isEqualTo("encrypted test content");
     assertThat(provider.deletedDocuments).isEmpty();
   }
 
@@ -320,6 +379,54 @@ public final class GoogleDriveStorageUploaderTest {
   }
 
   @Test
+  public void uploadFile_whenProviderCreatesDocumentOfAnotherProvider_neitherWritesNorDeletesIt() {
+    TestDriveContentProvider otherProvider =
+        Robolectric.buildContentProvider(TestDriveContentProvider.class)
+            .create(OTHER_AUTHORITY)
+            .get();
+    provider.createdDocumentUri =
+        DocumentsContract.buildDocumentUriUsingTree(
+            DocumentsContract.buildTreeDocumentUri(OTHER_AUTHORITY, "root_folder"), "victim.bin");
+
+    boolean uploaded = uploader.uploadFile(context, testFile, "destination_log.bin");
+
+    expect.that(uploaded).isFalse();
+    expect.that(otherProvider.documentsOpenedForWriting).isEmpty();
+    expect.that(otherProvider.deletedDocuments).isEmpty();
+  }
+
+  @Test
+  public void uploadFile_whenProviderCreatesDocumentOutsideTheFolder_neitherWritesNorDeletesIt() {
+    provider.createdDocumentUri =
+        DocumentsContract.buildDocumentUriUsingTree(TREE_URI, "other_folder/victim.bin");
+
+    boolean uploaded = uploader.uploadFile(context, testFile, "destination_log.bin");
+
+    expect.that(uploaded).isFalse();
+    expect.that(provider.documentsOpenedForWriting).isEmpty();
+    expect.that(provider.deletedDocuments).isEmpty();
+  }
+
+  @Test
+  public void uploadFile_whenProviderCreatesFileUriWithItsAuthority_neitherWritesNorDeletesIt()
+      throws Exception {
+    Path victim = Files.createTempFile("victim", ".bin");
+    Files.write(victim, "other data".getBytes(UTF_8));
+    provider.createdDocumentUri =
+        new Uri.Builder()
+            .scheme(ContentResolver.SCHEME_FILE)
+            .authority(AUTHORITY)
+            .path(victim.toString())
+            .build();
+
+    boolean uploaded = uploader.uploadFile(context, testFile, "destination_log.bin");
+
+    expect.that(uploaded).isFalse();
+    expect.that(new String(Files.readAllBytes(victim), UTF_8)).isEqualTo("other data");
+    expect.that(provider.deletedDocuments).isEmpty();
+  }
+
+  @Test
   public void uploadFile_whenProviderReadsBackEndlessly_returnsFalseAndRemovesTheCopy() {
     assume().that(ENDLESS_FILE.exists()).isTrue();
     provider.setShouldReadBackEndlessly(true);
@@ -341,15 +448,106 @@ public final class GoogleDriveStorageUploaderTest {
       provider.stalledReadBack = pipe;
       Future<Boolean> upload =
           uploadThread.submit(() -> uploader.uploadFile(context, testFile, "destination_log.bin"));
+      assertThat(provider.readBackOpened.await(/* timeout= */ 5, SECONDS)).isTrue();
 
       boolean uploaded = awaitPastDeadline(upload);
 
       expect.that(uploaded).isFalse();
       expect.that(uploader.transportFailed()).isTrue();
+      expect.that(uploader.failedMidBody()).isFalse();
       expect.that(provider.deletedDocuments).containsExactly("destination_log.bin");
     } finally {
       uploadThread.shutdownNow();
     }
+  }
+
+  @Test
+  public void uploadFile_whenTheProviderStopsTakingTheCopy_failsMidBody() throws Exception {
+    // More than a pipe holds, so that the copy blocks once nothing drains the pipe.
+    Files.write(testFile.toPath(), new byte[1 << 20]);
+    File pipe = new File(context.getCacheDir(), "undrained_pipe");
+    assertThat(new ProcessBuilder("mkfifo", pipe.getPath()).start().waitFor()).isEqualTo(0);
+    provider.stalledCopy = pipe;
+
+    boolean uploaded = uploadPastDeadline(testFile);
+
+    expect.that(uploaded).isFalse();
+    expect.that(uploader.transportFailed()).isTrue();
+    expect.that(uploader.failedMidBody()).isTrue();
+  }
+
+  @Test
+  public void uploadFile_afterAnUploadFailedInTransit_reportsOnlyItsOwnOutcome() throws Exception {
+    Files.write(testFile.toPath(), new byte[1 << 20]);
+    File pipe = new File(context.getCacheDir(), "pipe_drained_by_nothing");
+    assertThat(new ProcessBuilder("mkfifo", pipe.getPath()).start().waitFor()).isEqualTo(0);
+    provider.stalledCopy = pipe;
+    assertThat(uploadPastDeadline(testFile)).isFalse();
+    provider.stalledCopy = null;
+
+    boolean uploaded = uploader.uploadFile(context, testFile, "next_log.bin");
+
+    expect.that(uploaded).isTrue();
+    expect.that(uploader.transportFailed()).isFalse();
+    expect.that(uploader.failedMidBody()).isFalse();
+  }
+
+  @Test
+  public void uploadFile_whenClosingCannotEndTheCopy_givesUpAndRefusesTheProviderUntilItEnds()
+      throws Exception {
+    File batch = new File(context.getCacheDir(), "unending_batch");
+    assertThat(new ProcessBuilder("mkfifo", batch.getPath()).start().waitFor()).isEqualTo(0);
+    // Holding the pipe open for writing, but writing nothing, blocks the copy where closing the
+    // provider's channel cannot end it, as on a FUSE proxy descriptor whose provider never
+    // answers a write.
+    try (RandomAccessFile idleWriter = new RandomAccessFile(batch, "rw")) {
+      assertThat(uploadPastDeadline(batch)).isFalse();
+      assertThat(uploader.transportFailed()).isTrue();
+
+      boolean uploadedAgain = uploader.uploadFile(context, testFile, "second_log.bin");
+
+      expect.that(uploadedAgain).isFalse();
+      expect.that(uploader.transportFailed()).isTrue();
+      expect.that(new File(provider.tempDriveDir, "second_log.bin").exists()).isFalse();
+    }
+  }
+
+  @Test
+  public void uploadFile_whenProviderNeverAnswersCreateDocument_givesUpAtTheDeadline()
+      throws Exception {
+    provider.heldCall = "android:createDocument";
+
+    boolean uploaded = uploadPastDeadline(testFile);
+
+    expect.that(uploaded).isFalse();
+    expect.that(uploader.transportFailed()).isTrue();
+    expect.that(uploader.failedMidBody()).isFalse();
+  }
+
+  @Test
+  public void uploadFile_whenProviderNeverAnswersIsChildDocument_givesUpWithoutTouchingTheCopy()
+      throws Exception {
+    provider.heldCall = "android:isChildDocument";
+
+    boolean uploaded = uploadPastDeadline(testFile);
+
+    expect.that(uploaded).isFalse();
+    expect.that(uploader.transportFailed()).isTrue();
+    expect.that(provider.documentsOpenedForWriting).isEmpty();
+    expect.that(provider.deletedDocuments).isEmpty();
+  }
+
+  @Test
+  public void uploadFile_whenProviderNeverOpensTheCopy_givesUpWithoutCallingItToDeleteTheCopy()
+      throws Exception {
+    provider.heldCall = "openFile";
+
+    boolean uploaded = uploadPastDeadline(testFile);
+
+    expect.that(uploaded).isFalse();
+    expect.that(uploader.transportFailed()).isTrue();
+    expect.that(uploader.failedMidBody()).isFalse();
+    expect.that(provider.deletedDocuments).isEmpty();
   }
 
   @Test
@@ -358,14 +556,43 @@ public final class GoogleDriveStorageUploaderTest {
     assertThat(uploader.getDestinationDescription()).isEqualTo("Google Drive");
   }
 
+  /** Uploads {@code file} on another thread, and moves the clock on until the upload ends. */
+  private boolean uploadPastDeadline(File file) throws Exception {
+    ExecutorService uploadThread = Executors.newSingleThreadExecutor();
+    try {
+      Future<Boolean> upload =
+          uploadThread.submit(() -> uploader.uploadFile(context, file, "destination_log.bin"));
+      CountDownLatch stall =
+          provider.heldCall != null ? provider.heldCallEntered : provider.copyOpened;
+      assertThat(stall.await(/* timeout= */ 5, SECONDS)).isTrue();
+      return awaitPastDeadline(upload);
+    } finally {
+      uploadThread.shutdownNow();
+    }
+  }
+
+  /** Waits until the provider of {@code document} takes calls again, once it returns a held one. */
+  static void awaitProviderAnswers(Uri document) throws Exception {
+    for (int attempt = 0; attempt < 100; attempt++) {
+      try {
+        @SuppressWarnings("unused")
+        var unusedAnswer = CrumblesTransferDeadline.callProvider(document, () -> true);
+        return;
+      } catch (ClosedChannelException e) {
+        Uninterruptibles.sleepUninterruptibly(10, MILLISECONDS);
+      }
+    }
+  }
+
   /**
    * Moves the clock past the transfer deadline, repeatedly until {@code upload} ends, as the upload
    * sets its deadline only once it starts, and returns its result.
    */
-  private static boolean awaitPastDeadline(Future<Boolean> upload) throws Exception {
+  static boolean awaitPastDeadline(Future<Boolean> upload) throws Exception {
     for (int attempt = 0; attempt < 100 && !upload.isDone(); attempt++) {
+      // Let the background upload enter its blocked I/O before jumping the deadline clock.
+      Uninterruptibles.sleepUninterruptibly(50, MILLISECONDS);
       ShadowSystemClock.advanceBy(Duration.ofHours(1));
-      Sleeper.defaultSleeper().sleep(Duration.ofMillis(50));
     }
     return upload.get(/* timeout= */ 1, SECONDS);
   }

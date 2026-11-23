@@ -28,13 +28,13 @@ import android.app.KeyguardManager;
 import android.content.Context;
 import android.hardware.biometrics.BiometricManager;
 import android.os.Bundle;
-import android.support.v7.widget.RecyclerView;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.TextView;
 import androidx.biometric.BiometricPrompt;
+import androidx.recyclerview.widget.RecyclerView;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.work.Configuration;
@@ -268,19 +268,25 @@ public class CrumblesAuditLogViewerActivityTest {
   }
 
   @Test
-  public void clearLogsConfirmed_whenSealingFailsBeforeClear_clearsAndRecordsUnsealedCount()
+  public void clearLogsConfirmed_whenSealingFailsBeforeClear_keepsLogsAndRecordsRefusal()
       throws Exception {
     launchConfirmCredential();
-    int unshippedRecords = auditLogger.getUnshippedExcerpt().size();
 
     ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
     awaitBackgroundTasks();
 
-    // No encryption key is set up, so sealing fails and the tombstone counts the records lost.
-    assertThat(persistedEventTypes()).containsExactly("AUDIT_LOG_CLEARED");
+    // No encryption key is set up, so the unshipped records cannot be sealed before the clear.
     expect
-        .that(auditLogger.getAllPersistedEventsForDisplay().get(0).getMessage())
-        .contains("(" + unshippedRecords + " unshipped records could not be sealed before clear)");
+        .that(persistedEventTypes())
+        .containsExactly(
+            SEEDED_EVENT_TYPE,
+            "AUDIT_LOG_VIEWED",
+            "AUDIT_LOG_CLEAR_REQUESTED",
+            "AUDIT_LOG_CLEAR_SEAL_FAILED",
+            "AUDIT_LOG_CLEAR_REFUSED");
+    expect
+        .that(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(activity.getString(R.string.toast_audit_log_clear_refused));
   }
 
   @Test

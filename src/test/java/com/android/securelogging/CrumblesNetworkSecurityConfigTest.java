@@ -32,8 +32,7 @@ import org.xmlpull.v1.XmlPullParser;
 public final class CrumblesNetworkSecurityConfigTest {
 
   @Test
-  public void networkSecurityConfig_trustsOnlySystemCasAndPermitsCleartextOnlyToLoopbackNames()
-      throws Exception {
+  public void networkSecurityConfig_trustsOnlySystemCasAndPermitsNoCleartext() throws Exception {
     List<String> outline = outlineXmlResource(R.xml.network_security_config);
 
     assertThat(outline)
@@ -41,12 +40,7 @@ public final class CrumblesNetworkSecurityConfigTest {
             "network-security-config",
             "  base-config cleartextTrafficPermitted=false",
             "    trust-anchors",
-            "      certificates src=system",
-            "  domain-config cleartextTrafficPermitted=true",
-            "    domain includeSubdomains=false",
-            "      localhost",
-            "    domain includeSubdomains=false",
-            "      127.0.0.1")
+            "      certificates src=system")
         .inOrder();
   }
 

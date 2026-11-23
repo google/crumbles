@@ -17,10 +17,12 @@
 package com.android.securelogging;
 
 import static com.android.securelogging.CrumblesConstants.FILE_PICKER_REQUEST_CODE;
+import static com.android.securelogging.CrumblesLogsEncryptor.KEY_ALIAS;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.AdditionalMatchers.aryEq;
 import static org.mockito.ArgumentMatchers.any;
@@ -28,6 +30,7 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -40,6 +43,7 @@ import static org.robolectric.Shadows.shadowOf;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.Application;
 import android.app.Dialog;
 import android.app.KeyguardManager;
@@ -53,6 +57,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.UriPermission;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -63,6 +68,8 @@ import android.content.pm.SigningInfo;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.hardware.biometrics.BiometricPrompt;
+import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Environment;
 import android.os.Looper;
@@ -70,7 +77,6 @@ import android.os.UserManager;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.security.keystore.UserNotAuthenticatedException;
-import android.support.v7.app.AlertDialog;
 import android.text.InputType;
 import android.util.Log;
 import android.view.View;
@@ -80,26 +86,33 @@ import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
+import androidx.appcompat.app.AlertDialog;
 import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.work.Configuration;
+import androidx.work.ExistingWorkPolicy;
+import androidx.work.OneTimeWorkRequest;
 import androidx.work.WorkInfo;
 import androidx.work.WorkManager;
 import androidx.work.testing.TestListenableWorkerBuilder;
 import androidx.work.testing.WorkManagerTestInitHelper;
 import com.android.securelogging.CrumblesLogsEncryptor.BulkDecryptPartition;
 import com.android.securelogging.CrumblesLogsEncryptor.DecryptedLogBatch;
+import com.android.securelogging.CrumblesSendAndMarkProcessingWorkerTest.FakeGoogleDriveContentProvider;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 import com.android.securelogging.audit.CrumblesAuditEvent;
+import com.android.securelogging.audit.CrumblesAuditLogViewerActivity;
 import com.android.securelogging.exceptions.CrumblesKeysException;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreProvider;
 import com.android.securelogging.fakes.FakeAndroidKeyStoreSpi;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
 import com.google.common.truth.Expect;
 import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import com.google.protos.wireless_android_security_exploits_secure_logging_src_main.DeviceId;
@@ -117,6 +130,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Constructor;
+import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -132,6 +146,7 @@ import java.security.PublicKey;
 import java.security.Security;
 import java.security.cert.X509Certificate;
 import java.security.spec.RSAKeyGenParameterSpec;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -175,6 +190,7 @@ import org.robolectric.shadows.ShadowDevicePolicyManager;
 import org.robolectric.shadows.ShadowDialog;
 import org.robolectric.shadows.ShadowEnvironment;
 import org.robolectric.shadows.ShadowLog;
+import org.robolectric.shadows.ShadowNetworkCapabilities;
 import org.robolectric.shadows.ShadowPausedLooper;
 import org.robolectric.shadows.ShadowResolveInfo;
 import org.robolectric.shadows.ShadowToast;
@@ -187,6 +203,13 @@ public class CrumblesMainTest {
 
   // A loopback server reached over plaintext HTTP has no key to pin, so it is saved unconfirmed.
   private static final String WEBDAV_SERVER_URL = "http://127.0.0.1/remote.php/dav/files/alice/";
+
+  private static final Uri TEAM_LOGS_TREE_URI =
+      Uri.parse("content://com.example.storage.documents/tree/team_logs");
+
+  /** The folder that {@link FakeGoogleDriveContentProvider} serves. */
+  private static final Uri DRIVE_TREE_URI =
+      Uri.parse("content://com.google.android.apps.docs.storage/tree/valid_drive");
 
   private static final HeldCertificate testRootCertificate =
       new HeldCertificate.Builder().certificateAuthority(/* maxIntermediateCas= */ 0).build();
@@ -210,6 +233,13 @@ public class CrumblesMainTest {
   private File rootOfTestCleanup;
   private File mockAdHocDir;
   private KeyPair testExternalKeyPair;
+  private HttpServer webDavServer;
+
+  /** The storage app of {@link #DRIVE_TREE_URI}, once a test sets it up. */
+  private FakeGoogleDriveContentProvider driveProvider;
+
+  /** Opens to let the storage app go on after {@link #stallDriveProvider}. */
+  private final CountDownLatch driveProviderStall = new CountDownLatch(1);
 
   private static KeyPair generateTestRsaKeyPair() throws Exception {
     KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
@@ -277,6 +307,8 @@ public class CrumblesMainTest {
 
   @After
   public void tearDown() {
+    // A test that failed while the storage app held a document lets it go on.
+    driveProviderStall.countDown();
     CrumblesMain.setLogsEncryptorInstanceForTest(null);
     CrumblesAppAuditLogger.setInstanceForTest(null);
     CrumblesDecryptedLogsSession.destroyActiveSession();
@@ -284,6 +316,11 @@ public class CrumblesMainTest {
     if (rootOfTestCleanup != null) {
       deleteRecursive(rootOfTestCleanup);
     }
+    if (webDavServer != null) {
+      webDavServer.stop(/* delay= */ 0);
+    }
+    // Drops any key manager made with the real encryptor for the other tests.
+    ReflectionHelpers.setStaticField(CrumblesExternalPublicKeyManager.class, "instance", null);
   }
 
   private void deleteRecursive(File fileOrDirectory) {
@@ -778,6 +815,59 @@ public class CrumblesMainTest {
   }
 
   @Test
+  public void onCreate_whenNeutralEntryIsEnabled_namesTheTaskDeviceSync() {
+    CrumblesLauncherEntry.showNeutral(context);
+
+    // An alert opens CrumblesMain itself, so the neutral entry does not name the task it starts.
+    for (Class<? extends Activity> screen :
+        ImmutableList.of(
+            CrumblesMain.class,
+            CrumblesDecryptedLogsActivity.class,
+            CrumblesManageExternalKeysActivity.class,
+            CrumblesQrScannerActivity.class,
+            CrumblesReEncryptKeysActivity.class,
+            CrumblesSetupActivity.class,
+            CrumblesAuditLogViewerActivity.class)) {
+      Activity activity = Robolectric.buildActivity(screen).create().get();
+      expect
+          .withMessage(screen.getSimpleName())
+          .that(taskDescriptionOf(activity).getLabel())
+          .isEqualTo("Device sync");
+    }
+  }
+
+  @Test
+  public void onCreate_whenDefaultEntryIsEnabled_leavesTheTaskUnnamed() {
+    CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+
+    assertThat(taskDescriptionOf(activity).getLabel()).isNull();
+  }
+
+  @Test
+  public void neutralLauncherSwitch_whenTurnedOn_namesTheTaskDeviceSync() {
+    CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+
+    activity.findViewById(R.id.neutral_launcher_switch).performClick();
+
+    assertThat(taskDescriptionOf(activity).getLabel()).isEqualTo("Device sync");
+  }
+
+  @Test
+  public void neutralLauncherSwitch_whenTurnedOff_leavesTheTaskUnnamed() {
+    CrumblesLauncherEntry.showNeutral(context);
+    CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+
+    activity.findViewById(R.id.neutral_launcher_switch).performClick();
+
+    assertThat(taskDescriptionOf(activity).getLabel()).isNull();
+  }
+
+  /** Returns the description that {@code activity} gave its task, which Recents shows. */
+  private static ActivityManager.TaskDescription taskDescriptionOf(Activity activity) {
+    return ReflectionHelpers.getField(activity, "mTaskDescription");
+  }
+
+  @Test
   public void setLoggingToggle_asLoggingDelegate_enablesLogging() {
     setUpLoggingDelegate();
     ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
@@ -992,7 +1082,8 @@ public class CrumblesMainTest {
   public void onActivityResult_disableLoggingConfirmed_sealsFinalBatch() {
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
     when(mockLogsEncryptor.getPublicKey()).thenReturn(testExternalKeyPair.getPublic());
-    when(mockLogsEncryptor.encryptLogs(any(Context.class), any(byte[].class), any(PublicKey.class)))
+    when(mockLogsEncryptor.encryptLogs(
+            any(Context.class), any(byte[].class), any(PublicKey.class), any(), any()))
         .thenReturn(LogBatch.getDefaultInstance());
     when(mockLogsEncryptor.serializeBytes(any(LogBatch.class), any(File.class), anyString()))
         .thenCallRealMethod();
@@ -1111,6 +1202,43 @@ public class CrumblesMainTest {
   }
 
   @Test
+  public void loggingToggle_whenTurnedOnAsDeviceOwner_recordsEachTypeOfLoggingTurnedOnOnce() {
+    ActivityController<CrumblesMainWithMockDpm> controller =
+        Robolectric.buildActivity(CrumblesMainWithMockDpm.class);
+    DevicePolicyManager mockDpm = controller.get().mockDpm;
+    when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(true);
+    doAnswer(
+            invocation -> {
+              when(mockDpm.isSecurityLoggingEnabled(getAdminComponentName())).thenReturn(true);
+              return null;
+            })
+        .when(mockDpm)
+        .setSecurityLoggingEnabled(getAdminComponentName(), /* enabled= */ true);
+    doAnswer(
+            invocation -> {
+              when(mockDpm.isNetworkLoggingEnabled(getAdminComponentName())).thenReturn(true);
+              return null;
+            })
+        .when(mockDpm)
+        .setNetworkLoggingEnabled(getAdminComponentName(), /* enabled= */ true);
+    CrumblesMainWithMockDpm activity = controller.setup().get();
+
+    activity.findViewById(R.id.material_switch).performClick();
+
+    ImmutableList<String> eventTypes = auditEventTypes();
+    expect
+        .that(
+            Collections.frequency(
+                eventTypes, CrumblesLoggingWatchdogWorker.AUDIT_EVENT_LOGGING_ENABLED))
+        .isEqualTo(1);
+    expect
+        .that(
+            Collections.frequency(
+                eventTypes, CrumblesLoggingWatchdogWorker.AUDIT_EVENT_NETWORK_LOGGING_ENABLED))
+        .isEqualTo(1);
+  }
+
+  @Test
   public void loggingToggle_whenTurnedOffAsNetworkLoggingDelegate_asksForCredential() {
     CrumblesMainWithMockDpm activity =
         launchAsNetworkLoggingDelegate(/* isNetworkLoggingEnabled= */ true);
@@ -1144,7 +1272,8 @@ public class CrumblesMainTest {
       onActivityResult_disableNetworkCollectionConfirmedAsNetworkLoggingDelegate_stopsNetworkLogging() {
     when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
     when(mockLogsEncryptor.getPublicKey()).thenReturn(testExternalKeyPair.getPublic());
-    when(mockLogsEncryptor.encryptLogs(any(Context.class), any(byte[].class), any(PublicKey.class)))
+    when(mockLogsEncryptor.encryptLogs(
+            any(Context.class), any(byte[].class), any(PublicKey.class), any(), any()))
         .thenReturn(LogBatch.getDefaultInstance());
     when(mockLogsEncryptor.serializeBytes(any(LogBatch.class), any(File.class), anyString()))
         .thenCallRealMethod();
@@ -1282,6 +1411,9 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.onActivityResult(FILE_PICKER_REQUEST_CODE, Activity.RESULT_OK, resultDataIntent);
+          awaitSelectionRead(activity);
+          shadowOf(activity.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
           shadowOf(activity.getMainLooper()).idle();
           nextActivityIntent[0] = shadowOf(activity).getNextStartedActivity();
         });
@@ -1323,6 +1455,7 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.onActivityResult(FILE_PICKER_REQUEST_CODE, Activity.RESULT_OK, resultDataIntent);
+          awaitSelectionRead(activity);
           shadowOf(Looper.getMainLooper()).idle();
           ShadowBiometricPrompt.authenticateCurrentSessionWithError(
               BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED, "Authentication canceled");
@@ -1369,6 +1502,7 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.processSelectedFilesForDecryption(selection);
+          awaitSelectionRead(activity);
           ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
           shadowOf(Looper.getMainLooper()).idle();
           nextActivityIntent[0] = shadowOf(activity).getNextStartedActivity();
@@ -1397,6 +1531,9 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.processSelectedFilesForDecryption(selection);
+          awaitSelectionRead(activity);
+          shadowOf(Looper.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
           shadowOf(Looper.getMainLooper()).idle();
           ShadowBiometricPrompt.authenticateCurrentSessionWithError(
               BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED, "Authentication canceled");
@@ -1425,6 +1562,9 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.processSelectedFilesForDecryption(selection);
+          awaitSelectionRead(activity);
+          shadowOf(Looper.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
           shadowOf(Looper.getMainLooper()).idle();
         });
     scenario.moveToState(Lifecycle.State.CREATED);
@@ -1456,6 +1596,9 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.processSelectedFilesForDecryption(selection);
+          awaitSelectionRead(activity);
+          shadowOf(Looper.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
           shadowOf(Looper.getMainLooper()).idle();
         });
     scenario.moveToState(Lifecycle.State.CREATED);
@@ -1484,6 +1627,7 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.processSelectedFilesForDecryption(selection);
+          awaitSelectionRead(activity);
           shadowOf(Looper.getMainLooper()).idle();
           assertThat((Object) ReflectionHelpers.getField(activity, "selectedLogsCallback"))
               .isNotNull();
@@ -1495,6 +1639,147 @@ public class CrumblesMainTest {
         activity ->
             assertThat((Object) ReflectionHelpers.getField(activity, "selectedLogsCallback"))
                 .isNull());
+  }
+
+  @Test
+  public void processSelectedFilesForDecryption_whenMoreFilesThanTheLimit_readsNone()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    List<Uri> selection =
+        Collections.nCopies(
+            CrumblesConstants.MAX_DECRYPTION_FILES_PER_SESSION + 1, writeLogFiles("first").get(0));
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity -> {
+          activity.processSelectedFilesForDecryption(selection);
+          awaitSelectionRead(activity);
+        });
+
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(context.getString(R.string.toast_decryption_too_many_files));
+    verify(mockLogsEncryptor, never()).decryptLogBatch(any(LogBatch.class));
+  }
+
+  @Test
+  public void processSelectedFilesForDecryption_withAsManyFilesAsTheLimit_decryptsThemAll()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptLogBatch(any(LogBatch.class)))
+        .thenReturn(decrypted("logs".getBytes(UTF_8)));
+    List<Uri> selection =
+        Collections.nCopies(
+            CrumblesConstants.MAX_DECRYPTION_FILES_PER_SESSION, writeLogFiles("first").get(0));
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity -> {
+          activity.processSelectedFilesForDecryption(selection);
+          awaitSelectionRead(activity);
+          shadowOf(Looper.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
+          shadowOf(Looper.getMainLooper()).idle();
+        });
+
+    verify(mockLogsEncryptor, times(CrumblesConstants.MAX_DECRYPTION_FILES_PER_SESSION))
+        .decryptLogBatch(any(LogBatch.class));
+  }
+
+  @Test
+  public void processSelectedFilesForDecryption_whenTheFilesExceedTheTotalLimit_skipsTheRest()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    // The first two files reach the limit exactly, and the third exceeds it.
+    ImmutableList.Builder<Uri> selection = ImmutableList.builder();
+    for (String name : ImmutableList.of("a", "b", "c")) {
+      File largeFile = new File(mockAdHocDir, name + ".bin");
+      try (RandomAccessFile sparseFile = new RandomAccessFile(largeFile, "rw")) {
+        sparseFile.setLength(CrumblesConstants.MAX_DECRYPTION_SESSION_BYTES / 2);
+      }
+      selection.add(Uri.fromFile(largeFile));
+    }
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity -> {
+          activity.processSelectedFilesForDecryption(selection.build());
+          awaitSelectionRead(activity);
+        });
+
+    assertThat(ShadowToast.getTextOfLatestToast())
+        .isEqualTo(context.getString(R.string.toast_decryption_selection_too_large, "c.bin"));
+  }
+
+  @Test
+  public void
+      processSelectedFilesForDecryption_whenANewerSelectionIsMadeWhileReading_dropsTheOlder()
+          throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    when(mockLogsEncryptor.decryptLogBatch(any(LogBatch.class)))
+        .thenReturn(decrypted("logs".getBytes(UTF_8)));
+    ImmutableList<Uri> olderSelection = writeLogFiles("older");
+    ImmutableList<Uri> newerSelection = writeLogFiles("newer");
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+    Intent[] nextActivityIntent = new Intent[1];
+
+    scenario.onActivity(
+        activity -> {
+          activity.processSelectedFilesForDecryption(olderSelection);
+          activity.processSelectedFilesForDecryption(newerSelection);
+          awaitSelectionRead(activity);
+          shadowOf(Looper.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
+          shadowOf(Looper.getMainLooper()).idle();
+          nextActivityIntent[0] = shadowOf(activity).getNextStartedActivity();
+        });
+
+    assertThat(decryptedFileNames(nextActivityIntent[0])).containsExactly("newer.bin");
+  }
+
+  @Test
+  public void processSelectedFilesForDecryption_whenTheActivityStopsWhileReading_decryptsNothing()
+      throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    ImmutableList<Uri> selection = writeLogFiles("first");
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    ExecutorService executor =
+        ReflectionHelpers.getField(controller.get(), "decryptionInputExecutor");
+    controller.get().processSelectedFilesForDecryption(selection);
+    Futures.getUnchecked(executor.submit(() -> {}));
+
+    controller.pause().stop();
+    shadowOf(Looper.getMainLooper()).idle();
+
+    verify(mockLogsEncryptor, never()).decryptLogBatch(any(LogBatch.class));
+  }
+
+  @Test
+  public void
+      processSelectedFilesForDecryption_whenTheActivityStopsWhileReadingUndecryptableBatch_reportsNothing()
+          throws Exception {
+    when(mockLogsEncryptor.doesPrivateKeyExist()).thenReturn(true);
+    doAnswer(
+            invocation ->
+                new BulkDecryptPartition(
+                    ImmutableList.of(),
+                    ImmutableList.of(),
+                    ImmutableList.copyOf(invocation.<List<LogBatch>>getArgument(0))))
+        .when(mockLogsEncryptor)
+        .partitionForBulkDecrypt(any());
+    ImmutableList<Uri> selection = writeLogFiles("first");
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    ExecutorService executor =
+        ReflectionHelpers.getField(controller.get(), "decryptionInputExecutor");
+    controller.get().processSelectedFilesForDecryption(selection);
+    Futures.getUnchecked(executor.submit(() -> {}));
+
+    controller.pause().stop();
+    shadowOf(Looper.getMainLooper()).idle();
+
+    expect.that(hasAuditEvent("DECRYPTION_FAILURE")).isFalse();
+    expect.that(ShadowToast.getTextOfLatestToast()).isNotEqualTo("Failed to decrypt first.bin.");
   }
 
   /** Writes a log file per name into the ad hoc folder, and returns their URIs in that order. */
@@ -1511,6 +1796,13 @@ public class CrumblesMainTest {
       uris.add(Uri.fromFile(logFile));
     }
     return uris.build();
+  }
+
+  /** Waits for {@code activity} to read the selected log files and start decrypting them. */
+  private static void awaitSelectionRead(CrumblesMain activity) {
+    ExecutorService executor = ReflectionHelpers.getField(activity, "decryptionInputExecutor");
+    Futures.getUnchecked(executor.submit(() -> {}));
+    shadowOf(Looper.getMainLooper()).idle();
   }
 
   /** Returns the names of the files whose logs {@code decryptedLogsIntent} shows, in order. */
@@ -1615,7 +1907,8 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           try {
-            var _ = activity.readBytesFromUri(externalFileUri);
+            @SuppressWarnings("unused")
+            var unusedBytes = activity.readBytesFromUri(externalFileUri);
           } catch (SecurityException se) {
             caughtException[0] = se;
           } catch (IOException e) {
@@ -1669,7 +1962,7 @@ public class CrumblesMainTest {
   @Test
   public void readBytesFromUri_withDotDotEscapingAdHocFolder_throwsSecurityException()
       throws IOException {
-    Files.writeString(new File(rootOfTestCleanup, "outside.dat").toPath(), "secret");
+    Files.write(new File(rootOfTestCleanup, "outside.dat").toPath(), "secret".getBytes(UTF_8));
     Uri traversalUri = Uri.fromFile(new File(mockAdHocDir, "../../outside.dat"));
 
     SecurityException thrown = readBytesFromUriExpectingSecurityException(traversalUri);
@@ -1683,7 +1976,7 @@ public class CrumblesMainTest {
   public void readBytesFromUri_forSymlinkToOutsideFile_throwsSecurityException()
       throws IOException {
     File outsideFile = new File(rootOfTestCleanup, "outside.dat");
-    Files.writeString(outsideFile.toPath(), "secret");
+    Files.write(outsideFile.toPath(), "secret".getBytes(UTF_8));
     File symlink = new File(mockAdHocDir, "link.dat");
     Files.createSymbolicLink(symlink.toPath(), outsideFile.toPath());
 
@@ -1701,7 +1994,7 @@ public class CrumblesMainTest {
         new File(mockAdHocDir.getParentFile(), CrumblesConstants.TEMP_RE_ENCRYPTED_DIR + "_evil");
     assertThat(siblingDir.mkdirs()).isTrue();
     File siblingFile = new File(siblingDir, "sibling.dat");
-    Files.writeString(siblingFile.toPath(), "secret");
+    Files.write(siblingFile.toPath(), "secret".getBytes(UTF_8));
 
     SecurityException thrown =
         readBytesFromUriExpectingSecurityException(Uri.fromFile(siblingFile));
@@ -1734,6 +2027,7 @@ public class CrumblesMainTest {
         activity -> {
           shadowOf(activity).clearNextStartedActivities();
           activity.processSelectedFilesForDecryption(urisToProcess);
+          awaitSelectionRead(activity);
           shadowOf(Looper.getMainLooper()).idle();
         });
 
@@ -1763,6 +2057,7 @@ public class CrumblesMainTest {
         activity -> {
           shadowOf(activity).clearNextStartedActivities();
           activity.processSelectedFilesForDecryption(urisToProcess);
+          awaitSelectionRead(activity);
           shadowOf(Looper.getMainLooper()).idle();
         });
 
@@ -1802,6 +2097,9 @@ public class CrumblesMainTest {
         activity -> {
           shadowOf(activity).clearNextStartedActivities();
           activity.processSelectedFilesForDecryption(urisToProcess);
+          awaitSelectionRead(activity);
+          shadowOf(Looper.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
           shadowOf(Looper.getMainLooper()).idle();
         });
 
@@ -1827,7 +2125,11 @@ public class CrumblesMainTest {
     List<Uri> urisToProcess = Collections.singletonList(Uri.fromFile(oversizeFile));
 
     try (ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true)) {
-      scenario.onActivity(activity -> activity.processSelectedFilesForDecryption(urisToProcess));
+      scenario.onActivity(
+          activity -> {
+            activity.processSelectedFilesForDecryption(urisToProcess);
+            awaitSelectionRead(activity);
+          });
       shadowOf(Looper.getMainLooper()).idle();
     }
 
@@ -2080,6 +2382,7 @@ public class CrumblesMainTest {
             Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
 
     CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+    awaitUploadFolderName(activity);
 
     TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
     assertThat(statusTextView.getText().toString()).isEqualTo("Upload Destination: Team Logs");
@@ -2098,12 +2401,13 @@ public class CrumblesMainTest {
 
     SpyPackageManagerActivity activity =
         Robolectric.buildActivity(SpyPackageManagerActivity.class).setup().get();
+    awaitUploadFolderName(activity);
 
     TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
     assertThat(statusTextView.getText().toString())
         .isEqualTo(
             "Upload Destination: Example Storage (com.example.storage), folder \"Team Logs\"");
-    verify(activity.getPackageManager())
+    verify(activity.getPackageManager(), atLeastOnce())
         .resolveContentProvider(treeUri.getAuthority(), /* flags= */ 0);
   }
 
@@ -2119,6 +2423,7 @@ public class CrumblesMainTest {
     saveUploadDestinationWithGrant(treeUri);
 
     CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+    awaitUploadFolderName(activity);
 
     TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
     assertThat(statusTextView.getText().toString())
@@ -2150,6 +2455,7 @@ public class CrumblesMainTest {
     saveUploadDestinationWithGrant(treeUri);
 
     CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+    awaitUploadFolderName(activity);
 
     TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
     assertThat(statusTextView.getText().toString())
@@ -2169,10 +2475,59 @@ public class CrumblesMainTest {
     saveUploadDestinationWithGrant(treeUri);
 
     CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+    awaitUploadFolderName(activity);
 
     TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
     assertThat(statusTextView.getText().toString())
         .isEqualTo("Upload Destination: Configured, in Example Storage (com.example.storage)");
+  }
+
+  @Test
+  public void onResume_whenStorageProviderDoesNotAnswer_showsTheDestinationWithoutWaiting() {
+    Uri treeUri = Uri.parse("content://com.example.storage.documents/tree/team_logs");
+    installStorageApp(treeUri.getAuthority());
+    StalledFolderProvider provider =
+        Robolectric.setupContentProvider(StalledFolderProvider.class, treeUri.getAuthority());
+    saveUploadDestinationWithGrant(treeUri);
+
+    CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+
+    TextView statusTextView = activity.findViewById(R.id.upload_destination_status_textview);
+    assertThat(statusTextView.getText().toString())
+        .isEqualTo("Upload Destination: Configured, in Example Storage (com.example.storage)");
+    // A second refresh while the first read is still waiting does not start a second read.
+    activity.updateUploadDestinationStatusUi();
+    // Lets the read that still waits for the provider end within this test.
+    provider.answer.countDown();
+    awaitUploadFolderName(activity);
+    expect.that(provider.queries.get()).isEqualTo(1);
+    // Once that read ends, clearing the cached name lets the next refresh read it again.
+    context
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .remove(CrumblesConstants.PREF_UPLOAD_FOLDER_NAME)
+        .commit();
+    activity.updateUploadDestinationStatusUi();
+    awaitUploadFolderName(activity);
+    expect.that(provider.queries.get()).isEqualTo(2);
+  }
+
+  @Test
+  public void onDestroy_shutsDownFolderNameExecutor() {
+    ActivityController<CrumblesMain> controller = Robolectric.buildActivity(CrumblesMain.class);
+    CrumblesMain activity = controller.setup().get();
+    ExecutorService executor = ReflectionHelpers.getField(activity, "folderNameExecutor");
+
+    controller.destroy();
+
+    assertThat(executor.isShutdown()).isTrue();
+  }
+
+  /** Waits until {@code activity} has read the name of its upload folder, and shows it. */
+  private static void awaitUploadFolderName(CrumblesMain activity) {
+    ExecutorService executor = ReflectionHelpers.getField(activity, "folderNameExecutor");
+    Futures.getUnchecked(executor.submit(() -> {}));
+    shadowOf(Looper.getMainLooper()).idle();
   }
 
   /** Installs a storage app labelled "Example Storage" whose provider serves {@code authority}. */
@@ -2377,6 +2732,587 @@ public class CrumblesMainTest {
   }
 
   @Test
+  public void onActivityResult_folderReplacingWebDav_firstSendsNoticeToWebDav() throws Exception {
+    AtomicInteger webDavUploads = new AtomicInteger();
+
+    switchFromWebDavToFolderWithExternalKey(HttpURLConnection.HTTP_CREATED, webDavUploads);
+
+    expect.that(webDavUploads.get()).isEqualTo(1);
+    expect.that(auditEventTypes()).contains("DESTINATION_HANDOVER_UPLOADED");
+    expect
+        .that(readSavedRemoteStorageConfig().getUploadDestinationUri())
+        .isEqualTo(TEAM_LOGS_TREE_URI.toString());
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingWebDav_whenNoticeFails_asksBeforeSwitching()
+      throws Exception {
+    switchFromWebDavToFolderWithExternalKey(
+        HttpURLConnection.HTTP_INTERNAL_ERROR, new AtomicInteger());
+
+    AlertDialog dialog = getLatestAppCompatAlertDialog();
+    expect
+        .that(messageOf(dialog))
+        .isEqualTo(context.getString(R.string.dialog_destination_not_handed_over_message));
+    expect.that(dialog.isShowing()).isTrue();
+    expect.that(hidesOverlayWindows(dialog.getWindow())).isTrue();
+    expect.that(auditEventTypes()).contains("DESTINATION_HANDOVER_UPLOAD_FAILED");
+    expect
+        .that(readSavedRemoteStorageConfig().getStorageType())
+        .isEqualTo(StorageType.STORAGE_TYPE_WEBDAV);
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingWebDav_whenNoticeFailsAndUserCancels_keepsWebDav()
+      throws Exception {
+    switchFromWebDavToFolderWithExternalKey(
+        HttpURLConnection.HTTP_INTERNAL_ERROR, new AtomicInteger());
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+    shadowOf(Looper.getMainLooper()).idle();
+
+    expect.that(auditEventTypes()).contains("UPLOAD_DESTINATION_ABANDONED");
+    expect
+        .that(readSavedRemoteStorageConfig().getStorageType())
+        .isEqualTo(StorageType.STORAGE_TYPE_WEBDAV);
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingWebDav_whenNoticeFailsAndUserConfirms_switches()
+      throws Exception {
+    AtomicInteger webDavUploads = new AtomicInteger();
+    ActivityController<CrumblesMain> controller =
+        switchFromWebDavToFolderWithExternalKey(
+            HttpURLConnection.HTTP_INTERNAL_ERROR, webDavUploads);
+    AlertDialog dialog = getLatestAppCompatAlertDialog();
+
+    dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    awaitDestinationHandover(controller.get());
+
+    expect.that(dialog.isShowing()).isFalse();
+    expect
+        .that(auditEventMessages("DESTINATION_CHANGED_WITHOUT_HANDOVER"))
+        .containsExactly(
+            "The user chose to change the upload destination although the outgoing destination"
+                + " did not confirm the handover notice (UPLOAD_FAILED).");
+    expect.that(auditEventTypes()).doesNotContain("UPLOAD_DESTINATION_ABANDONED");
+    // A second notice, which carries that record, went to the WebDAV server before the change.
+    expect.that(webDavUploads.get()).isEqualTo(2);
+    expect
+        .that(readSavedRemoteStorageConfig().getUploadDestinationUri())
+        .isEqualTo(TEAM_LOGS_TREE_URI.toString());
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingFolder_whenOffline_asksBeforeSwitching()
+      throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+
+    chooseTeamLogsFolder(activity);
+    awaitDestinationHandover(activity);
+
+    AlertDialog dialog = getLatestAppCompatAlertDialog();
+    expect
+        .that(messageOf(dialog))
+        .isEqualTo(context.getString(R.string.dialog_destination_handover_offline_message));
+    expect.that(dialog.isShowing()).isTrue();
+    expect.that(auditEventTypes()).contains("DESTINATION_HANDOVER_UPLOADED_OFFLINE");
+    expect.that(savedUploadFolderUri()).isEqualTo(DRIVE_TREE_URI.toString());
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingFolder_whenOfflineAndUserConfirms_switches()
+      throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+    chooseTeamLogsFolder(activity);
+    awaitDestinationHandover(activity);
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    awaitDestinationHandover(activity);
+
+    expect
+        .that(auditEventMessages("DESTINATION_CHANGED_WITHOUT_HANDOVER"))
+        .containsExactly(
+            "The user chose to change the upload destination although the outgoing destination"
+                + " did not confirm the handover notice (UPLOADED_OFFLINE).");
+    expect.that(savedUploadFolderUri()).isEqualTo(TEAM_LOGS_TREE_URI.toString());
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingFolder_whenOnline_stillAsksBeforeSwitching()
+      throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+    validateActiveNetwork();
+
+    chooseTeamLogsFolder(activity);
+    awaitDestinationHandover(activity);
+
+    AlertDialog dialog = getLatestAppCompatAlertDialog();
+    expect
+        .that(messageOf(dialog))
+        .isEqualTo(context.getString(R.string.dialog_destination_handover_unconfirmed_message));
+    expect.that(dialog.isShowing()).isTrue();
+    expect.that(auditEventTypes()).contains("DESTINATION_HANDOVER_UPLOADED_UNCONFIRMED");
+    expect.that(auditEventTypes()).doesNotContain("UPLOAD_DESTINATION_CONFIGURED");
+    expect.that(savedUploadFolderUri()).isEqualTo(DRIVE_TREE_URI.toString());
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingFolder_whenUserConfirms_recordsItInTheOldFolder()
+      throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+    validateActiveNetwork();
+    chooseTeamLogsFolder(activity);
+    awaitDestinationHandover(activity);
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    awaitDestinationHandover(activity);
+
+    expect.that(readNoticesInDriveFolder()).hasSize(2);
+    expect
+        .that(readNoticeInDriveFolderThatRecords("DESTINATION_CHANGED_WITHOUT_HANDOVER"))
+        .startsWith(
+            "Crumbles upload destination change\nChange: Changing the upload destination to a"
+                + " folder of storage provider com.example.storage.documents anyway, although the"
+                + " outgoing destination did not confirm the first notice"
+                + " (UPLOADED_UNCONFIRMED)\n");
+    expect
+        .that(auditEventTypes().reverse())
+        .containsAtLeast(
+            "DESTINATION_HANDOVER_UPLOADED_UNCONFIRMED",
+            "DESTINATION_CHANGED_WITHOUT_HANDOVER",
+            "DESTINATION_HANDOVER_UPLOADED_UNCONFIRMED",
+            "UPLOAD_DESTINATION_CONFIGURED")
+        .inOrder();
+    expect.that(savedUploadFolderUri()).isEqualTo(TEAM_LOGS_TREE_URI.toString());
+  }
+
+  @Test
+  public void onActivityResult_whileTheOldFolderStalls_cancellingTheWaitAsksBeforeSwitching()
+      throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+    CountDownLatch stalled = stallDriveProvider();
+    chooseTeamLogsFolder(activity);
+    assertThat(stalled.await(5, TimeUnit.SECONDS)).isTrue();
+    AlertDialog progressDialog = getLatestAppCompatAlertDialog();
+
+    progressDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+    shadowOf(Looper.getMainLooper()).idle();
+    AlertDialog dialogDuringStall = getLatestAppCompatAlertDialog();
+    // The storage app answers only now, which must not change what the user is asked.
+    driveProviderStall.countDown();
+    awaitDestinationHandover(activity);
+
+    expect.that(progressDialog.isShowing()).isFalse();
+    expect
+        .that(messageOf(dialogDuringStall))
+        .isEqualTo(context.getString(R.string.dialog_destination_not_handed_over_message));
+    expect.that(getLatestAppCompatAlertDialog()).isSameInstanceAs(dialogDuringStall);
+    expect.that(dialogDuringStall.isShowing()).isTrue();
+    expect.that(auditEventTypes()).contains("DESTINATION_HANDOVER_UPLOADED_OFFLINE");
+    expect.that(auditEventTypes()).doesNotContain("UPLOAD_DESTINATION_CONFIGURED");
+    expect.that(savedUploadFolderUri()).isEqualTo(DRIVE_TREE_URI.toString());
+  }
+
+  @Test
+  public void changeAnywayButton_whileTheOldFolderStalls_changeNowSwitches() throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+    chooseTeamLogsFolder(activity);
+    awaitDestinationHandover(activity);
+    CountDownLatch stalled = stallDriveProvider();
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    assertThat(stalled.await(5, TimeUnit.SECONDS)).isTrue();
+    AlertDialog progressDialog = getLatestAppCompatAlertDialog();
+
+    progressDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+    shadowOf(Looper.getMainLooper()).idle();
+    String folderDuringStall = savedUploadFolderUri();
+    // The storage app answers only now, which must not change the destination again.
+    driveProviderStall.countDown();
+    awaitDestinationHandover(activity);
+
+    expect
+        .that(progressDialog.getButton(AlertDialog.BUTTON_NEGATIVE).getText().toString())
+        .isEqualTo(context.getString(R.string.dialog_destination_change_now));
+    expect.that(progressDialog.isShowing()).isFalse();
+    expect.that(folderDuringStall).isEqualTo(TEAM_LOGS_TREE_URI.toString());
+    expect.that(auditEventTypes()).contains("DESTINATION_CHANGED_WITHOUT_HANDOVER");
+    expect
+        .that(Collections.frequency(auditEventTypes(), "UPLOAD_DESTINATION_CONFIGURED"))
+        .isEqualTo(1);
+    expect.that(savedUploadFolderUri()).isEqualTo(TEAM_LOGS_TREE_URI.toString());
+  }
+
+  @Test
+  public void changeNowButton_whileTheOldFolderStalls_keepsItsGrantUntilTheNoticeEnds()
+      throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+    chooseTeamLogsFolder(activity);
+    awaitDestinationHandover(activity);
+    CountDownLatch stalled = stallDriveProvider();
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+    assertThat(stalled.await(5, TimeUnit.SECONDS)).isTrue();
+
+    getLatestAppCompatAlertDialog().getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+    shadowOf(Looper.getMainLooper()).idle();
+    ImmutableList<Uri> grantsDuringStall = persistedGrants();
+    // The storage app answers only now, and gets the second notice under the old folder's grant.
+    driveProviderStall.countDown();
+    awaitDestinationHandover(activity);
+
+    expect.that(grantsDuringStall).contains(DRIVE_TREE_URI);
+    expect.that(readNoticesInDriveFolder()).hasSize(2);
+    expect.that(persistedGrants()).containsExactly(TEAM_LOGS_TREE_URI);
+  }
+
+  @Test
+  public void changeNowButton_whileTheFirstNoticeIsSealed_sendsNoNoticeToTheNewServer()
+      throws Exception {
+    CrumblesMain activity = setUpFolderDestinationWithExternalKey().get();
+    AtomicInteger newServerRequests = new AtomicInteger();
+    String newServerUrl = startWebDavServer(HttpURLConnection.HTTP_CREATED, newServerRequests);
+    AlertDialog webDavDialog = openWebDavDialog(activity);
+    ImmutableList<Uri> grantsBeforeTheNoticesEnd;
+
+    // Sealing a notice needs this lock, so the first notice is sealed only after the change.
+    synchronized (CrumblesSendAndMarkProcessingWorker.UPLOAD_LOCK) {
+      saveWebDavSettings(webDavDialog, newServerUrl, "bob", "battery staple");
+      clickOnLatestDialog(AlertDialog.BUTTON_NEGATIVE);
+      clickOnLatestDialog(AlertDialog.BUTTON_POSITIVE);
+      clickOnLatestDialog(AlertDialog.BUTTON_NEGATIVE);
+      grantsBeforeTheNoticesEnd = persistedGrants();
+    }
+    awaitDestinationHandover(activity);
+
+    expect
+        .that(readSavedRemoteStorageConfig().getStorageType())
+        .isEqualTo(StorageType.STORAGE_TYPE_WEBDAV);
+    expect.that(newServerRequests.get()).isEqualTo(0);
+    expect.that(auditEventTypes()).doesNotContain("DESTINATION_HANDOVER_UPLOADED");
+    expect
+        .that(Collections.frequency(auditEventTypes(), "DESTINATION_HANDOVER_UPLOAD_FAILED"))
+        .isEqualTo(2);
+    ImmutableList<String> pendingNotices = readPendingNotices();
+    expect.that(pendingNotices).hasSize(2);
+    expect
+        .that(
+            Iterables.filter(
+                pendingNotices,
+                notice -> notice.contains(recordOf("DESTINATION_CHANGED_WITHOUT_HANDOVER"))))
+        .hasSize(1);
+    expect.that(readNoticesInDriveFolder()).isEmpty();
+    expect.that(grantsBeforeTheNoticesEnd).contains(DRIVE_TREE_URI);
+    expect.that(persistedGrants()).doesNotContain(DRIVE_TREE_URI);
+  }
+
+  @Test
+  public void onStop_whileTheNoticeIsSent_abandonsTheChange() throws Exception {
+    ActivityController<CrumblesMain> controller = setUpFolderDestinationWithExternalKey();
+    CountDownLatch stalled = stallDriveProvider();
+    chooseTeamLogsFolder(controller.get());
+    assertThat(stalled.await(5, TimeUnit.SECONDS)).isTrue();
+    AlertDialog progressDialog = getLatestAppCompatAlertDialog();
+
+    controller.pause().stop();
+    boolean progressShownAfterStop = progressDialog.isShowing();
+    // The storage app answers only now, which must neither ask about nor make the change.
+    driveProviderStall.countDown();
+    awaitDestinationHandover(controller.get());
+
+    expect.that(progressShownAfterStop).isFalse();
+    expect.that(getLatestAppCompatAlertDialog()).isSameInstanceAs(progressDialog);
+    expect
+        .that(auditEventMessages("UPLOAD_DESTINATION_ABANDONED"))
+        .containsExactly(
+            "Upload destination unchanged because the app left the screen while the change was"
+                + " handed over.");
+    expect.that(auditEventTypes()).doesNotContain("DESTINATION_CHANGED_WITHOUT_HANDOVER");
+    expect.that(auditEventTypes()).doesNotContain("UPLOAD_DESTINATION_CONFIGURED");
+    expect.that(savedUploadFolderUri()).isEqualTo(DRIVE_TREE_URI.toString());
+  }
+
+  @Test
+  public void onStop_whileAskingToSwitchWithoutHandover_abandonsTheChange() throws Exception {
+    ActivityController<CrumblesMain> controller =
+        switchFromWebDavToFolderWithExternalKey(
+            HttpURLConnection.HTTP_INTERNAL_ERROR, new AtomicInteger());
+    AlertDialog dialog = getLatestAppCompatAlertDialog();
+
+    controller.pause().stop();
+    shadowOf(Looper.getMainLooper()).idle();
+
+    expect.that(dialog.isShowing()).isFalse();
+    expect.that(auditEventTypes()).contains("UPLOAD_DESTINATION_ABANDONED");
+  }
+
+  @Test
+  public void onActivityResult_folderReplacingWebDav_whenScreenClosesMeanwhile_keepsWebDav()
+      throws Exception {
+    ActivityController<CrumblesMain> controller =
+        setUpWebDavDestinationWithExternalKey(HttpURLConnection.HTTP_CREATED, new AtomicInteger());
+    chooseTeamLogsFolder(controller.get());
+
+    controller.get().finish();
+    awaitDestinationHandover(controller.get());
+
+    expect.that(auditEventTypes()).contains("UPLOAD_DESTINATION_ABANDONED");
+    expect
+        .that(readSavedRemoteStorageConfig().getStorageType())
+        .isEqualTo(StorageType.STORAGE_TYPE_WEBDAV);
+  }
+
+  @Test
+  public void onDestroy_duringHandover_finishesItButKeepsDestination() throws Exception {
+    ActivityController<CrumblesMain> controller =
+        setUpWebDavDestinationWithExternalKey(HttpURLConnection.HTTP_CREATED, new AtomicInteger());
+    chooseTeamLogsFolder(controller.get());
+    ExecutorService handover =
+        ReflectionHelpers.getField(controller.get(), "destinationHandoverExecutor");
+
+    controller.pause().stop().destroy();
+    boolean handoverFinished = handover.awaitTermination(5, TimeUnit.SECONDS);
+    shadowOf(Looper.getMainLooper()).idle();
+
+    expect.that(handoverFinished).isTrue();
+    // Leaving the screen abandons the change at once, which the activity log may record before or
+    // after the upload of the notice.
+    expect
+        .that(auditEventTypes())
+        .containsAtLeast("DESTINATION_HANDOVER_UPLOADED", "UPLOAD_DESTINATION_ABANDONED");
+    expect
+        .that(readSavedRemoteStorageConfig().getStorageType())
+        .isEqualTo(StorageType.STORAGE_TYPE_WEBDAV);
+  }
+
+  @Test
+  public void webDavDialog_replacingDestination_savesOnceHandedOverBehindProgressDialog()
+      throws Exception {
+    AtomicInteger webDavUploads = new AtomicInteger();
+    ActivityController<CrumblesMain> controller =
+        setUpWebDavDestinationWithExternalKey(HttpURLConnection.HTTP_CREATED, webDavUploads);
+    String teamServerUrl = "http://localhost:" + webDavServer.getAddress().getPort() + "/dav/team/";
+
+    saveWebDavSettings(openWebDavDialog(controller.get()), teamServerUrl, "bob", "battery staple");
+    awaitDestinationHandover(controller.get());
+
+    AlertDialog progressDialog = getLatestAppCompatAlertDialog();
+    expect
+        .that(messageOf(progressDialog))
+        .isEqualTo(context.getString(R.string.dialog_message_handing_over_destination));
+    expect
+        .that(progressDialog.getButton(AlertDialog.BUTTON_NEGATIVE).getText().toString())
+        .isEqualTo(context.getString(android.R.string.cancel));
+    expect.that(progressDialog.isShowing()).isFalse();
+    expect.that(webDavUploads.get()).isEqualTo(1);
+    expect
+        .that(auditEventTypes().reverse())
+        .containsAtLeast("DESTINATION_HANDOVER_UPLOADED", "UPLOAD_DESTINATION_CONFIGURED")
+        .inOrder();
+    expect
+        .that(
+            new String(
+                CrumblesMain.getLogsEncryptorInstance()
+                    .decryptDataStoreEntry(
+                        readSavedRemoteStorageConfig().getWebdavServerUrl(),
+                        CrumblesConstants.WEBDAV_SERVER_URL_ENTRY_ID),
+                UTF_8))
+        .isEqualTo(teamServerUrl);
+  }
+
+  @Test
+  public void webDavDialog_afterAHandedOverChange_handsTheNextChangeOverToo() throws Exception {
+    AtomicInteger webDavUploads = new AtomicInteger();
+    ActivityController<CrumblesMain> controller =
+        setUpWebDavDestinationWithExternalKey(HttpURLConnection.HTTP_CREATED, webDavUploads);
+    String serverUrl = "http://localhost:" + webDavServer.getAddress().getPort() + "/dav/";
+    saveWebDavSettings(openWebDavDialog(controller.get()), serverUrl + "team/", "bob", "pass");
+    awaitDestinationHandover(controller.get());
+
+    saveWebDavSettings(openWebDavDialog(controller.get()), serverUrl + "audit/", "eve", "pass");
+    awaitDestinationHandover(controller.get());
+
+    expect.that(webDavUploads.get()).isEqualTo(2);
+  }
+
+  /** Opens a main screen with an external key and, as destination, a counting WebDAV server. */
+  private ActivityController<CrumblesMain> setUpWebDavDestinationWithExternalKey(
+      int webDavStatus, AtomicInteger webDavUploads) throws Exception {
+    String serverUrl = startWebDavServer(webDavStatus, webDavUploads);
+    selectExternalKeyWithRealEncryptor(testExternalKeyPair.getPublic());
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    saveWebDavSettings(openWebDavDialog(controller.get()), serverUrl, "alice", "correct horse");
+    return controller;
+  }
+
+  /**
+   * Starts a WebDAV server that answers every request with {@code status} and counts the requests
+   * in {@code requests}, and returns its URL.
+   */
+  private String startWebDavServer(int status, AtomicInteger requests) throws IOException {
+    webDavServer =
+        HttpServer.create(new InetSocketAddress("localhost", /* port= */ 0), /* backlog= */ 0);
+    webDavServer.createContext(
+        "/dav",
+        exchange -> {
+          requests.incrementAndGet();
+          exchange.sendResponseHeaders(status, /* responseLength= */ -1);
+          exchange.close();
+        });
+    webDavServer.start();
+    return "http://localhost:" + webDavServer.getAddress().getPort() + "/dav/";
+  }
+
+  /**
+   * Opens a main screen with an external key and, as destination, a folder of a storage app. The
+   * external key is the device key, so that the tests can read the notices sealed to it.
+   */
+  private ActivityController<CrumblesMain> setUpFolderDestinationWithExternalKey()
+      throws CrumblesKeysException {
+    driveProvider =
+        Robolectric.setupContentProvider(
+            FakeGoogleDriveContentProvider.class, DRIVE_TREE_URI.getAuthority());
+    // The storage app's documents count as writable only under a grant of the folder's prefix.
+    context.grantUriPermission(
+        context.getPackageName(),
+        DRIVE_TREE_URI,
+        Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+    saveUploadDestinationWithGrant(DRIVE_TREE_URI);
+    CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    selectExternalKeyWithRealEncryptor(
+        CrumblesMain.getLogsEncryptorInstance()
+            .generateKeyPair(KEY_ALIAS, /* requireUserAuthentication= */ false)
+            .getPublic());
+    return Robolectric.buildActivity(CrumblesMain.class).setup();
+  }
+
+  /**
+   * Selects {@code externalKey}. The key manager is a singleton that keeps the encryptor it was
+   * made with. It is made again with the real one, which seals the notice, and dropped after the
+   * test.
+   */
+  private void selectExternalKeyWithRealEncryptor(PublicKey externalKey)
+      throws CrumblesKeysException {
+    CrumblesMain.setLogsEncryptorInstanceForTest(null);
+    ReflectionHelpers.setStaticField(CrumblesExternalPublicKeyManager.class, "instance", null);
+    CrumblesExternalPublicKeyManager.getInstance(context).saveActiveExternalPublicKey(externalKey);
+  }
+
+  /**
+   * Makes the storage app of {@link #DRIVE_TREE_URI} hold each document it opens, as a provider
+   * that never answers would, until {@link #driveProviderStall} opens. Returns a latch that opens
+   * once the storage app holds the first document.
+   */
+  private CountDownLatch stallDriveProvider() {
+    CountDownLatch stalled = new CountDownLatch(1);
+    driveProvider.onOpenFile =
+        () -> {
+          stalled.countDown();
+          try {
+            driveProviderStall.await();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+          }
+        };
+    return stalled;
+  }
+
+  /** Returns the notices, decrypted, that the storage app holds in {@link #DRIVE_TREE_URI}. */
+  private ImmutableList<String> readNoticesInDriveFolder() throws Exception {
+    // FakeGoogleDriveContentProvider keeps the documents of its folder there.
+    return decrypt(new File(context.getFilesDir(), "fake_remote_drive").listFiles());
+  }
+
+  /** Returns the batches, decrypted, that wait on this phone for background sync. */
+  private ImmutableList<String> readPendingNotices() throws Exception {
+    File logsDirectory =
+        new File(context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
+    return decrypt(
+        logsDirectory.listFiles((directory, name) -> !name.endsWith(CrumblesConstants.SENT_SUFFIX)));
+  }
+
+  /** Returns the logs of {@code batches}, which the device key decrypts. */
+  private static ImmutableList<String> decrypt(File[] batches) throws Exception {
+    CrumblesLogsEncryptor encryptor = CrumblesMain.getLogsEncryptorInstance();
+    ImmutableList.Builder<String> logs = ImmutableList.builder();
+    for (File batch : batches) {
+      logs.add(new String(encryptor.decryptLogs(encryptor.deserializeFile(batch.toPath())), UTF_8));
+    }
+    return logs.build();
+  }
+
+  /**
+   * Returns the only notice in {@link #DRIVE_TREE_URI} that carries an activity record of {@code
+   * eventType}.
+   */
+  private String readNoticeInDriveFolderThatRecords(String eventType) throws Exception {
+    return Iterables.getOnlyElement(
+        Iterables.filter(readNoticesInDriveFolder(), notice -> notice.contains(recordOf(eventType))));
+  }
+
+  /** Returns how an activity record of {@code eventType} names its type in a batch. */
+  private static String recordOf(String eventType) {
+    return "\"eventType\":\"" + eventType + "\"";
+  }
+
+  /** Returns the folders that this app holds a persisted grant to. */
+  private ImmutableList<Uri> persistedGrants() {
+    return context.getContentResolver().getPersistedUriPermissions().stream()
+        .map(UriPermission::getUri)
+        .collect(toImmutableList());
+  }
+
+  /** Taps the button {@code which} of the dialog shown last. */
+  private static void clickOnLatestDialog(int which) {
+    getLatestAppCompatAlertDialog().getButton(which).performClick();
+    shadowOf(Looper.getMainLooper()).idle();
+  }
+
+  /** Lets the active network count as validated, that is, as reaching the internet. */
+  private void validateActiveNetwork() {
+    ConnectivityManager connectivityManager = context.getSystemService(ConnectivityManager.class);
+    NetworkCapabilities validated = ShadowNetworkCapabilities.newInstance();
+    shadowOf(validated).addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+    shadowOf(connectivityManager)
+        .setNetworkCapabilities(connectivityManager.getActiveNetwork(), validated);
+  }
+
+  /** Returns the upload folder that the app saved last, or an empty string if none. */
+  private String savedUploadFolderUri() {
+    return context
+        .getSharedPreferences(CrumblesConstants.PREFS_NAME, Context.MODE_PRIVATE)
+        .getString(CrumblesConstants.PREF_UPLOAD_DESTINATION_URI, /* defValue= */ "");
+  }
+
+  /** Sets up the WebDAV destination, then chooses a folder and waits for the handover. */
+  @CanIgnoreReturnValue
+  private ActivityController<CrumblesMain> switchFromWebDavToFolderWithExternalKey(
+      int webDavStatus, AtomicInteger webDavUploads) throws Exception {
+    ActivityController<CrumblesMain> controller =
+        setUpWebDavDestinationWithExternalKey(webDavStatus, webDavUploads);
+    chooseTeamLogsFolder(controller.get());
+    awaitDestinationHandover(controller.get());
+    return controller;
+  }
+
+  /** Chooses the folder of {@link #TEAM_LOGS_TREE_URI} as the upload destination. */
+  private void chooseTeamLogsFolder(CrumblesMain activity) {
+    int grantFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+    context.getContentResolver().takePersistableUriPermission(TEAM_LOGS_TREE_URI, grantFlags);
+    activity.onActivityResult(
+        CrumblesConstants.FILE_TREE_REQUEST_CODE,
+        Activity.RESULT_OK,
+        new Intent().setData(TEAM_LOGS_TREE_URI).addFlags(grantFlags));
+  }
+
+  /** Waits until the handover of the upload destination change on {@code activity} is done. */
+  private static void awaitDestinationHandover(CrumblesMain activity) {
+    ExecutorService handover = ReflectionHelpers.getField(activity, "destinationHandoverExecutor");
+    Futures.getUnchecked(handover.submit(() -> {}));
+    shadowOf(Looper.getMainLooper()).idle();
+  }
+
+  @Test
   public void uploadAndWipeButton_startsTheUploadAndWipe() throws Exception {
     ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
 
@@ -2573,6 +3509,39 @@ public class CrumblesMainTest {
   }
 
   @Test
+  public void wipeAnywayButton_whileAnUploadAndWipeIsQueued_showsThePendingBatches()
+      throws Exception {
+    createSentBatchOnDisk("crumbles_logs_encrypted_1.bin");
+    // Queued but not running yet, as while the system holds the job back.
+    WorkManager.getInstance(context)
+        .enqueueUniqueWork(
+            CrumblesUploadAndWipeWorker.UNIQUE_WORK_NAME,
+            ExistingWorkPolicy.KEEP,
+            new OneTimeWorkRequest.Builder(CrumblesUploadAndWipeWorker.class)
+                .setInitialDelay(Duration.ofHours(1))
+                .build())
+        .getResult()
+        .get();
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    AtomicReference<Button> wipeAnywayButton = new AtomicReference<>();
+    scenario.onActivity(
+        activity -> wipeAnywayButton.set(activity.findViewById(R.id.btn_wipe_anyway)));
+    // WorkManager reports the queued work to the screen off the main thread.
+    for (int attempt = 0;
+        attempt < 50 && wipeAnywayButton.get().getVisibility() != View.VISIBLE;
+        attempt++) {
+      Uninterruptibles.sleepUninterruptibly(20, MILLISECONDS);
+      shadowOf(Looper.getMainLooper()).idle();
+    }
+
+    expect.that(wipeAnywayButton.get().getVisibility()).isEqualTo(View.VISIBLE);
+    expect
+        .that(wipeAnywayButton.get().getText().toString())
+        .isEqualTo("Wipe anyway (1 batch not uploaded)");
+  }
+
+  @Test
   public void wipeAnyway_withoutScreenLock_refusesAndKeepsTheBatches() throws Exception {
     File batch = leaveBatchThatCouldNotBeUploaded();
     ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
@@ -2684,8 +3653,9 @@ public class CrumblesMainTest {
             context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
     assertThat(logsDirectory.mkdirs()).isTrue();
     File batch = new File(logsDirectory, "crumbles_logs_encrypted_1.bin");
-    Files.writeString(batch.toPath(), "encrypted batch");
-    var _ =
+    Files.write(batch.toPath(), "encrypted batch".getBytes(UTF_8));
+    @SuppressWarnings("unused")
+    var unusedResult =
         TestListenableWorkerBuilder.from(context, CrumblesUploadAndWipeWorker.class)
             .build()
             .doWork();
@@ -2697,9 +3667,10 @@ public class CrumblesMainTest {
     File logsDirectory =
         new File(
             context.getFilesDir(), CrumblesConstants.FILEPROVIDER_COMPATIBLE_LOGS_SUBDIRECTORY);
-    var _ = logsDirectory.mkdirs();
+    @SuppressWarnings("unused")
+    var unusedCreated = logsDirectory.mkdirs();
     File batch = new File(logsDirectory, fileName);
-    Files.writeString(batch.toPath(), "encrypted sent batch");
+    Files.write(batch.toPath(), "encrypted sent batch".getBytes(UTF_8));
     return batch;
   }
 
@@ -2708,6 +3679,15 @@ public class CrumblesMainTest {
         .getMemoryCachedEvents()
         .stream()
         .map(CrumblesAuditEvent::getEventType)
+        .collect(toImmutableList());
+  }
+
+  private static ImmutableList<String> auditEventMessages(String eventType) {
+    return CrumblesAppAuditLogger.getInstance(ApplicationProvider.getApplicationContext())
+        .getMemoryCachedEvents()
+        .stream()
+        .filter(event -> event.getEventType().equals(eventType))
+        .map(CrumblesAuditEvent::getMessage)
         .collect(toImmutableList());
   }
 
@@ -2901,6 +3881,28 @@ public class CrumblesMainTest {
   }
 
   @Test
+  public void onResume_whenNotificationsAreTurnedOff_showsAlertsBlockedWarning() {
+    shadowOf(context.getSystemService(NotificationManager.class)).setNotificationsEnabled(false);
+
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity ->
+            assertThat(activity.findViewById(R.id.alerts_blocked_warning).getVisibility())
+                .isEqualTo(View.VISIBLE));
+  }
+
+  @Test
+  public void onResume_whenNotificationsAreOn_hidesAlertsBlockedWarning() {
+    ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
+
+    scenario.onActivity(
+        activity ->
+            assertThat(activity.findViewById(R.id.alerts_blocked_warning).getVisibility())
+                .isEqualTo(View.GONE));
+  }
+
+  @Test
   public void setScreenLockButton_onClick_opensTheSystemScreenLockSettings() {
     setPasswordComplexity(DevicePolicyManager.PASSWORD_COMPLEXITY_NONE);
     addScreenLockActivity("com.example.claims.screen.lock", /* applicationFlags= */ 0);
@@ -2967,8 +3969,10 @@ public class CrumblesMainTest {
   }
 
   @Test
-  public void activateDeviceAdminButton_onClick_asksToActivateCrumblesAsDeviceAdmin() {
+  public void activateDeviceAdminButton_onClick_asksTheSystemToActivateCrumblesAsDeviceAdmin() {
     setUpLoggingDelegate();
+    addDeviceAdminActivity("com.example.claims.device.admin", /* applicationFlags= */ 0);
+    addDeviceAdminActivity("com.android.settings", ApplicationInfo.FLAG_SYSTEM);
     ActivityScenario<CrumblesMain> scenario = launchActivityWithNotificationPermission(true);
     Intent[] startedIntent = new Intent[1];
 
@@ -2981,6 +3985,10 @@ public class CrumblesMainTest {
     expect
         .that(startedIntent[0].getAction())
         .isEqualTo(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
+    expect
+        .that(startedIntent[0].getComponent())
+        .isEqualTo(
+            new ComponentName("com.android.settings", "com.android.settings.DeviceAdminAdd"));
     expect
         .that(
             startedIntent[0].getParcelableExtra(
@@ -3022,6 +4030,18 @@ public class CrumblesMainTest {
     shadowOf(application.getPackageManager())
         .addResolveInfoForIntent(
             new Intent(DevicePolicyManager.ACTION_SET_NEW_PASSWORD), resolveInfo);
+  }
+
+  /** Makes the activity {@code DeviceAdminAdd} of {@code packageName} activate device admins. */
+  private static void addDeviceAdminActivity(String packageName, int applicationFlags) {
+    ResolveInfo resolveInfo =
+        ShadowResolveInfo.newResolveInfo(
+            "Device admin", packageName, packageName + ".DeviceAdminAdd");
+    resolveInfo.activityInfo.applicationInfo.flags = applicationFlags;
+    Application application = ApplicationProvider.getApplicationContext();
+    shadowOf(application.getPackageManager())
+        .addResolveInfoForIntent(
+            new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN), resolveInfo);
   }
 
   /** Simulates a layout that lacks the app signing fingerprint view. */
@@ -3108,6 +4128,9 @@ public class CrumblesMainTest {
     scenario.onActivity(
         activity -> {
           activity.onActivityResult(FILE_PICKER_REQUEST_CODE, Activity.RESULT_OK, resultDataIntent);
+          awaitSelectionRead(activity);
+          shadowOf(activity.getMainLooper()).idle();
+          ShadowBiometricPrompt.authenticateCurrentSessionSuccessfully();
           shadowOf(activity.getMainLooper()).idle();
           nextActivityIntent[0] = shadowOf(activity).getNextStartedActivity();
         });
@@ -3186,6 +4209,28 @@ public class CrumblesMainTest {
       return 0;
     }
   }
+
+  /** A documents provider that names the folder only once the test lets it answer. */
+  public static class StalledFolderProvider extends FakeContentProvider {
+    final CountDownLatch answer = new CountDownLatch(1);
+    final AtomicInteger queries = new AtomicInteger();
+
+    @Override
+    public Cursor query(
+        Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+      queries.incrementAndGet();
+      // Waiting here on the main thread would freeze the app, and the test with it.
+      assertWithMessage("Asked for the folder name on the main thread")
+          .that(Looper.getMainLooper().isCurrentThread())
+          .isFalse();
+      Uninterruptibles.awaitUninterruptibly(answer);
+      MatrixCursor cursor =
+          new MatrixCursor(new String[] {DocumentsContract.Document.COLUMN_DISPLAY_NAME});
+      cursor.addRow(new Object[] {"Team Logs"});
+      return cursor;
+    }
+  }
+
   @Test
   public void selectUploadDestination_showsSecureStorageTypeAndWebDavDialogs() {
     CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
@@ -3262,9 +4307,23 @@ public class CrumblesMainTest {
 
     expect.that(webDavDialog.isShowing()).isFalse();
     expect.that(controller.get().webDavDialog).isNull();
+    expect.that(hasAuditEvent("UPLOAD_DESTINATION_ABANDONED")).isTrue();
     expect.that(urlField.getText().toString()).isEmpty();
     expect.that(usernameField.getText().toString()).isEmpty();
     expect.that(passwordField.getText().toString()).isEmpty();
+  }
+
+  @Test
+  public void storageTypeDialog_onStop_dismissesDialogAndRecordsAbandonedChange() {
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    clickAndConfirmPrompt(controller.get(), R.id.btn_select_upload_dest);
+    AlertDialog storageTypeDialog = getLatestAppCompatAlertDialog();
+
+    controller.pause().stop();
+
+    expect.that(storageTypeDialog.isShowing()).isFalse();
+    expect.that(hasAuditEvent("UPLOAD_DESTINATION_ABANDONED")).isTrue();
   }
 
   @Test
@@ -3409,19 +4468,23 @@ public class CrumblesMainTest {
 
   @Test
   public void webDavDialog_whenCancelled_dismissesAndClearsCredentials() throws Exception {
-    CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
-    AlertDialog webDavDialog = openWebDavDialog(activity);
+    ActivityController<CrumblesMain> controller =
+        Robolectric.buildActivity(CrumblesMain.class).setup();
+    AlertDialog webDavDialog = openWebDavDialog(controller.get());
     EditText usernameField = webDavDialog.findViewById(R.id.webdav_username_input);
     EditText passwordField = webDavDialog.findViewById(R.id.webdav_password_input);
     fillWebDavFields(webDavDialog, WEBDAV_SERVER_URL, "alice", "correct horse");
 
     webDavDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
     shadowOf(Looper.getMainLooper()).idle();
+    // Stopping after the dialog is already closed must not record an abandoned change.
+    controller.pause().stop();
 
     expect.that(webDavDialog.isShowing()).isFalse();
     expect.that(usernameField.getText().toString()).isEmpty();
     expect.that(passwordField.getText().toString()).isEmpty();
     expect.that(readSavedRemoteStorageConfig()).isEqualTo(RemoteStorageConfig.getDefaultInstance());
+    expect.that(auditEventTypes()).doesNotContain("UPLOAD_DESTINATION_ABANDONED");
   }
 
   @Test
@@ -3659,6 +4722,43 @@ public class CrumblesMainTest {
   }
 
   @Test
+  public void webDavDialog_whenAnotherServerIsEntered_showsNoWarningAboutTheSavedKey()
+      throws Exception {
+    stubSealing();
+    HttpsServer savedServer = startHttpsServer();
+    HttpsServer otherServer =
+        startHttpsServer(
+            new AtomicReference<>(rotatedServerCertificate),
+            new AtomicInteger(),
+            /* onHandshake= */ null);
+    Security.insertProviderAt(new TestRootTrustProvider(), 1);
+    try {
+      CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+      saveHttpsWebDavSettings(activity, savedServer)
+          .getButton(AlertDialog.BUTTON_POSITIVE)
+          .performClick();
+      shadowOf(Looper.getMainLooper()).idle();
+
+      saveWebDavSettings(
+          openWebDavDialog(activity),
+          "https://localhost:" + otherServer.getAddress().getPort() + "/dav/",
+          "alice",
+          "correct horse");
+      AlertDialog confirmationDialog = awaitServerKeyDialog(activity);
+
+      assertThat(messageOf(confirmationDialog))
+          .isEqualTo(
+              activity.getString(
+                  R.string.webdav_server_key_dialog_message,
+                  WebDavServerKeyPin.of(rotatedServerCertificate.keyPair().getPublic())
+                      .fingerprint()));
+    } finally {
+      savedServer.stop(0);
+      otherServer.stop(0);
+    }
+  }
+
+  @Test
   public void webDavKeyConfirmation_whenUrlEditedOrDialogReopened_promptsForKeyConfirmation()
       throws Exception {
     stubSealing();
@@ -3798,15 +4898,23 @@ public class CrumblesMainTest {
       shadowOf(Looper.getMainLooper()).idle();
       expect.that(webDavDialog.isShowing()).isFalse();
 
-      // Reopening with a persisted pin warns if the server presents a different key on Save.
+      // Reopening with a persisted pin warns if the server presents a different key on Save, also
+      // when the URL spells the same scheme, host and port differently.
       activeCertificate.set(rotatedServerCertificate);
       AlertDialog reopenedDialog = openWebDavDialog(activity);
-      saveWebDavSettings(reopenedDialog, serverUrl, "alice", "new password");
+      saveWebDavSettings(
+          reopenedDialog,
+          "https://LOCALHOST:" + server.getAddress().getPort() + "/dav",
+          "alice",
+          "new password");
       AlertDialog persistedWarningDialog = awaitServerKeyDialog(activity);
       expect.that(persistedWarningDialog.isShowing()).isTrue();
       expect
           .that(messageOf(persistedWarningDialog))
-          .contains(activity.getString(R.string.webdav_server_key_changed));
+          .startsWith(
+              activity.getString(
+                  R.string.webdav_server_key_differs_from_saved,
+                  WebDavServerKeyPin.of(serverCertificate.keyPair().getPublic()).fingerprint()));
       persistedWarningDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
       reopenedDialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
       shadowOf(Looper.getMainLooper()).idle();
@@ -3911,6 +5019,42 @@ public class CrumblesMainTest {
                 .setStorageType(StorageType.STORAGE_TYPE_GOOGLE_DRIVE)
                 .setUploadDestinationUri(treeUri.toString())
                 .build());
+  }
+
+  @Test
+  public void fileTreeResult_releasesTheGrantOfThePreviousFolder() {
+    Uri oldTreeUri = Uri.parse("content://com.android.externalstorage.documents/tree/old_folder");
+    Uri newTreeUri = Uri.parse("content://com.android.externalstorage.documents/tree/new_folder");
+    int grantFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+    context.getContentResolver().takePersistableUriPermission(oldTreeUri, grantFlags);
+    context.getContentResolver().takePersistableUriPermission(newTreeUri, grantFlags);
+    CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+
+    activity.onActivityResult(
+        CrumblesConstants.FILE_TREE_REQUEST_CODE,
+        Activity.RESULT_OK,
+        new Intent().setData(newTreeUri).addFlags(grantFlags));
+
+    assertThat(
+            context.getContentResolver().getPersistedUriPermissions().stream()
+                .map(UriPermission::getUri)
+                .toList())
+        .containsExactly(newTreeUri);
+  }
+
+  @Test
+  public void webDavSave_releasesTheGrantOfTheFolder() throws Exception {
+    stubSealing();
+    context
+        .getContentResolver()
+        .takePersistableUriPermission(
+            Uri.parse("content://com.android.externalstorage.documents/tree/valid_folder"),
+            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+    CrumblesMain activity = Robolectric.buildActivity(CrumblesMain.class).setup().get();
+
+    saveWebDavSettings(openWebDavDialog(activity), WEBDAV_SERVER_URL, "alice", "correct horse");
+
+    assertThat(context.getContentResolver().getPersistedUriPermissions()).isEmpty();
   }
 
   @Test
@@ -4300,11 +5444,23 @@ public class CrumblesMainTest {
     return (privateFlags & hideOverlays) == hideOverlays;
   }
 
+  @Test
+  public void onDestroy_shutsDownDecryptionInputExecutor() {
+    ActivityController<CrumblesMain> controller = Robolectric.buildActivity(CrumblesMain.class);
+    CrumblesMain activity = controller.setup().get();
+    ExecutorService executor = ReflectionHelpers.getField(activity, "decryptionInputExecutor");
+
+    controller.destroy();
+
+    assertThat(executor.isShutdown()).isTrue();
+  }
+
   private static final class TestRootTrustProvider extends Provider {
     static final String NAME = "CrumblesMainTestRootTrust";
 
+    @SuppressWarnings("deprecation") // Android lacks Provider(String, String, String).
     TestRootTrustProvider() {
-      super(NAME, "1.0", "Trusts only the test root CA");
+      super(NAME, 1.0, "Trusts only the test root CA");
       TrustManager[] trustManagers = {
         new HandshakeCertificates.Builder()
             .addTrustedCertificate(testRootCertificate.certificate())

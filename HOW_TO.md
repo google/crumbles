@@ -48,7 +48,12 @@ No app can protect against the following, so they are out of scope:
   batch encrypted to it. Keep it offline, and change it if it leaks.
 * **Stopping the logs.** An attacker who controls the phone or its network can
   stop the logging or the uploads. Crumbles can't bring back logs that were
-  never recorded or sent.
+  never recorded or sent. A restart can also lose recent security events;
+  Crumbles records when it may have. Before the first unlock after a restart,
+  Crumbles collects security logs only if it encrypts them to an external key.
+* **Hiding that Crumbles is installed.** The neutral launcher entry also names
+  the app neutrally in Recents, but Settings, notification headers and the
+  Quick Settings tile editor still show the name Crumbles.
 
 ---
 
@@ -148,11 +153,29 @@ If you prefer installing Crumbles manually using a desktop or laptop computer:
 2. **Enable USB Debugging** on your phone ([Setup Guide](https://developer.android.com/studio/debug/dev-options)).
 3. Plug your phone into your computer via USB cable and tap **Allow USB Debugging** on your phone screen.
 4. Download the [Android Platform-Tools](https://developer.android.com/tools/releases/platform-tools) and the latest [Crumbles APK](https://github.com/google/crumbles/releases).
-5. Run the setup script for your computer's OS (each script automatically verifies the downloaded APK's SHA-256 checksum against `CrumblesApp.apk.sha256` before installation):
+5. Run the setup script for your computer's OS. A checksum from the release
+   site only proves that the download is complete, so each script installs the
+   APK only if its SHA-256 checksum matches `CrumblesApp.apk.sha256` **and**
+   `apksigner` (Android SDK Build-Tools) finds that it is signed with the
+   release certificate whose SHA-256 fingerprint you give it: with
+   `--expected-cert-sha256`, in `CRUMBLES_EXPECTED_CERT_SHA256`, or typed in
+   when the script asks. Get that fingerprint from your organization or
+   another channel you trust, not from the site that serves the APK.
    * **Windows**: Double-click `setup_device.bat`
    * **Mac**: Double-click `setup_device.command`
    * **Linux**: Run `./setup_device.sh`
-   * *(Terminal alternative: Download `CrumblesApp.apk` and `CrumblesApp.apk.sha256`, verify with `sha256sum -c CrumblesApp.apk.sha256`, then run `adb install -r CrumblesApp.apk` followed by `adb shell dpm set-device-owner com.android.securelogging/.CrumblesDeviceAdminReceiver`)*
+   * Terminal alternative: download `CrumblesApp.apk` and
+     `CrumblesApp.apk.sha256`, and check both the checksum and the signer
+     before you install. The second command must print the fingerprint from
+     that trusted channel (`apksigner verify --print-certs CrumblesApp.apk`
+     shows it too):
+
+     ```bash
+     sha256sum -c CrumblesApp.apk.sha256
+     ./tools/print_signing_cert_sha256.sh CrumblesApp.apk
+     adb install -r CrumblesApp.apk
+     adb shell dpm set-device-owner com.android.securelogging/.CrumblesDeviceAdminReceiver
+     ```
 
 ---
 
@@ -178,9 +201,11 @@ Android enforces strict multi-user privacy rules for device-wide logging
   [`DevicePolicyManager.setAffiliationIds()`][dpm-set-affiliation-ids], the
   phone **must remain single-user with no secondary users or profiles** (no
   Work Profile, Guest/Secondary user, Android 14+ Clone profile, or Android 15+
-  Private Space). Recommended DPC user restrictions for administrators:
+  Private Space). While security logging is on, Crumbles applies
   `DISALLOW_ADD_USER`, `DISALLOW_ADD_MANAGED_PROFILE`,
-  `DISALLOW_ADD_CLONE_PROFILE`, and `DISALLOW_ADD_PRIVATE_PROFILE`.
+  `DISALLOW_ADD_CLONE_PROFILE`, and `DISALLOW_ADD_PRIVATE_PROFILE` itself
+  (Android already sets the last three for any device owner, and removes an
+  existing Private Space when its restriction takes effect).
 * **Delegated Mode (`DELEGATION_SECURITY_LOGGING` /
   `DELEGATION_NETWORK_LOGGING`)**: If the delegating Device Owner DPC allows
   secondary users or managed profiles on the device, the DPC **must** install
@@ -195,7 +220,9 @@ Android enforces strict multi-user privacy rules for device-wide logging
   toggle still appears enabled, check whether a secondary user, Work Profile,
   Android 14+ Clone profile, or Android 15+ Private Space exists on the phone.
   Removing an unaffiliated user or profile resumes logging, but causes
-  `discardDeviceWideLogsLocked()` to discard buffered device-wide logs.
+  `discardDeviceWideLogsLocked()` to discard the device-wide logs buffered in
+  memory. The security logs kept across the next restart can still include
+  events from that time.
 
 [dpc-security-logging]: https://developer.android.com/work/dpc/security#log-enterprise
 [dpc-network-logging]: https://developer.android.com/work/dpc/logging#availability
@@ -229,7 +256,7 @@ Once installed, open the Crumbles app, enable the logging toggle, and select you
 
 * **Option A: Built-in Hardware Keystore (Recommended)**
   * Crumbles stores your encryption keys securely inside your phone's hardware security module (TEE/StrongBox).
-  * **In-App Decryption**: You can view and decrypt your logs directly inside the app.
+  * **In-App Decryption**: You can view and decrypt your logs directly inside the app. Decryption asks for your PIN, pattern or password, never your fingerprint or face, which someone could force onto the sensor.
   * **Re-Encrypt & Share**: You can re-encrypt selected logs using a trusted 3rd-party's public key QR code to safely share them via Email or Drive.
 * **Option B: Generate Private Key & Keep Externally**
   * Crumbles generates an encryption key pair, but displays the private key for you to save in an offline, secure location (e.g., password manager). Crumbles does not store the private key on the phone.
@@ -306,7 +333,9 @@ analyst-env/bin/python tools/analyst/crumbles_analyst.py --key key.txt --out dec
   the trailer chain. Their decrypted logs are still written to
   `decrypted/unverified/<batch name>.txt`.
 * `--max-age` is optional: the maximum allowed age in hours of the newest
-  batch for each device. Older devices are flagged.
+  batch for each device. Older devices are flagged. A re-encrypted copy of a
+  batch keeps the time the batch was written, so sharing old logs again does
+  not make a device look recent.
 * `--device` is optional, and can be repeated: the ID of a device whose batches
   you expect, as the report prints it ("by device ..."). Each device you give
   must have a trusted batch, and batches of any other device are flagged and go
@@ -314,6 +343,14 @@ analyst-env/bin/python tools/analyst/crumbles_analyst.py --key key.txt --out dec
   phones: without it, someone who can write to the folder can delete every
   batch of one phone, or replace them with another phone's batches, and the
   check still passes.
+* `--signer` is optional, and can be repeated: the SHA-256 fingerprint of a
+  phone's batch-signing key, as the report prints it ("signed by TEE key ...").
+  Note it from the first report after you enroll a phone, and give it in every
+  later run: batches that another key signed are then flagged, even if that key
+  was attested for the same device ID.
+* `--min-patch-level` is optional: the oldest patch level (`YYYYMM`) of the OS,
+  vendor and boot images when a phone made its signing key. The report shows
+  the OS version and the patch levels that the attestation gives for each key.
 * The last arguments are batch files, or folders of `.bin` files.
 
 For each batch, the script prints when and by which device it was written,
@@ -376,11 +413,19 @@ problem:
   lock the bootloader again, or sign batches on a phone whose OS is not one you
   pinned. Phones of the same model running their maker's OS share a verified
   boot key, so use `--device` to tell such phones apart.
+* **signed with none of the keys of --signer**, or **the key's OS, vendor or
+  boot patch level is below --min-patch-level** (or missing): a key you did
+  not pin signed the batch, or a phone lacked the patches that you require.
 * **device X was not given with --device**: the batch comes from a phone that
   you did not list.
 * **attestation certificate N is REVOKED**, or **SUSPENDED**: Google revoked
   a key of the attestation chain, for example because it leaked, and whoever
   has a leaked key can attest anything.
+
+A notice that **the batch time is outside the validity of attestation
+certificate 0** means that the phone's clock was wrong, or was changed, when it
+wrote the batch: the signature still counts. A batch **collected before the
+first unlock** has no activity log records: the phone cannot read them then.
 
 Anyone who has your public key can create a batch that decrypts, so only a
 valid signature shows that Crumbles wrote it: the script checks that the key
@@ -396,12 +441,26 @@ that signs the app: compare it with the one you expect, or give that one with
 
 ## Building from Source (Developers)
 
-The repository holds a Gradle build (`build.gradle.kts`), but it does not run
-from a clone yet: the Gradle wrapper (`gradlew` and
-`gradle/wrapper/gradle-wrapper.jar`) is not checked in, and some sources still
-use libraries that are not on Maven Central or Google Maven. Until both are
-fixed, `./gradlew build` fails, and the checksums in
-`gradle/verification-metadata.xml` protect no build.
+Build Crumbles with the Gradle wrapper from a clone of the repository. You need
+JDK 17 or newer and the Android SDK with the Android 15 (API level 35)
+platform: point Gradle to the SDK with the `ANDROID_HOME` environment variable
+or with `sdk.dir` in `local.properties`. Then run the unit tests and build the
+release APK:
+
+```bash
+./gradlew test assembleRelease
+```
+
+Gradle writes the unsigned APK to
+`build/outputs/apk/release/crumbles-release-unsigned.apk`. It checks every
+plugin and library that it downloads against the SHA-256 checksums in
+`gradle/verification-metadata.xml`, and fails the build if one is missing or
+differs: [RELEASING.md](RELEASING.md) describes how to update them when a
+dependency changes. Of the build tools that depend on the platform, the
+checksums cover only those for Linux on x86-64, aapt2 and protoc: to build on
+another platform, first add the checksums of its own tools with
+`./gradlew --write-verification-metadata sha256 build`, and check the new
+entries as RELEASING.md describes.
 
 ---
 

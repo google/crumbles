@@ -158,6 +158,20 @@ public final class CrumblesHeartbeatWorkerTest {
   }
 
   @Test
+  public void doWork_whenLastBatchWasSignedInTheFuture_writesBatch() throws Exception {
+    CrumblesDeviceAdminReceiver.prefs(context)
+        .edit()
+        .putLong(
+            CrumblesBatchSigner.PREF_LAST_SIGNED_AT_MILLIS,
+            Instant.now().plus(Duration.ofDays(365)).toEpochMilli())
+        .commit();
+
+    runWorker();
+
+    assertThat(writtenBatches()).hasSize(1);
+  }
+
+  @Test
   public void doWork_whenNeitherDeviceOwnerNorDelegate_writesNothing() throws Exception {
     when(mockDpm.isDeviceOwnerApp(context.getPackageName())).thenReturn(false);
     when(mockDpm.isNetworkLoggingEnabled(any())).thenReturn(true);

@@ -19,8 +19,8 @@ package com.android.securelogging;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
-import android.support.v7.app.AppCompatActivity;
 import android.view.WindowManager;
+import androidx.appcompat.app.AppCompatActivity;
 import com.android.securelogging.audit.CrumblesAppAuditLogger;
 
 /**
@@ -59,6 +59,7 @@ public final class CrumblesSetupActivity extends AppCompatActivity {
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setHideOverlayWindows(true);
     super.onCreate(savedInstanceState);
+    CrumblesLauncherEntry.applyToTask(this);
     setContentView(R.layout.activity_setup);
     CrumblesWindowInsets.applySystemBarPadding(this);
     findViewById(R.id.btn_setup_acknowledge).setOnClickListener(v -> onAcknowledgeClicked());

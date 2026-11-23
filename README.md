@@ -51,9 +51,11 @@ For full setup details, step-by-step guides, and developer build instructions, r
   [`DevicePolicyManager.setAffiliationIds()`][dpm-set-affiliation-ids], the
   device **must remain single-user with no secondary users or profiles** (no
   Work Profile, Guest/Secondary user, Android 14+ Clone profile, or Android 15+
-  Private Space). Recommended DPC user restrictions for administrators:
+  Private Space). While security logging is on, Crumbles applies
   `DISALLOW_ADD_USER`, `DISALLOW_ADD_MANAGED_PROFILE`,
-  `DISALLOW_ADD_CLONE_PROFILE`, and `DISALLOW_ADD_PRIVATE_PROFILE`.
+  `DISALLOW_ADD_CLONE_PROFILE`, and `DISALLOW_ADD_PRIVATE_PROFILE` itself
+  (Android already sets the last three for any device owner, and removes an
+  existing Private Space when its restriction takes effect).
 * **Delegated Mode (`DELEGATION_SECURITY_LOGGING` /
   `DELEGATION_NETWORK_LOGGING`)**: If the delegating Device Owner DPC allows
   secondary users or managed profiles on the device, the DPC **must** install
@@ -63,9 +65,11 @@ For full setup details, step-by-step guides, and developer build instructions, r
   the Device Owner (`USER_SYSTEM`) and each Profile Owner. Profiles that
   cannot have a Profile Owner (such as Android 14+ Clone profiles, Android 15+
   Private Space, or unmanaged secondary/guest users) cannot be affiliated and
-  must be disallowed; otherwise logging stops until they are removed (and
-  removing an unaffiliated user or profile causes
-  `discardDeviceWideLogsLocked()` to discard buffered logs).
+  must be disallowed; otherwise logging stops until they are removed.
+  Removing an unaffiliated user or profile makes
+  `discardDeviceWideLogsLocked()` discard the logs buffered in memory, but
+  the security logs kept across the next restart can still include events
+  from that time.
 
 [dpc-security-logging]: https://developer.android.com/work/dpc/security#log-enterprise
 [dpc-network-logging]: https://developer.android.com/work/dpc/logging#availability

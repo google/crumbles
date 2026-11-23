@@ -51,10 +51,18 @@ public interface RemoteStorageUploader extends AutoCloseable {
   }
 
   /**
-   * Returns whether an upload failed in transit, for example because the destination could not be
-   * reached or did not finish before the deadline, rather than because it refused the batch.
+   * Returns whether the last upload failed in transit, for example because the destination could
+   * not be reached or did not finish before the deadline, rather than because it refused the batch.
    */
   boolean transportFailed();
+
+  /**
+   * Returns whether the last upload failed in transit while its body was being sent, as when a
+   * large batch outlasts its deadline on a slow link. Unlike a failure while connecting, or while
+   * waiting for the destination to confirm the batch, it does not mean that the next, smaller,
+   * batches would fail too.
+   */
+  boolean failedMidBody();
 
   /**
    * Releases any credential material this uploader holds in memory.
