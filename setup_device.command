@@ -71,7 +71,7 @@ echo "Device found!"
 echo ""
 
 echo "--> Step 2 of 4: Downloading the Crumbles APK..."
-APK_URL="https://github.com/google/crumbles/releases/download/v1.0/CrumblesApp.apk"
+APK_URL="https://github.com/google/crumbles/releases/download/v2.0/CrumblesApp.apk"
 if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$APK_FILE" "$APK_URL"; then
     echo ""
     echo "ERROR: Failed to download the APK. Please check your internet connection."

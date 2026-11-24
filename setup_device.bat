@@ -59,7 +59,7 @@ echo  Device found!
 echo.
 
 echo  --> Step 2 of 4: Downloading the Crumbles APK...
-set "APK_URL=https://github.com/google/crumbles/releases/download/v1.0/CrumblesApp.apk"
+set "APK_URL=https://github.com/google/crumbles/releases/download/v2.0/CrumblesApp.apk"
 "%CURL_EXE%" --proto "=https" --tlsv1.2 -fsSL -o CrumblesApp.apk "%APK_URL%"
 if errorlevel 1 (
     echo.

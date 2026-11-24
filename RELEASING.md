@@ -17,7 +17,29 @@ This document describes how to cut an official Crumbles release so that:
 
 ---
 
-## 1. Update and Commit Gradle Dependency Verification Metadata
+## 1. Prepare the Release Commit
+
+Before tagging a release, update these files in the commit that the tag will
+point to:
+
+1. `build.gradle.kts`: increase `versionCode` by one and set `versionName` to
+   the number of the release. Android only replaces an installed app with an
+   APK that has a higher `versionCode`.
+2. The release tag in `APK_URL` in `setup_device.sh`, `setup_device.command`
+   and `setup_device.bat`, and in the default download URL of
+   `tools/generate_qr_payload.sh`.
+3. `documentation_images/provisioning_qr.png`, if the release signing key
+   changed. Generate the payload as section 4 describes, with the download URL
+   `https://github.com/google/crumbles/releases/latest/download/CrumblesApp.apk`,
+   and encode it as a QR code. Decode the image again and compare the result
+   with the payload before you commit it. Because the code always downloads the
+   latest release and pins only the signing key, releases signed with the same
+   key need no new code.
+4. The revision line of `THREAT_MODEL.md`.
+
+---
+
+## 2. Update and Commit Gradle Dependency Verification Metadata
 
 Before cutting a release tag (and whenever dependencies or plugins change in
 `build.gradle.kts` or `settings.gradle.kts`), regenerate Gradle's dependency
@@ -42,12 +64,13 @@ they build, such as `protoc` and AAPT2.
 
 ---
 
-## 2. Build and Sign the Release APK
+## 3. Build and Sign the Release APK
 
 From the clean release tag:
 
-1. Build the release APK with Gradle (`./gradlew assembleRelease`) and sign it
-   with the official Crumbles release signing key to produce `CrumblesApp.apk`.
+1. Build the release APK with Gradle (`./gradlew clean assembleRelease`) on
+   Linux x86-64, whose build tools the checksums cover, and sign it with the
+   official Crumbles release signing key to produce `CrumblesApp.apk`.
 2. Generate the APK file checksum alongside the binary (consumed by
    `setup_device.sh`, `setup_device.command`, and `setup_device.bat`):
 
@@ -60,7 +83,7 @@ sha256sum CrumblesApp.apk > CrumblesApp.apk.sha256
 
 ---
 
-## 3. Verify the APK Signature and Extract the Certificate SHA-256
+## 4. Verify the APK Signature and Extract the Certificate SHA-256
 
 Verify the signed APK and print the signing certificate's SHA-256 fingerprint:
 
@@ -104,7 +127,7 @@ certificate SHA-256 fingerprint remains identical across releases.
 
 ---
 
-## 4. Publish the GitHub Release
+## 5. Publish the GitHub Release
 
 Attach `CrumblesApp.apk` and `CrumblesApp.apk.sha256` to the GitHub release and
 include the following verification block in **every GitHub release note**:
@@ -142,7 +165,7 @@ replace the fingerprint.
 
 ---
 
-## 5. Verify That the Release Was Built From Its Tag
+## 6. Verify That the Release Was Built From Its Tag
 
 Gradle archive tasks keep no file timestamps and write their entries in a fixed
 order, and the APK holds no dependency metadata block (see `build.gradle.kts`),

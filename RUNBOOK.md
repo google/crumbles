@@ -238,7 +238,7 @@ type that this version records. **Analyst** is how
 activity records that uploaded batches carry: **Problem** (tamper evidence, see
 section 2.4), **Notice**, or **Routine** (not reported).
 
-Records from versions before 1.0 can also contain `OAEP_UNSUPPORTED`: a faulty
+Records from versions before 2.0 can also contain `OAEP_UNSUPPORTED`: a faulty
 capability probe created the device key for PKCS#1 v1.5 padding. That key keeps
 receiving PKCS#1 v1.5 wraps until a new built-in key replaces it.
 

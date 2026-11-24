@@ -24,7 +24,7 @@
 set -euo pipefail
 
 APK_PATH="${1:-}"
-DOWNLOAD_URL="${2:-https://github.com/google/crumbles/releases/download/v1.0/CrumblesApp.apk}"
+DOWNLOAD_URL="${2:-https://github.com/google/crumbles/releases/download/v2.0/CrumblesApp.apk}"
 ENABLE_LOGGING="${3:-true}"
 
 if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
@@ -52,7 +52,17 @@ if [ -z "$CERT_HEX" ]; then
   exit 1
 fi
 
-CHECKSUM=$(echo "$CERT_HEX" | xxd -r -p | openssl base64 | tr '+/' '-_' | tr -d '=')
+# Converts the hex digest to bytes. xxd comes with vim, which not every system
+# installs; perl is the fallback.
+hex_to_bytes() {
+  if command -v xxd >/dev/null 2>&1; then
+    xxd -r -p
+  else
+    perl -e 'local $/; my $hex = <STDIN>; $hex =~ s/\s+//g; print pack("H*", $hex)'
+  fi
+}
+
+CHECKSUM=$(echo "$CERT_HEX" | hex_to_bytes | openssl base64 | tr '+/' '-_' | tr -d '=')
 
 cat <<EOF
 {
