@@ -168,8 +168,10 @@ replace the fingerprint.
 ## 6. Verify That the Release Was Built From Its Tag
 
 Gradle archive tasks keep no file timestamps and write their entries in a fixed
-order, and the APK holds no dependency metadata block (see `build.gradle.kts`),
-so anyone can rebuild the release and compare it with the published APK:
+order, and the APK holds neither a dependency metadata block nor version control
+information (see `build.gradle.kts`). So anyone can rebuild the release, from a
+git checkout of the tag or from its source archive, and compare it with the
+published APK:
 
 1. Check that the published APK is signed with the release certificate:
 

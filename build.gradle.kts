@@ -31,6 +31,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // AGP would otherwise write META-INF/version-control-info.textproto, whose content
+            // depends on the checkout (a git branch, a detached commit or a plain copy of the
+            // tree), so one commit could build different APKs.
+            vcsInfo.include = false
         }
     }
     compileOptions {
